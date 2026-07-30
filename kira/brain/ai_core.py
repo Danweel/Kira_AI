@@ -17,7 +17,7 @@ from llama_cpp import Llama
 from kira.config import (
     LLM_MODEL_PATH, N_CTX, N_BATCH, N_GPU_LAYERS, WHISPER_MODEL_SIZE, WHISPER_CACHE_DIR, TTS_ENGINE,
     LLM_MAX_RESPONSE_TOKENS,
-    ELEVENLABS_API_KEY, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION,
+    ELEVENLABS_API_KEY, AZURE_SPEECH_KEY, AZURE_SPEECH_REGION, EDGE_TTS_VOICE,
     AZURE_SPEECH_VOICE, AZURE_PROSODY_PITCH, AZURE_PROSODY_RATE,
     VOICE_EMOTION_ENABLED, VOICE_EMOTION_BREAK_MS, VOICE_EMOTION_PROSODY,
     AI_NAME,
@@ -528,7 +528,7 @@ class AI_Core:
 
         import os as _os
         _os.makedirs(WHISPER_CACHE_DIR, exist_ok=True)
-        compute_type = "float16" if device == "cuda" else "int8"
+        compute_type = "int8" if device == "cuda" else "int8"
         print(f"   Whisper Config: Model={WHISPER_MODEL_SIZE} | Device={device} | ComputeType={compute_type} | Cache={WHISPER_CACHE_DIR}")
         self.whisper = WhisperModel(WHISPER_MODEL_SIZE, device=device, compute_type=compute_type, download_root=WHISPER_CACHE_DIR)
         print("   Faster-Whisper STT model loaded.")
@@ -1780,7 +1780,10 @@ class AI_Core:
                     self._track_word_event_health(text, len(word_timings))
                 print(f"   [TTS] backend=azure")
             elif TTS_ENGINE == "edge" and Communicate:
-                voice = AZURE_SPEECH_VOICE if AZURE_SPEECH_VOICE else "en-US-AriaNeural"
+                # Optionally strip <think>...</think> blocks from Qwen outputs
+                if os.getenv("STRIP_THINK_TAGS", "false").lower() == "true":
+                    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL | re.IGNORECASE).strip()
+                voice = EDGE_TTS_VOICE if EDGE_TTS_VOICE else (AZURE_SPEECH_VOICE if AZURE_SPEECH_VOICE else "en-US-AriaNeural")
                 communicate = Communicate(text, voice)
                 buffer = b""
                 async for chunk in communicate.stream():
