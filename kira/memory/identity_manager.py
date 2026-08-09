@@ -300,42 +300,63 @@ def get_continuity_block(activity_slug: str = "") -> str:
 # ─── Source attribution (Piece 3) ─────────────────────────────────────────────
 
 def label_for_source(source: str, username: str = "", activity_slug: str = "") -> str:
-    """Produce a dialogue-line prefix tag that tells Kira who is speaking.
+    """Produce a dialogue-line prefix tag that tells the AI who is speaking.
 
     source values:
-      "voice"         — Jonny speaking via microphone
+      "voice"         — the streamer speaking via microphone
       "chat"          — Twitch/YouTube viewer (username required)
       "game_dialogue" — character dialogue captured by vision/loopback
       "ambient_npc"   — background NPCs, set-dressing audio
       "system"        — internal system messages (not a real speaker)
 
     Returns a bracketed prefix string, e.g.:
-      "[JONNY — your creator, speaking to you]"
+      "[DANIIL — your creator, speaking to you]"
       "[CHAT — classiccoldfish, viewer]"
       "[GAME DIALOGUE — character speech, not addressed to you]"
+
+    NOTE: No hardcoded names. The streamer is detected dynamically from identity.json
+    by finding the tier-1 entity whose role contains "creator". This allows any
+    persona configuration without code changes.
     """
     if source == "voice":
-        # Voice is always Jonny — look up tier 1 label
-        entry = get_entity("Jonny")
-        if entry:
-            role = entry.get("role", "your creator and the person you talk with")
-            return f"[JONNY — {role}, speaking to you]"
-        return "[JONNY — speaking to you]"
+        # Find the streamer dynamically: tier-1 entity with "creator" in role
+        streamer_name = None
+        streamer_entry = None
+        for name, entry in _identity.get("permanent", {}).items():
+            if entry.get("tier") == 1 and "creator" in entry.get("role", "").lower():
+                streamer_name = name
+                streamer_entry = entry
+                break
+
+        if streamer_entry:
+            role = streamer_entry.get("role", "your creator and the person you talk with")
+            return f"[{streamer_name.upper()} — {role}, speaking to you]"
+        # Fallback if identity.json has no streamer entry
+        return "[STREAMER — speaking to you]"
 
     if source == "chat":
         if not username:
             return "[CHAT — viewer]"
+
         # Check if this is a known regular (tier 1)
         entry = get_entity(username)
         if entry and entry.get("tier") == 1:
             role = entry.get("role", "viewer")
-            # If the entry resolves to Jonny (same person as the mic voice),
-            # make the label unambiguous so Kira never treats it as a stranger.
+            # If the entry resolves to the streamer (same person as mic voice),
+            # make the label unambiguous so the AI never treats it as a stranger.
             canonical_key = _canonical_key(username)
-            if canonical_key == "jonny":
-                return f"[JONNY (via chat as {username}) — your creator, same person as the voice]"
+            # Also find the streamer's canonical key dynamically
+            streamer_canonical_key = None
+            for name, ent in _identity.get("permanent", {}).items():
+                if ent.get("tier") == 1 and "creator" in ent.get("role", "").lower():
+                    streamer_canonical_key = _canonical_key(name)
+                    break
+
+            if canonical_key == streamer_canonical_key:
+                return f"[{username.upper()} (via chat as {username}) — your creator, same person as the voice]"
             return f"[CHAT — {username}, {role}]"
         return f"[CHAT — {username}, viewer in chat]"
+
     if source == "game_dialogue":
         return "[GAME DIALOGUE — character speech, not addressed to you]"
 
@@ -344,6 +365,8 @@ def label_for_source(source: str, username: str = "", activity_slug: str = "") -
 
     if source == "system":
         return "[SYSTEM]"
+
+    return ""
 
     # Fallback — unknown source
     return f"[{source.upper()}]"
