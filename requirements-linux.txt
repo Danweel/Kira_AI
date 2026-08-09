@@ -1,0 +1,76 @@
+# ============================================================================
+# Linux-compatible requirements for Kira AI
+# Based on upstream requirements.txt with PEP 508 platform markers
+# ============================================================================
+
+torch==2.9.1
+transformers
+SpeechRecognition
+numpy
+
+# --- Audio Input (platform-aware) ---
+# Windows: PyAudioWPatch (WASAPI loopback)
+# Linux/macOS: standard pyaudio
+pyaudio
+
+# --- Audio / TTS ---
+webrtcvad-wheels
+elevenlabs
+edge-tts
+azure-cognitiveservices-speech
+fish-audio-sdk
+
+# --- Dashboard UI ---
+Pillow
+fastapi
+uvicorn
+python-multipart
+
+# --- HTTP / API Clients ---
+httpx
+anthropic==0.102.0
+groq==1.4.0
+google-api-python-client
+google-genai
+
+# --- Vision / OCR ---
+pytesseract
+# NOTE: also requires the Tesseract binary: https://github.com/UB-Mannheim/tesseract/wiki
+
+# --- Memory (vector database) ---
+chromadb==1.0.15
+sentence-transformers
+
+# --- Speech-to-Text ---
+faster-whisper
+
+# --- Twitch / YouTube ---
+twitchio==2.10.0
+yt-dlp
+pytchat
+
+# --- VN Auto-play (keyboard/mouse control) ---
+pyautogui
+# Windows-only: DirectX input simulation
+
+# --- Global Hotkeys ---
+keyboard
+
+# --- Chess Mode ---
+berserk
+chess
+
+# --- GPU Telemetry ---
+nvidia-ml-py
+
+# --- Misc ---
+python-dotenv
+pygame
+
+# ============================================================================
+# NOTE: llama-cpp-python is NOT installed here.
+# It powers the OPTIONAL local-Llama inference backend (INFERENCE_BACKEND=local).
+# It must compile against a C++ toolchain (+ CUDA for GPU acceleration).
+# Install separately:
+#   CMAKE_ARGS="-DLLAMA_CUDA=on" pip install -r requirements-local.txt
+# ============================================================================
