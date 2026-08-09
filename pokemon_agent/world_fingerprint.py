@@ -277,10 +277,12 @@ class ProgressLedger:
 # Battle is battle_agent's domain (the flee floor owns it) -> a battle_active fp auto-resets (never
 # trips mid-fight). TIME IS INJECTED (`now`) so the module stays a pure read and the class unit-tests
 # headless with a fake clock.
-WATCHDOG_STUCK_S   = float(os.getenv("POKEMON_WATCHDOG_STUCK_S", "15"))  # frozen this long (s) -> trip
-# ^ 15s (was 30): 30s of frozen screen reads as dead air to a viewer; 15s bails ~2x faster while still
-#   sitting well above the longest legit hold (a T3 badge savor ~17s changes the fp anyway, and a real
-#   conversation advances its text each page). Env POKEMON_WATCHDOG_STUCK_S overrides for live tuning.
+WATCHDOG_STUCK_S   = float(os.getenv("POKEMON_WATCHDOG_STUCK_S", "8"))  # frozen this long (s) -> trip
+# ^ 8s (was 15, was 30) — SUBATHON READINESS (2026-07-29, Jonny watching live): "we have like a 15
+#   second thing to notice she's in a loop — make it 5 or 10." Every legit hold updates the fp (badge
+#   savor changes the world, conversation advances its text each page, battle fps auto-reset), so the
+#   only thing 8s catches faster is a REAL wedge — and on stream every wedge-second is dead air.
+#   Env POKEMON_WATCHDOG_STUCK_S overrides for live tuning.
 WATCHDOG_SEEN_CAP  = 64        # distinct keys retained; only grows under sustained PROGRESS, never a wedge
 
 
@@ -297,6 +299,34 @@ class StuckWatch:
         self._t0 = None             # wall-clock of the last genuine advance (clock origin)
         self._tripped = False
         self.reason = ""
+        # DELIBERATE-STATE GATE (2026-07-30, THE false-self-heal bug): "she is thinking" must be a
+        # first-class state, not indistinguishable from "she is wedged". An oracle (LLM) decision, a
+        # voice savor-hold, a reading-pace dialogue hold — all leave the world DELIBERATELY static
+        # for longer than stuck_s, and the wall-clock trip fired on the first feed after each one
+        # ("frozen 8.0s" at innocent tiles → false wedge marks persisted to disk, healthy
+        # conversations aborted mid-drive, travel legs instabailed on the stale latch). While one or
+        # more holds are active, feeds RESET instead of accumulate; release() resets again so the
+        # held span never counts even when NOTHING fed during it (a blocking LLM call pumps raw
+        # frames, bypassing the render hook entirely). Nestable (a read-hold inside a savor-hold).
+        self._holds = 0
+        self.hold_reason = ""
+
+    def hold(self, reason=""):
+        """Enter a deliberate-stillness state (LLM decision in flight / voice hold / read-along).
+        The watch cannot trip while any hold is active."""
+        self._holds += 1
+        self.hold_reason = reason
+
+    def release(self):
+        """Leave the deliberate state. The stuck clock restarts NOW — the held span never counts."""
+        self._holds = max(0, self._holds - 1)
+        if self._holds == 0:
+            self.hold_reason = ""
+            self.reset()
+
+    @property
+    def held(self):
+        return self._holds > 0
 
     @staticmethod
     def _key(fp, text):
@@ -310,6 +340,9 @@ class StuckWatch:
         """Record one sample at wall-clock `now`. Returns True once tripped. A None fp (unreadable),
         an in-battle fp, or an explicit `progressed` flag RESET the watch (no judgement / not our
         domain / a caller-known advance)."""
+        if self._holds > 0:                     # deliberate stillness (thinking/holding) — never a wedge
+            self.reset()
+            return False
         if fp is None or fp.battle_active or progressed:
             self.reset()
             return False

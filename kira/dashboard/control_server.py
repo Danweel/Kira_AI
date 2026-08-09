@@ -462,7 +462,12 @@ async def _card_overlay_handler():
 # health.json the campaign already publishes (no token/runtime counters, no reasoning transcript).
 @app.get("/pokemon_hud")
 async def _pokemon_hud_handler():
-    return FileResponse(str(_REPO_ROOT / "web_dashboard" / "pokemon_hud.html"))
+    # Serve under /web_dashboard/ so relative asset paths (and OBS CEF) resolve the same
+    # way as card_overlay — absolute /web_dashboard/assets/pokemon/*.png still work too.
+    return FileResponse(
+        str(_REPO_ROOT / "web_dashboard" / "pokemon_hud.html"),
+        headers={"Cache-Control": "no-store"},
+    )
 
 # SAVE-FILE CARD (couch close-out 2026-07-08): a Game Boy / FireRed "CONTINUE" save-select
 # screen — pure presentation over the SAME /pokemon_hud.json state (badges / Pokédex / play
@@ -478,9 +483,14 @@ async def _pokemon_hud_json():
     # Deliberately excludes spend/uptime/reasoning — those live in Jonny's cockpit, never on stream.
     from kira import pokemon_proc
     g = (pokemon_proc.health() or {}).get("game") or {}
-    return {"running": pokemon_proc.is_running(),
+    # running = owned process OR a fresh external heartbeat (marathon supervisor) — the HUD hid
+    # itself mid-run when the script-launched supervisor wasn't the dashboard's own child.
+    return {"running": pokemon_proc.is_running() or pokemon_proc.heartbeat_alive(),
             "badges": g.get("badges") or [], "badge_count": g.get("badge_count") or 0,
             "party": g.get("party_hud") or [], "place": g.get("place"),
+            # who is ACTUALLY on the field mid-battle (per-card "active" flag rides in party too) —
+            # fixes the "wrong mon looks fielded after a faint/switch" HUD read.
+            "active_species": g.get("active_species"),
             # HUD overhaul — per-mon cards carry types/sprite-id; plus journey timer / now-state /
             # objective / want. All game-side + viewer-appropriate (still NO token spend / reasoning).
             "now_state": g.get("now_state"), "objective": g.get("objective"),

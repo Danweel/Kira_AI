@@ -32,6 +32,17 @@ import world_fingerprint as wf      # MICRO watchdog: stop A-mashing an exhauste
 # progressing -> disengage (B, walk away). Tolerance is low (a real speech never repeats a line 3x).
 DIALOGUE_LOOP_REPEAT = int(os.getenv("POKEMON_DIALOGUE_LOOP_REPEAT", "3"))
 
+# MENU-PROMPT TEXTS (2026-08-03, the Route-13 Super-Potion loop): these strings are NEVER
+# conversation — they mean an ITEM/BAG/PARTY menu is open under the text band. A-driving them
+# "advances" the menu (selects the item, opens the party, re-selects...) forever. The ONLY
+# correct move is B-cascade out and hand the field back. Matched on the normalized lowercase line.
+_MENU_PROMPT_SNIPPETS = (
+    "is selected",              # "SUPER POTION is selected."
+    "use on which pok",         # "Use on which POKMON?" (accent byte varies)
+    "won't have any effect",    # full-HP / no-status apply refusal
+    "there's no pok",           # party-related refusals
+)
+
 # Bottom overworld message-box band: solid white while a box is open, dark (map) when closed.
 # Verified across misty_done (box up: 27-28/28 per row) vs cerulean/pewter/viridian (0/28).
 _BOX_ROWS = (126, 132, 138, 144)
@@ -40,6 +51,7 @@ _BOX_XS = tuple(range(16, 226, 10))           # ~21 samples per row
 
 _OB0 = 0x02036E38               # object-event 0 = the player
 _FACE_OFF = 0x18                # facing direction nibble (1=down 2=up 3=left 4=right)
+_START_CURSOR = 0x020370F4      # START-menu cursor row (same address hm_teach nav uses)
 
 
 def box_open(b):
@@ -110,6 +122,31 @@ class DialogueDriver:
         self._wait(6)
         return player_facing(self.b) != f0 or _player_coords(self.b) != c0
 
+    def _keyboard_escape(self):
+        """KEYBOARD-CLASS ESCAPE, now GUARDED (2026-08-03 Route-12 'Super Potion on a full team
+        forever'): the old bare START+A was fired on ANY misdetected lock — but when the field
+        was actually FREE, START opened the START MENU and A opened whatever the cursor was on
+        (BAG). The drive loop then A-'advanced' the bag like dialogue: Super Potion → USE →
+        party → \"It won't have any effect.\" → A → pick again — the infinite overworld potion
+        loop Jonny filmed. So: press START, then PROBE — if the START-menu cursor byte responds
+        to a DOWN, a menu actually opened (the field was free all along) → B it closed, control
+        is back. Only a dead cursor (a true keyboard/cutscene, which eats START) earns the A."""
+        self.b.press("START", 6, 12, self.render, owner=self.owner)
+        self._hold_s(0.05)
+        c0 = self.b.rd8(_START_CURSOR)
+        self.b.press("DOWN", 4, 10, self.render, owner=self.owner)
+        self._hold_s(0.04)
+        if self.b.rd8(_START_CURSOR) != c0:
+            self.log("   [dlg] escape probe: START MENU opened (field was FREE, lock was "
+                     "misdetected) — B-closing it, NOT pressing A (anti bag-potion loop)")
+            for _ in range(3):
+                self.b.press("B", 4, 10, self.render, owner=self.owner)
+                self._hold_s(0.04)
+            return True
+        self.b.press("A", 6, 12, self.render, owner=self.owner)
+        self._hold_s(0.05)
+        return not box_open(self.b) and self._control_returned()
+
     def _close_box(self, max_tries=12):
         """Bounded B-mash to dismiss an EXHAUSTED/looping dialogue box once the micro-watchdog has
         decided more A-pressing is futile: stop pushing A (which kept re-initiating the NPC), tap B
@@ -121,16 +158,11 @@ class DialogueDriver:
                 return True
             self.b.press("B", 4, 10, self.render, owner=self.owner)
             self._hold_s(0.03)
-        # LAST RESORT — KEYBOARD-CLASS ESCAPE (the Celadon Eevee wedge, night shift 8): the naming
-        # KEYBOARD eats B (B only deletes typed letters), so a B-mash can never close it. START
-        # jumps the cursor to OK, A confirms; an empty name keeps the species name — a clean
-        # decline. Inert if the lock is a cutscene (START/A are eaten), so always safe to try.
-        self.b.press("START", 6, 12, self.render, owner=self.owner)
-        self._hold_s(0.05)
-        self.b.press("A", 6, 12, self.render, owner=self.owner)
-        self._hold_s(0.05)
-        if not box_open(self.b) and self._control_returned():
-            self.log("   [dlg] keyboard-class escape (START+A) regained control")
+        # LAST RESORT — the guarded keyboard-class escape (Celadon Eevee wedge, night shift 8):
+        # the naming KEYBOARD eats B, so only START(+A) can close it. Guarded: never A into an
+        # accidentally-opened START menu (the overworld bag-potion loop).
+        if self._keyboard_escape():
+            self.log("   [dlg] keyboard-class escape regained control")
             return True
         self.log(f"   [dlg] !! B-close did not regain control after {max_tries} tries - LOUD "
                  f"(stopping the mash anyway; caller re-paths away)")
@@ -151,7 +183,7 @@ class DialogueDriver:
     # HOLD + the A-tap cadence; the frozen-backstop is PRESS-COUNT based (DIALOGUE_FROZEN_LIMIT) and
     # box_open/_control_returned are pixel/press based, so detection + the stuck-box guard are untouched.
     def drive(self, stop_when=None, label="", min_s=0.022, max_s=0.11, base_s=0.012,
-              per_char_s=0.0014, page_gap_s=0.011, max_steps=300):
+              per_char_s=0.0014, page_gap_s=0.011, max_steps=300, max_wall_s=120.0):
         """Advance an open overworld dialogue at a watchable pace until control RETURNS (or
         stop_when() fires). Returns 'stopped' | 'closed' | 'exhausted' | 'timeout'(loud).
 
@@ -193,7 +225,19 @@ class DialogueDriver:
                 self.log(f"   [dlg-pace{(' ' + label) if label else ''}] box {_pace_prev[1]!r} "
                          f"visible {_dt:.2f}s (sink {_pace_prev[2]}ms, hold {_pace_prev[3]:.2f}s, "
                          f"end={reason})")
+        _t0 = time.time()                                 # WALL-CLOCK CAP (2026-07-30, the Nugget
+        # Bridge Bill-guy loop): max_steps is a PRESS budget, but a conversation cycling at read-along
+        # pace burns wall time far faster than presses — Jonny and chat watched one loop for 10+
+        # minutes. NO single overworld conversation is legitimately longer than max_wall_s at this
+        # pace; past it, this is a loop whatever the press count says -> exhausted (caller marks the
+        # spot so she never re-engages).
         for _ in range(max_steps):
+            if time.time() - _t0 > max_wall_s:
+                self.log(f"   [dlg{(' ' + label) if label else ''}] !! CONVERSATION WALL-CLOCK CAP "
+                         f"({max_wall_s:.0f}s) — no real dialogue runs this long; treating as a loop "
+                         f"-> B, walking away")
+                self._close_box()
+                return "exhausted"
             if stop_when and stop_when():
                 _pace_close("stopped")
                 return "stopped"
@@ -215,6 +259,15 @@ class DialogueDriver:
                     # counter never trips). If any one line has now reappeared DIALOGUE_LOOP_REPEAT
                     # times this call, it's a loop, not progress -> disengage (don't read it again).
                     _k = " ".join(cur.lower().split())
+                    # MENU-PROMPT GUARD (2026-08-03 Route-13): this text means a bag/party MENU
+                    # is open, not a conversation. One more A here re-selects the item — the
+                    # infinite overworld Super-Potion loop. B-cascade out, never drive it.
+                    if any(s in _k for s in _MENU_PROMPT_SNIPPETS):
+                        self.log(f"   [dlg{(' ' + label) if label else ''}] !! MENU PROMPT under the "
+                                 f"text band ({cur.replace(chr(10), ' ')[:48]!r}) — a bag/party menu "
+                                 f"is open; B-closing, NEVER A-driving it (anti item-loop)")
+                        self._close_box()
+                        return "exhausted"
                     seen[_k] = seen.get(_k, 0) + 1
                     if seen[_k] >= DIALOGUE_LOOP_REPEAT:
                         self.log(f"   [dlg{(' ' + label) if label else ''}] !! LOOPING DIALOGUE — "
@@ -285,10 +338,10 @@ class DialogueDriver:
                     # = species name kept = a clean decline).
                     if blind % 24 == 0:
                         self.log(f"   [dlg{(' ' + label) if label else ''}] !! blind-locked "
-                                 f"x{blind} (no box, no control) -> START+A keyboard-class escape")
-                        self.b.press("START", 6, 12, self.render, owner=self.owner)
-                        self._hold_s(0.05)
-                        self.b.press("A", 6, 12, self.render, owner=self.owner)
+                                 f"x{blind} (no box, no control) -> GUARDED keyboard-class escape")
+                        if self._keyboard_escape():
+                            _pace_close("closed")
+                            return "closed"
                     else:
                         self.b.press("B", 4, 10, self.render, owner=self.owner)
                 else:

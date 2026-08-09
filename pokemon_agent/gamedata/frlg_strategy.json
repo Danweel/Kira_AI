@@ -4,7 +4,7 @@
   "source": "pret/pokefirered (data/trainers, party rosters) + Bulbapedia leader/E4 pages + long-standing FRLG playthrough knowledge, distilled offline. FireRed version (Vulpix/Growlithe/Scyther available; Sandshrew/Meowth/Pinsir are LeafGreen).",
   "firewall": "MODE-GATED. Consumed only inside the Pokémon campaign free-roam oracle context. Never touches core Kira identity; never surfaces in unrelated chat. Same firewall class as frlg_gates.json.",
   "voice_rule": "The planner renders these facts as ONE characterful anticipation beat in HER voice (excited-kid-who-did-her-homework), never a data dump. The `counter`/`folklore` strings are her raw material, not lines to read verbatim.",
-  "type_note": "`weak_to` = attack types that hit the leader's overall team hard (a curated summary, not a per-mon chart). `answer_types` = the practical types SHE should field to beat them. `answer_species` = specific keepers that hard-counter (used for the 'level your existing counter' nudge). `level_band` = [low, high] of the leader's team on the first (non-rematch) fight.",
+  "type_note": "`weak_to` = attack types that hit the leader's overall team hard (a curated summary, not a per-mon chart). `answer_types` = the practical types SHE should field to beat them. `answer_species` = specific keepers that hard-counter (used for the 'level your existing counter' nudge). `level_band` = [low, high] of the leader's team on the first (non-rematch) fight. `bring_cures` = non-volatile statuses the gym commonly lands (Thunder Wave, Toxic, Sleep Powder…) — stock those cures at the city Mart BEFORE the fight (Bulbapedia kit foresight), not only after she's already been hit.",
   "updated": "2026-07-08 (the strategic-intelligence mega-batch)"
  },
 
@@ -30,22 +30,25 @@
    "types": ["electric"], "ace": "raichu", "level_band": [21, 24],
    "weak_to": ["ground"],
    "answer_types": ["ground"], "answer_species": ["diglett", "dugtrio", "sandshrew", "nidoking", "geodude"],
+   "bring_cures": ["paralysis"],
    "counter": "Electric can't touch a GROUND-type at all — a Diglett/Dugtrio from the cave, or any ground mon, makes Surge a joke",
-   "folklore": "the lightning American — ELECTRIC-types; ground moves shut his whole act down"
+   "folklore": "the lightning American — ELECTRIC-types; Thunder Wave locks your ace — Parlyz Heals in the bag before you walk in; ground moves shut his whole act down"
   },
   "Erika": {
    "order": 4, "kind": "gym", "city": "Celadon City",
    "types": ["grass", "poison"], "ace": "vileplume", "level_band": [29, 29],
    "weak_to": ["fire", "flying", "psychic", "ice"],
    "answer_types": ["fire", "flying", "psychic"], "answer_species": ["growlithe", "charmander", "pidgeotto", "abra"],
+   "bring_cures": ["poison", "sleep"],
    "counter": "Grass/Poison melts to Fire and to Flying/Psychic — a Growlithe or a Fire move is a clean sweep",
-   "folklore": "the flower lady — GRASS and poison; fire melts her garden, flyers do fine too"
+   "folklore": "the flower lady — GRASS and poison; Sleep Powder + PoisonPowder lock you down — Antidotes and Awakenings at the Dept Store BEFORE you walk in; fire melts her garden"
   },
   "Koga": {
    "order": 5, "kind": "gym", "city": "Fuchsia City",
    "types": ["poison"], "ace": "weezing", "level_band": [37, 43],
    "weak_to": ["psychic", "ground"],
    "answer_types": ["psychic", "ground"], "answer_species": ["kadabra", "alakazam", "abra"],
+   "bring_cures": ["poison"],
    "counter": "his Poison team gets erased by PSYCHIC (and Ground); an Abra line here is the answer that carries straight into Sabrina",
    "folklore": "a literal ninja — POISON and confusion tricks; bring antidotes and patience, and Psychic wrecks him"
   },
@@ -136,13 +139,19 @@
   "kabuto":   {"tier": "rare", "evolves": "kabutops", "where": "Mt. Moon fossil choice (Dome)", "note": "a fossil Rock/Water — Kabutops is a fast physical sweeper if you pick the Dome"},
   "clefairy": {"tier": "decent", "evolves": "clefable (Moon Stone)", "where": "Mt. Moon (rare)", "note": "a rare Mt. Moon Normal-type with a huge, flexible movepool"},
   "gyarados": {"tier": "strong", "evolves": "none", "where": "evolve a Magikarp / rare fish", "note": "a Water/Flying powerhouse — huge attack"},
-  "vulpix":   {"tier": "decent", "evolves": "ninetales (Fire Stone)", "where": "Routes 7/8 (FireRed exclusive)", "note": "a solid Fire option if you skipped Growlithe"}
+  "vulpix":   {"tier": "decent", "evolves": "ninetales (Fire Stone)", "where": "Routes 7/8 (FireRed exclusive)", "note": "a solid Fire option if you skipped Growlithe"},
+  "diglett":  {"tier": "strong", "evolves": "dugtrio @26", "where": "Diglett's Cave (Route 11 <-> Route 2)", "note": "the Surge hard-counter — Electric can't touch Ground; becomes Dugtrio, Earthquake body for Koga/Blaine/Agatha"},
+  "dugtrio":  {"tier": "strong", "evolves": "none", "where": "Diglett's Cave (rare) / evolve Diglett", "note": "fast Ground sweeper — Surge answer and late-game Earthquake user"},
+  "moltres":  {"tier": "rare_strong", "evolves": "none", "where": "Mt. Ember (Sevii / post-Rocket)", "note": "LEGENDARY Fire/Flying bird — weaken carefully and ball; NEVER KO"},
+  "articuno": {"tier": "rare_strong", "evolves": "none", "where": "Seafoam Islands", "note": "LEGENDARY Ice/Flying — weaken carefully and ball; NEVER KO"},
+  "zapdos":   {"tier": "rare_strong", "evolves": "none", "where": "Power Plant", "note": "LEGENDARY Electric/Flying — weaken carefully and ball; NEVER KO"},
+  "mewtwo":   {"tier": "rare_strong", "evolves": "none", "where": "Cerulean Cave (post-Elite Four)", "note": "LEGENDARY Psychic — the endgame catch; never KO on sight"}
  },
 
  "key_moves": {
   "_doc": "the handful of TMs/moves that change what the team can DO. The planner names these as a want when the matching threat is ahead and she has a good user for it.",
-  "ice beam":    {"tm": "TM13", "where": "Celadon Dept. Store 4F (buy, ~4000)", "type": "ice", "why": "THE dragon-slayer — 4x on Lance's Dragonite and huge on his Dragonairs; also stellar neutral coverage. Teach it to Lapras or any Water-type", "for": ["Lance", "Giovanni", "Agatha"]},
-  "thunderbolt": {"tm": "TM24", "where": "Celadon Dept. Store 4F (buy, ~4000)", "type": "electric", "why": "hits Lorelei's water mons AND Lance's Gyarados/Aerodactyl hard; a clean Misty answer too", "for": ["Lorelei", "Lance", "Misty"]},
+  "ice beam":    {"tm": "TM13", "where": "Celadon Game Corner prize desk (4000 coins; buy coins with cash)", "type": "ice", "why": "Melts Erika's grass line; later THE dragon-slayer — 4x on Lance's Dragonite. Teach it to Blastoise/Lapras/any Water-type", "for": ["Erika", "Lance", "Giovanni", "Agatha"]},
+  "thunderbolt": {"tm": "TM24", "where": "Celadon Game Corner prize desk (4000 coins)", "type": "electric", "why": "hits Lorelei's water mons AND Lance's Gyarados/Aerodactyl hard; a clean Misty answer too", "for": ["Lorelei", "Lance", "Misty"]},
   "earthquake":  {"tm": "TM26", "where": "Silph Co. (gift on 7F) / found in the Rocket Hideout", "type": "ground", "why": "the best Ground move in the game — smashes Surge, Blaine, Koga and Agatha's poison", "for": ["Lt. Surge", "Agatha", "Blaine", "Koga"]},
   "psychic":     {"tm": "TM29", "where": "Saffron gym reward (beat Sabrina) / Celadon Game Corner", "type": "psychic", "why": "nukes Koga's poison, Bruno's fighters and Agatha's ghosts", "for": ["Koga", "Bruno", "Agatha"]},
   "fire blast":  {"tm": "TM38", "where": "Celadon Game Corner prize", "type": "fire", "why": "a heavy Fire nuke — melts Erika and any Grass/Ice/Bug", "for": ["Erika"]},

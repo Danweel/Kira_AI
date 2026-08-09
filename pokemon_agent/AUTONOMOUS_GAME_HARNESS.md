@@ -243,6 +243,20 @@ from the bedrock + pitfalls, not from scratch. (See CLAUDE.md rule 14.)
     the menu is up; carrying an index across the open/close boundary mis-aims every later
     use (revives on corpses, switches to the wrong body). Re-derive selection indices AT
     menu time from the live struct, every time — never cache across a UI boundary.
+40. **A RE-DERIVED CHECKLIST ITEM NEEDS A ONE-TRIP LATCH; a visible "door loop" can be an
+    OUTER dispatch shuttle (2026-08-05, the Cinnabar Center).** box_bench re-read its
+    pending state from the live party every tick — so each mid-lap catch regrew the plan,
+    flipped it back to 'pending', and the lap marched her back into the Center: on stream it
+    LOOKED like a door bug, but the door worked fine. Diagnosis law: before debugging the
+    warp/egress layer, read the [lap] CHECKLIST lines for a done->pending flip. Fix law: an
+    at-most-once errand latches DONE on completion (session-scoped); later pickups ride
+    until the closing 'repack'. Three accomplices, all fixed the same shift: (a) a patience
+    fix in ONE movement layer (travel 0ab3555) does nothing for the OTHER (the strikes'
+    sea_walk — port npc_wait to every walker that treats bodies as walls); (b) an errand
+    with NO overworld road (Bill's ferry) must surface a bounded failure when its strike
+    exhausts — a compass fallback surfs circles forever and never counts a lap fail; (c) a
+    voice-order regex without a NEGATION guard turns "don't try to catch it" into a
+    catch_now LAW that keeps refilling the party and re-arming the shuttle.
 
 **STATUS ADDENDUM (2026-07-07): GAME #1 SUMMITED.** FireRed credits rolled autonomously
 (bedroom → 8 badges → E4 → Champion). The engine list above is what did it; the post-credits
@@ -353,6 +367,23 @@ so the wanderer's own motion never reset it) turns this transient into a hard we
 needs the long patience branch (bounded ~10s) and an honest npc-block reason when it still
 fails. Hygiene twin: an A-press that opens a plain NPC's chatter with the blocker unmatched
 must CLOSE the box before continuing, or the open box eats every later press of the leg.
+
+**ENGINE PITFALL (added 2026-08-05, the Cinnabar-Center door loop): A ROAMING BLOCKER IS A
+WAIT, NOT A WALL.** A WANDER_* NPC beside a 1-tile door approach (Cinnabar PC's Gentleman
+boxed (8-10,6-8) over the exit-mat row; One Island Network Center's kid boxed (5-7,7-9) by
+the single (9,9) door) blocks a tile for SECONDS — but the executor treated every occupied
+tile as a wall: re-plan -> detour -> he moved -> re-plan back, the visible "undershoots or
+overshoots every single time" egress oscillation, ending in the escape hatch (which then
+rewound real progress). The human move is to STAND STILL: `_wait_for_npc_clear` (travel.py,
+`[egress]` logs) holds the COMMITTED plan and polls the live object list (readback law,
+never blind timing) ~every 0.4s, bounded 12s, at all three seams — plan hysteresis (blocker
+stepped onto the committed next tile), the failed-press race (body landed between plan and
+press), and the no-path only-gap probe (wait BEFORE walking up and talking, which used to
+mark the wanderer's tile and kill single-file approaches with no_route_npc_blocked). A
+MOTION GATE (~3.5s, live-set delta) keeps stationary squatters/gauntlet trainers on the old
+fast interact path, and every timeout falls through to the unchanged re-path machinery — the
+escape hatch stays the LAST resort, not the routine outcome. Proven offline by
+recon_egress_wait_check.py (real travel() loop vs a scripted sim wanderer, 16 checks).
 
 **ENGINE PITFALL (added 2026-07-08, night shift 11): FORCED-MOVEMENT FLOORS BLIND EVERY
 STILLNESS-SHAPED GUARD.** Wedge detectors tuned for "she can't move" (identical world

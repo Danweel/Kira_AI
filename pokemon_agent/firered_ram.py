@@ -35,6 +35,32 @@ SB1_OFF_POS_Y     = 0x0002       # s16 player map Y
 # (read 0x1c in the overworld after the rival fight). The reliable in-battle signal
 # is the battle-RESOURCES pointer: null out of battle, a valid EWRAM ptr in battle.
 GBATTLE_TYPE_FLAGS = 0x02022B4C  # u32 battle type bitflags - STALE out of battle, do NOT gate on it
+# ── DOUBLE BATTLES (2026-08-04, the first trainer-pair wedge; all ✅ pret/pokefirered ground truth:
+# symbols branch pokefirered.sym + include/constants/battle.h + src/battle_controller_player.c) ──
+BATTLE_TYPE_DOUBLE  = 0x0001     # battle.h:47 (1 << 0); TRAINER is (1 << 3) = the 0x08 used above
+GBATTLERS_COUNT     = 0x02023BCC  # u8 gBattlersCount: 2 in singles, 4 in doubles
+GACTIVE_BATTLER     = 0x02023BC4  # u8 gActiveBattler (loops during selection — prefer controller funcs)
+GABSENT_BATTLER_FLAGS = 0x02023D70  # u8 gAbsentBattlerFlags: bit b = battler slot b is empty/fainted-out
+GBATTLER_POSITIONS  = 0x02023BD6  # u8[4] gBattlerPositions (local battles: position == battler id;
+#                                   player side = even, opponent side = odd)
+# gBattleCommunication (u8[8] @ 0x02023E82 — the sym proves MENU_MODE *is* gBattleCommunication[0]):
+# [b] = battler b's HandleTurnActionSelectionState state (battle_main.c): 0=before-action, 1=action
+# menu up, 2=move list OR target-select (the whole FIGHT flow), 3/4=action confirmed, 5=selection
+# script. [4] doubles as ACTIONS_CONFIRMED_COUNT — the reason GBATTLE_MENU_UP (=comm[4]) reads "1 =
+# action menu" ONLY in singles (the lone AI confirm); in a 4-battler double it reads 2-3 while HER
+# menus are up, so every comm[4]-gated classifier goes blind. Doubles must key off the CONTROLLER
+# FUNCS below instead.
+GBATTLE_COMM        = 0x02023E82  # base of gBattleCommunication (per-battler selection state at +b)
+# gBattlerControllerFuncs (IWRAM, u32[4] function ptrs): battler b's controller handler. While the
+# PLAYER is being asked for input, [b] holds one of the three ROM handlers below (thumb bit set) —
+# the same ground-truth class as GMAIN_CB2. Opponent AI battlers never hold these.
+GBATTLER_CONTROLLER_FUNCS = 0x03004FE0
+HANDLE_INPUT_CHOOSE_ACTION = 0x0802E438 | 1   # action menu (FIGHT/BAG/POKEMON/RUN) waits for input
+HANDLE_INPUT_CHOOSE_MOVE   = 0x0802EA10 | 1   # FIGHT move list waits for input
+HANDLE_INPUT_CHOOSE_TARGET = 0x0802E674 | 1   # doubles target-select: d-pad cycles LIVE foes (player-
+#                                               side positions are skipped for damaging single-target
+#                                               moves), A confirms gMultiUsePlayerCursor, B backs out
+GMULTIUSE_PLAYER_CURSOR = 0x03004FF4          # u8 gMultiUsePlayerCursor: the target-select battler id
 GMOVE_TO_LEARN     = 0x02024022  # u16 gMoveToLearn (pret symbols 2026-07-07): armed with the pending
 #                                  move id when a level-up wants to teach with 4 moves known (the
 #                                  "Delete an older move?" flow). STALE after the flow — treat only a
@@ -141,11 +167,36 @@ GBATTLE_PARTY_ORDER = 0x0203B0DC
 GBATTLER_PARTY_IDX = 0x02023BCE
 _CB2_OVERWORLD = 0x080565B4 | 1         # thumb bit set as stored
 _CB2_WHITEOUT = 0x080566A4 | 1
+# ── THE START-MENU BLIND SPOT (2026-08-05 #2, the Mt. Ember EXIT-cursor wedge) ────────────
+# The START menu runs UNDER CB2_Overworld (it's a field task, not a callback2 owner), so
+# callback2 truth can NEVER see it — travel's arrows scrolled POKeDEX..EXIT forever while
+# every cb2-gated recovery layer said "the world is fine". Ground truth is the gTasks table
+# (pret pokefirered.sym): Task_StartMenuHandleInput is alive exactly while the menu owns
+# input. Task struct: func u32 at +0, isActive u8 at +4, 40 bytes each, 16 slots.
+GTASKS = 0x03005090
+TASK_SIZE, NUM_TASKS = 40, 16
+_TASK_START_MENU_INPUT = 0x0806F1F0 | 1  # Task_StartMenuHandleInput (thumb bit as stored)
+
+
+def start_menu_open(bridge) -> bool:
+    """True iff the overworld START menu owns input right now (gTasks func-pointer scan —
+    cursor/RAM readback, never pixels; the cursor byte alone goes STALE after close).
+    Fail-CLOSED on a read error: 'no menu seen' just means the caller's old behavior."""
+    try:
+        for i in range(NUM_TASKS):
+            base = GTASKS + i * TASK_SIZE
+            if bridge.rd32(base) == _TASK_START_MENU_INPUT and bridge.rd8(base + 4):
+                return True
+    except Exception:
+        pass
+    return False
 
 
 def battle_cb2_dead(bridge) -> bool:
     """True iff gMain.callback2 says we are IN THE WORLD (overworld/whiteout) — any battle
-    struct still pointing somewhere is a corpse, not a fight."""
+    struct still pointing somewhere is a corpse, not a fight. NOTE: the START menu runs
+    UNDER the overworld callback — pair with start_menu_open() when 'world back' must also
+    mean 'no menu owns input' (the Mt. Ember EXIT-cursor wedge)."""
     return bridge.rd32(GMAIN_CB2) in (_CB2_OVERWORLD, _CB2_WHITEOUT)
 
 

@@ -23,7 +23,9 @@ import argparse
 import os
 import sys
 import time
+import zlib
 from collections import namedtuple
+from contextlib import contextmanager
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -35,7 +37,7 @@ import pokemon_state as st       # noqa: E402
 import travel as tv              # noqa: E402
 import world_fingerprint as wf   # noqa: E402  (MACRO ProgressLedger + fingerprint keystone)
 from pokemon_strategy import StrategicMemory, roster_judgment  # noqa: E402  (Batch 3 Phase 2 + block-#3 choice)
-from pokemon_planner import StrategicPlanner, TeamPlanner  # noqa: E402  (2026-07-08 mega-batch; TeamPlanner 2026-07-09 mission-pivot)
+from pokemon_planner import StrategicPlanner, TeamPlanner, GYM_LEVEL_MARGIN  # noqa: E402  (2026-07-08 mega-batch; TeamPlanner 2026-07-09 mission-pivot)
 from pokemon_search import GuideSearch  # noqa: E402  (Batch 6 Phase 5: silent strategy-guide when stuck)
 from pokemon_world import WorldModel  # noqa: E402  (Batch-WORLD: visited-map memory + capability registry — sense of PLACE)
 import questline as ql                # noqa: E402  (GATE-UNLOCK: recognise a gate -> derive a questline -> execute)
@@ -78,6 +80,12 @@ ROAD_BENCH_XP_ENABLED = os.getenv("POKEMON_ROAD_BENCH_XP", "1") != "0"
 # defers to the heal path (needs_heal only fires <0.50 on ANY member — this is a higher, ACE-specific
 # floor). On a fresh organically-built run the bench shares the gauntlet, so this rarely bites.
 ROAD_XP_ACE_HP_FLOOR = float(os.getenv("POKEMON_ROAD_XP_ACE_HP_FLOOR", "0.6"))
+# LEAD ROTATION (2026-07-31, Jonny: "cycle pokemon to give xp to as many per fight — keep the ENTIRE
+# team up to par"): strict weakest-first hands every consecutive leg to the same mon until it climbs
+# past the next one. When the previous leg's lead would be re-picked and another under-target candidate
+# sits within this many levels of it, rotate to that one — the whole bench levels evenly instead of one
+# mon monopolising the rides. 0 disables (pure weakest-first).
+ROAD_XP_ROTATE_BAND = int(os.getenv("POKEMON_ROAD_XP_ROTATE_BAND", "3"))
 # PREP-FOR-E4 band (2026-07-11, PASS 3 team-depth): at all 8 badges the whole party is floored to the
 # team-plan's E4 milestone (~L55) so the bench survives the Center-less five-fight gauntlet (NS13/NS14:
 # a top-heavy team where the ace solos then dies at Lance/Champion). A member counts as LEVELABLE only
@@ -145,6 +153,9 @@ OVERWORLD_SAFE_QUESTLINES = frozenset({
     "FLAG_WOKE_UP_ROUTE_12_SNORLAX",  # Route 12 bridge (Poke Flute used on the overworld bridge)
     "fly",                            # Route 16 house
     "FLAG_GOT_TEA",                   # Celadon (town)
+    "eevee",                          # Celadon (town) — the Condominiums gift ball (interior is a strike)
+    "exp_share",                      # Fuchsia -> Route 15 west gate (open road; the gatehouse is a strike)
+    "ice_beam",                       # Celadon (town) — the Game Corner TM13 errand (interiors are a strike)
     "bike", "FLAG_GOT_BIKE_VOUCHER",  # Cerulean / Vermilion (towns)
     # RUN-5 (2026-07-14) — the badge-6..8 back-half keys. fresh_go_1..4 all froze the bench ~L25-29 while
     # the ace soloed to L63+ across these questline-dense legs, because their gate.missing keys were NOT
@@ -164,6 +175,22 @@ OVERWORLD_SAFE_QUESTLINES = frozenset({
     # the seafoam_strike now ALSO _restore_ace()s at boot (belt-and-suspenders). Do NOT re-add.
     "FLAG_HIDE_SAFFRON_ROCKETS",      # Sabrina — the long Fuchsia->Saffron open-route march (Silph Co. building
     #                                   is a SEPARATE strike, live-guarded; mirrors the listed earth_badge march)
+})
+# DUNGEON STRIKE STEPS (2026-08-02): even when the OUTER gate is allowlisted (e.g. Lavender-south
+# FLAG_WOKE_UP_ROUTE_12_SNORLAX), the CURRENT actionable prereq can be a multi-floor combat dungeon
+# (silph_scope → Rocket Hideout Giovanni + L29 Kangaskhan). ROAD-BENCH-XP wraps the WHOLE head_to_gym
+# tick — weak lead persists into the strike → paper L16 Ekans walks into Giovanni and dies. If the
+# actionable step is one of these, keep the true ace leading (mirrors seafoam's ace-leads-gauntlet).
+DUNGEON_QUESTLINE_STEPS = frozenset({
+    "silph_scope",                    # Rocket Hideout under Celadon Game Corner
+    "FLAG_GOT_POKE_FLUTE",            # Pokémon Tower (ghost floors)
+    "FLAG_HIDE_SAFFRON_ROCKETS",      # Silph Co. liberation (Giovanni #2)
+    "secret_key",                     # Pokémon Mansion
+    "seafoam",                        # Seafoam interior (if ever re-armed)
+    # 2026-08-04 LEGENDARY HUNTS: all four are combat dungeons (Power Plant Electrodes,
+    # Seafoam interior, Mt. Ember's trainers + the Sevii biker gauntlet, Cerulean Cave's
+    # L46-70 wilds) — the ace leads, never a bench mon.
+    "zapdos", "articuno", "moltres", "mewtwo",
 })
 # CAVE STEP-ENCOUNTER GRIND (2026-07-11, PASS 3 NS#16 — the endgame grind-spot-adequacy unblock). The
 # binding wall for a fresh-GO E4-ready team: near Viridian/Indigo the only adequate high-level GRASS is
@@ -281,10 +308,22 @@ KEEPER_CAVE_FLOOR_WANDER_S = int(os.getenv("POKEMON_KEEPER_CAVE_FLOOR_WANDER_S",
 # party<6, so a full team of early-catch chaff (erika_done: Venusaur + Rattata/Spearow/Ekans/Meowth/Pidgey)
 # can NEVER swap in a planned coverage keeper (abra/diglett). box_chaff deposits the lowest-value off-plan
 # chaff at the current city's Center PC -> party 6->5 -> the router's room-gate opens -> the keeper is added.
-# DEFAULT OFF: the PC deposit menu is menu-nav-on-the-long-core (wedge-prone); arm with POKEMON_PCBOX=1 after
-# a live grab-and-look confirms the actuation on the show build. Decision/selection logic + a headless deposit
-# are verified in recon_deposit_check.py. Never boxes an on-plan line (planner._is_target_line) or the lead.
-PCBOX_ENABLED = os.getenv("POKEMON_PCBOX", "0") != "0"
+# DEFAULT ON (2026-08-03, the OP-team pass — Jonny: "sacrifice the weak ones for her strongest ones"): her
+# party is SIX low-20s chaff around a L49 ace, and every planned upgrade (fetch_keeper room-gate, the boxed
+# gift Eevee, an auto-boxed legendary) is DEAD without the swap loop — the box IS the bench-for-keeper play.
+# Decision/selection + headless deposit verified in recon_deposit_check.py; gates stay conservative (mapped-
+# Center city only, never hurt, on-plan keeper genuinely fetchable). Disarm with POKEMON_PCBOX=0 if the live
+# PC menu wedges on the show build. Never boxes an on-plan line (planner._is_target_line) or the lead.
+PCBOX_ENABLED = os.getenv("POKEMON_PCBOX", "1") != "0"
+# TEAM-BUILD BREATHER (2026-08-04, Jonny + chat: "box the dead bench and catch at the area's level —
+# don't hand-level hour-one catches"): the PC swap loop above (box_chaff -> fetch_keeper -> swap_keeper)
+# was OFFERED every tick and bulldozed every tick by the ACE-CARRIES GO-HARD force-pick (oracle SKIPPED),
+# so the bench sat at L17-19 chaff around a L54 ace for 25 in-game hours. When the bench is LOPSIDED,
+# the forced march yields at most MAX ticks per badge to a cheap roster move (a PC visit or a short
+# keeper fetch — minutes, not a grind montage), then marches again. Bounded so the march can never be
+# starved; creator order (LAW) and story-liberation errands still outrank.
+TEAM_BUILD_BREATHER_MAX = int(os.getenv("POKEMON_TB_BREATHER_MAX", "6"))
+TEAM_BUILD_LOPSIDED_GAP = int(os.getenv("POKEMON_TB_LOPSIDED_GAP", "20"))
 # NS#11: the SAFARI ZONE STRIKE (HM03 Surf + HM04 Strength via safari_strike.run_strike) + the PROACTIVE
 # Blaine Surf-prereq recognition. DEFAULT OFF — recognition + strike are useless/harmful apart and the
 # whole chain needs a live look-ahead before default-ON (a mis-timed Surf questline poisons her ctx). When
@@ -311,6 +350,39 @@ SEAFOAM_STRIKE_ENABLED = os.getenv("POKEMON_SEAFOAM_STRIKE", "1") != "0"
 # POKEMON_MANSION_STRIKE=0. NB the Cinnabar gym LEADER (quiz-door gym) doesn't fire via general beat_gym =
 # the next gate (recon_blaine.py extract, same pattern).
 MANSION_STRIKE_ENABLED = os.getenv("POKEMON_MANSION_STRIKE", "1") != "0"
+# 2026-08-03 (the OP-team pass — "cute Pokémon like Eevee"): the CELADON GIFT-EEVEE strike
+# (eevee_fetch.run_strike — back door -> stairwell -> roof room -> the givemon ball -> back out). The
+# gentlest interior in the game (no puzzles, no locked doors), built on the Mansion strike's proven
+# primitives + pret ground truth. Party-full is handled by the GAME (the script auto-PCs the gift);
+# the PCBOX swap_keeper loop fields it later. Recognized PROACTIVELY at badge>=4 while FLAG_GOT_EEVEE
+# (0x263) is unset. Disable with POKEMON_EEVEE_FETCH=0.
+EEVEE_FETCH_ENABLED = os.getenv("POKEMON_EEVEE_FETCH", "1") != "0"
+# 2026-08-03 (OP-team pass): the EXP. SHARE claim (expshare_fetch.run_strike — the Route 15 west
+# gate 2F aide, ITEM 182 at >=50 CAUGHT species, FLAG 0x256). The bench-development engine: the
+# holder banks XP from every fight without taking the field. The gate (_expshare_gate) only opens
+# at dex>=50; below the bar the strategist brief runs the DEX PUSH doctrine (catch every NEW
+# species crossed, never wander for it). Disable with POKEMON_EXPSHARE_FETCH=0.
+EXPSHARE_FETCH_ENABLED = os.getenv("POKEMON_EXPSHARE_FETCH", "1") != "0"
+# 2026-08-04 (Jonny: "make sure she gets blastoise ice beam so he has 4 attacks and a really
+# good one"): the CELADON GAME CORNER TM13 side quest (game_corner.run_strike — Coin Case from
+# the restaurant, 4000 coins off the Corner clerk, TM13 at the prize counter, TeachFlow to the
+# ace). The errand machinery has existed since the Erika era but was never dispatched (the
+# badge-4 wiring grass-farmed ¥66k and got benched). The gate (_icebeam_gate) only arms once
+# the FULL coin budget is affordable above the shop floor — no farming, no deferral: she buys
+# it the tick she's rich enough. Success = a party mon KNOWING move 58 (the TM is consumed on
+# teach, so no flag/bag check can bill it). Disable with POKEMON_ICEBEAM_FETCH=0.
+ICEBEAM_FETCH_ENABLED = os.getenv("POKEMON_ICEBEAM_FETCH", "1") != "0"
+# 2026-08-04 (Jonny: "i want her catching mew or mewtwo as a final endgame project. and all cool
+# legendaries that are available before or after the final 4 so she mops the floor with them"):
+# the LEGENDARY HUNTS (legendary_strikes.py — Zapdos/Power Plant, Articuno/Seafoam B4F, Mewtwo/
+# Cerulean Cave post-champion). Each gate self-suppresses until its road is actually open (Surf
+# taught; Articuno additionally needs the Seafoam boulders TRULY down — the R21-reroute stamp
+# is not enough; Mewtwo needs FLAG_SYS_GAME_CLEAR) and until the ball pocket can carry the
+# fight (the mart doctrine stocks Ultras once any hunt is pending). The battle side is the
+# existing careful-capture divert, now best-ball-first with the Master Ball reserved for
+# Mewtwo. (Mew is event-only distribution hardware — not obtainable by play; Mewtwo IS this
+# cartridge's Mew-class prize.) Disable with POKEMON_LEGENDARY_HUNTS=0.
+LEGENDARY_HUNTS_ENABLED = os.getenv("POKEMON_LEGENDARY_HUNTS", "1") != "0"
 # NS#13: the CINNABAR GYM strike (Blaine, badge 7). Cinnabar is FRLG's SIX quiz-door gym — the general
 # beat_gym clears juniors but never opens the quiz doors, so the leader battle never fires (the bounce the
 # mansion look-ahead surfaced). blaine_gym.run_gym does the FULL tour (quiz chain -> Blaine -> badge ->
@@ -349,6 +421,44 @@ GIOVANNI_GYM_ENABLED = os.getenv("POKEMON_GIOVANNI_GYM", "1") != "0"
 ENDGAME_INDIGO = (3, 9)                                        # the Indigo Plateau exterior
 VICTORY_ROAD_ENABLED = os.getenv("POKEMON_VICTORY_ROAD", "1") != "0"
 E4_STRIKE_ENABLED = os.getenv("POKEMON_E4_STRIKE", "1") != "0"
+# THE VICTORY LAP (2026-08-04, post-Giovanni — Jonny's parked endgame wishes are DUE in the
+# 8-badge pre-E4 window, and before this nothing sequenced them: next_gym derives to None, the
+# gym-keyed proactive chain goes dead, a parked luxury errand (fly) hogs the one questline slot,
+# and head_to_league marches straight at Victory Road). The fix is an EXPLICIT checklist that
+# holds the League actions off the menu until every item is DONE or HONESTLY SKIPPED, in an
+# explicit route order from her post-Giovanni position (Viridian, top of the R21 sea road):
+#   1. earthquake — TM26 (Giovanni's reward, ITEM_TM26=314, move 89) onto the ace via the proven
+#      TeachFlow (zero travel; Surf/Ice Beam/HM field moves are never the forgotten move);
+#   2. moltres   — Bill still waits in the Cinnabar PC and the R21 sea road south is the road she
+#      just surfed: the Sevii round-trip FIRST (the strike + ride-home hook drive the whole loop);
+#   3. articuno  — Seafoam's Route-20 doors are one map east of Cinnabar (the ride-home dock);
+#   4. eevee     — the Celadon Condominiums roof ball on the walk back north-east (the promised
+#      quest since Celadon; the Jolteon rite picks it up from there);
+#   5. zapdos    — the Route 10 / Power Plant spur last; the League march re-derives from anywhere.
+# 'Honestly skipped' = the hunts' own self-suppression truths (caught/battled-away, Bill gone,
+# Seafoam boulders never dropped) plus a bounded failed-dispatch counter -> a loud '[lap] SKIP' —
+# never an infinite park. While an item is owed the 'victory_lap' action replaces head_to_league
+# on the menu AND force-picks (the order lives in code+logs, not in the oracle's mood).
+# Mewtwo is deliberately NOT on the lap: its gate only arms post-champion (FLAG_SYS_GAME_CLEAR).
+# Disable with POKEMON_VICTORY_LAP=0 (reverts to the straight-at-the-League NS#15 dispatch).
+# ── 2026-08-05 (the 16:19 restart's Cinnabar↔Route-20 loop postmortem): TWO new items ──
+#   box_bench (after earthquake, BEFORE the hunts) — the party is FULL (a dex-push Pidgey took
+#      seat 6), and FRLG auto-boxes any catch at party-6: without seats, Moltres/Articuno/Zapdos
+#      sail straight to storage and never fight. Deposit the dead-weight passengers (level <=
+#      BOX_BENCH_MAX_LEVEL, never the ace, never below BOX_BENCH_MIN_PARTY bodies) at a Center
+#      PC via the PROVEN deposit_mon vehicle, sized to exactly the owed join-items. [box] logs.
+#   repack (LAST) — if a hunt was honestly skipped the party ends short of six and the E4
+#      readiness gate's FULL-SIX law can never pass: withdraw box occupants (lap birds first,
+#      then the benched passengers) until the party is whole again.
+# Kill switch: POKEMON_BOX_FLOW=0 removes both items from the checklist entirely (the lap
+# collapses to the original five; passengers ride in the trunk, the E4 sort keeps them last).
+VICTORY_LAP_ENABLED = os.getenv("POKEMON_VICTORY_LAP", "1") != "0"
+VICTORY_LAP_ORDER = ("earthquake", "box_bench", "moltres", "articuno", "eevee", "zapdos",
+                     "repack")
+VICTORY_LAP_MAX_FAILS = int(os.getenv("POKEMON_VICTORY_LAP_FAILS", "6"))
+BOX_FLOW_ENABLED = os.getenv("POKEMON_BOX_FLOW", "1") != "0"
+BOX_BENCH_MAX_LEVEL = int(os.getenv("POKEMON_BOX_BENCH_LEVEL", "22"))  # a 'passenger' rides under this
+BOX_BENCH_MIN_PARTY = 2            # never deposit below ace + one body (whiteout/sacrifice safety)
 # ── RUN-4 (2026-07-14): the E4-READINESS GATE. The solo-ace disqualify failed THREE runs — the ace
 # out-levels the bench through the cave/gauntlet endgame and solos the E4 to L100 while the bench freezes
 # ~L31 (disqualified on team-shape all three times, even after the 5add821 map-type relax). Jonny-adjudicated
@@ -400,6 +510,12 @@ FLAG_SECRET_KEY_ID = 0x1A8
 # Wall-clock ceiling for ONE grind_weak_members() call (a single tick's worth of weak-grinding). grind()
 # itself caps at 480s/member; this outer bound stops a multi-weak-member loop from running away on a tick.
 GRIND_WEAK_BUDGET_S = int(os.getenv("POKEMON_GRIND_WEAK_BUDGET_S", "600"))
+# WATCHDOG LATCH TTL (2026-07-30, the Route-4 instabail storm): a tripped watchdog latches a disengage
+# that only the roam-loop TOP clears — but a trip inside a deep sub-loop (grind's grass pacing) can be
+# consumed leg after leg without ever unwinding, freezing play in a bail storm. A latch this old means
+# nothing is honoring it -> _stuck_latched self-heals in place (clear + reset, LOUD). A real wedge
+# simply re-trips 8s later and gets the normal top-level recovery.
+WATCHDOG_LATCH_TTL_S = float(os.getenv("POKEMON_WATCHDOG_LATCH_TTL_S", "45"))
 # PER-MON PROBE for the FRAGILE bench-grind (2026-07-09, the Rattata over-grind wedge): a genuinely
 # too-weak bench mon (Rattata/Spearow L14 on Route 4, ace L29) earns no XP, but grind() ran the FULL
 # 480s before returning — so the zero-gain STALL mark (grind_weak_members) took ~8 min PER hopeless mon,
@@ -457,9 +573,14 @@ GRIND_PP_HEAL_CAP = int(os.getenv("POKEMON_GRIND_PP_HEAL_CAP", "4"))  # PP-heals
 # GRIND-SPOT LEVEL AWARENESS (NS#5, PASS-3 grind-efficiency lever a) — a map whose wild_max is more than
 # GRIND_POOR_GAP below the team's grind target gives ~0 XP (the NS#1/#14 E4-prep stall). The KB reader
 # (_grind_wild_band / _grind_inadequate) + this gap land now (decision-verified); the picker WIRING that
-# marks such a map grind-inadequate + prefers a reachable higher-level spot is flag-gated + verify-gated.
-GRIND_POOR_GAP = int(os.getenv("POKEMON_GRIND_POOR_GAP", "18"))
-GRIND_SPOT_LEVELAWARE = os.getenv("POKEMON_GRIND_SPOT_LEVELAWARE", "0") == "1"  # default OFF until live-verified
+# marks such a map grind-inadequate + prefers a reachable higher-level spot is flag-gated.
+# 2026-07-29 DEFAULT ON, GAP 8 (watched live: L20 team farming Route-3 L3-6 wilds toward a L22 Misty
+# bar — hours of ~0-XP fights while Route 24/25 L10-14 grass sat reachable). Gap 8: a target of 22
+# marks Route 3 (max 9), Route 4 (max 12), and Route 24 (max 12) inadequate; Route 25 (max 14)
+# clears the bar. Anti-freeze holds: she NEVER abandons the only reachable grass (_better_grind_spot
+# must return a REAL alternative before grind stands down).
+GRIND_POOR_GAP = int(os.getenv("POKEMON_GRIND_POOR_GAP", "8"))
+GRIND_SPOT_LEVELAWARE = os.getenv("POKEMON_GRIND_SPOT_LEVELAWARE", "1") == "1"
 try:
     import field_moves as fm          # noqa: E402  (capability reads: knows-HM AND has-badge)
 except Exception:
@@ -518,6 +639,24 @@ STRAT_JSON = os.path.join(STATES_CAMPAIGN, "strat_memory.json")
 # next to the campaign save, so a --resume climb wakes up KNOWING where she's been (no more
 # spatial amnesia that left the only place in her head to go = into the wall).
 WORLD_JSON = os.path.join(STATES_CAMPAIGN, "world_model.json")
+# WEDGE MEMORY (2026-07-30, subathon audit) — the unified block memory (_blocked_npcs/_looped_spots)
+# used to die with the process, so an abandon -> supervisor-relaunch re-approached the SAME trap with
+# amnesia and re-wedged for as long as nobody was watching. Persist it next to the campaign save,
+# TTL-bounded (a wanderer NPC's transient block must not poison a corridor forever; travel's live
+# staleness-release still un-marks any of these the moment the tile reads empty).
+WEDGE_MEM_JSON = os.path.join(STATES_CAMPAIGN, "wedge_memory.json")
+PP_RESTORE_JSON = os.path.join(STATES_CAMPAIGN, "pp_restore_latch.json")
+WEDGE_MEM_TTL_S = float(os.getenv("POKEMON_WEDGE_MEM_TTL_S", str(12 * 3600)))
+# SCHEMA v2 (2026-07-30, the thinking-gate fix): every mark recorded BEFORE the watchdog learned to
+# tell "thinking" from "wedged" is untrustworthy — the 8s watch tripped during normal LLM decisions
+# and persisted false blocked-tiles/resolved-talk-spots at innocent tiles (they were poisoning travel
+# routing across restarts). A v1 (or unversioned) file is discarded WHOLESALE on load, loud; only
+# post-gate marks (written with "v": 2) are ever restored.
+# v3 (2026-08-01, Jonny: "delete her memory of everything in her current tile space"): every mark
+# recorded during the Route-4/Cerulean border-war era is suspect — the graph-first gym router was
+# marching her into structural dead ends for two days, planting wedge marks on roads that are fine.
+# One more wholesale purge; the fixed router records only honest marks from here.
+WEDGE_MEM_SCHEMA = 3
 # HUD — the WHOLE-PLAYTHROUGH timer (persists across sessions, unlike per-session run_uptime). Stamped
 # once at the first free-roam and read forever after, so the stream HUD shows "how long this journey
 # has taken" not "how long since this launch".
@@ -527,11 +666,62 @@ PLAYTHROUGH_JSON = os.path.join(STATES_CAMPAIGN, "playthrough.json")
 # or "she's been wedged an hour". Game-side fields only (progress/where/badges/last-checkpoint); the
 # dashboard merges in API spend from the bot's own cost-tracker.
 HEALTH_JSON = os.path.join(STATES_CAMPAIGN, "health.json")
+# CREATOR ORDER (2026-07-31, Jonny's pacing debrief: "chat is advice, my word is LAW"). The bot
+# writes creator_order.json when Jonny gives a direct gameplay order OUT LOUD ("stop grinding,
+# go fight Misty"); the roam loop reads it every tick and every prep/prune layer stands down so
+# the ordered action stays on the menu and dominant. TTL-bounded + fulfillment-released so a
+# forgotten order can never park her behavior permanently.
+CREATOR_ORDER_JSON = os.path.join(STATES_CAMPAIGN, "creator_order.json")
+CREATOR_ORDER_TTL_S = float(os.getenv("POKEMON_CREATOR_ORDER_TTL_S", "1800"))
+# MOMENTUM (2026-07-31, the post-Misty Route-4 seam loop): a DECISIVE gym win (zero faints, ace
+# still healthy) latches a persisted momentum state — the readiness floor + bench pin stand DOWN
+# for the NEXT gym and she marches straight at it; the trainers on the road ARE the training
+# (road-bench-XP still arms on march legs). PERSISTED to disk because the live loop was born of a
+# relaunch: the in-memory post-badge beat evaporated with the process and the new milestone's
+# floor parked her in backward grass. Released by: the next badge (re-evaluated fresh), any gym
+# loss (the hard-release branch — loss-bump prep is the safety net), or manual file delete.
+MOMENTUM_JSON = os.path.join(STATES_CAMPAIGN, "momentum.json")
+MOMENTUM_ENABLED = os.getenv("POKEMON_MOMENTUM", "1") == "1"
+# GYM-PREP BUMP PERSISTENCE (2026-08-01, Surge L33 Wartortle DOMINANT re-entry after relaunch):
+# loss bumps used to live only in memory — resume_marathon restarted the process, the bump
+# evaporated, and DOMINANT/GO HARD re-armed immediately against Raichu with a paper bench.
+# Same dir pattern as momentum.json; cleared when the badge lands.
+GYM_PREP_BUMP_JSON = os.path.join(STATES_CAMPAIGN, "gym_prep_bump.json")
+# Squirtle-line rematch bar: after a gym loss, grind targets Blastoise (L36) before re-challenging.
+# Post-Blastoise rematch (2026-08-02): L36 still barely lost to Raichu — +2 more on the ace
+# plus a fieldable bench (~L20) is the short grass farm, not an infinite gym spam.
+BLASTOISE_EVO_LEVEL = 36
+BLASTOISE_REMATCH_LEVEL = int(os.getenv("POKEMON_BLASTOISE_REMATCH_LEVEL", "38"))
+_SQUIRTLE_LINE = frozenset(("squirtle", "wartortle", "blastoise"))
+MOMENTUM_ACE_HP_FRAC = float(os.getenv("POKEMON_MOMENTUM_ACE_HP", "0.60"))
+# MOMENTUM SEED (2026-07-31, Jonny: "she can go to vermillion now"): a repo-committed one-shot
+# latch for a run whose badge win happened BEFORE the momentum code was deployed (the latch only
+# writes at the win moment, so a retroactive ride needs a seed). If MOMENTUM_SEED.json sits next
+# to this file with a badge_count matching the LIVE count and an id not yet consumed, momentum
+# latches on the next roam tick exactly as if the win had been decisive. Consumed ids are recorded
+# in the states dir so a git pull can never re-arm an old seed; releases via the normal paths
+# (next badge / gym loss).
+MOMENTUM_SEED_JSON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MOMENTUM_SEED.json")
+MOMENTUM_SEED_DONE = os.path.join(STATES_CAMPAIGN, "momentum_seed_consumed.json")
+# RESCUE TELEPORT — RETIRED 2026-08-01. The 07-31 escape hatch (field-Teleport off a contested
+# border via the party menu) drove the submenu BLIND and live pressed A on SUMMARY, not TELEPORT —
+# on-stream menu loops, twice. _teleport_rescue is kept (documented, uncalled) but nothing may
+# invoke it until the submenu row is read back, not assumed. Physical relocation goes through the
+# deterministic CKPT/SNAPSHOT promote path in resume_marathon.ps1; forward routing is owned by
+# head_to_gym's BILLED-ROAD PRIORITY.
+TELEPORT_MOVE_ID = 100                       # Gen-3 move id for TELEPORT
+# SEAM-THRASH BREAKER (2026-07-31, the Route-4↔Cerulean border ping-pong): >=3 crossings of the
+# SAME map seam within the window with no badge progress = two mechanisms are fighting over the
+# border. Hard-commit to the forward objective for a few builds and no-go the backward map for
+# the session. POKEMON_SEAM_BREAKER=0 disables.
+SEAM_BREAKER_ENABLED = os.getenv("POKEMON_SEAM_BREAKER", "1") == "1"
+SEAM_WINDOW_S = float(os.getenv("POKEMON_SEAM_WINDOW_S", "120"))
+SEAM_TRIP_N = int(os.getenv("POKEMON_SEAM_TRIP_N", "3"))
 # RULE 17 SANCTITY — bank her NARRATIVE saga (grudge/team-feelings/arc) WITH the checkpoint bundle, next to
 # strat/world/soul, so a checkpoint restore resumes her STORY (not just game+strategy). Core Kira keeps its
 # own states/kira/journey_core.json; this campaign-side copy makes the resume bundle COMPLETE.
 JOURNEY_JSON = os.path.join(STATES_CAMPAIGN, "journey_core.json")
-CAMPAIGN_SAVE_EVERY = int(os.getenv("POKEMON_CAMPAIGN_SAVE_EVERY", "5"))   # heartbeat-save every N roam ticks
+CAMPAIGN_SAVE_EVERY = int(os.getenv("POKEMON_CAMPAIGN_SAVE_EVERY", "2"))   # heartbeat-save every N roam ticks
 # DENSE AUTO-CHECKPOINT (2026-07-09) — the rolling campaign anchor above is a SINGLE overwriting file
 # ("now" only). For a dev fix→reload→verify loop across a 25-30h run you must hop to JUST BEFORE a bug,
 # not restart from the bedroom. So ALSO bank a GROWING, LABELED history of full sanctity bundles into
@@ -540,8 +730,11 @@ CAMPAIGN_SAVE_EVERY = int(os.getenv("POKEMON_CAMPAIGN_SAVE_EVERY", "5"))   # hea
 # campaign-side bundle only and is structurally incapable of writing the sacred states/kira/ spine.
 # watch.py --list surfaces them; watch.py --at <path|alias> reloads one into a canonical-safe sandbox.
 AUTO_CKPT_ENABLED = os.getenv("POKEMON_AUTO_CKPT", "1") == "1"
-CKPT_EVERY_S      = float(os.getenv("POKEMON_AUTO_CKPT_EVERY_S", "720"))   # wall-clock floor (~12 min)
-CKPT_KEEP         = int(os.getenv("POKEMON_AUTO_CKPT_KEEP", "40"))         # retain last N (~16 MB cap)
+# Dense by default (2026-08-02 Jonny): 12-min floor meant every rescue TP'd 20 min backward
+# and she re-walked Diglett's Cave. Keep a fat recent history for live fixes.
+CKPT_EVERY_S      = float(os.getenv("POKEMON_AUTO_CKPT_EVERY_S", "120"))  # ~2 min overworld
+CKPT_EVERY_CAVE_S = float(os.getenv("POKEMON_AUTO_CKPT_EVERY_CAVE_S", "45"))  # Rock Tunnel etc.
+CKPT_KEEP         = int(os.getenv("POKEMON_AUTO_CKPT_KEEP", "80"))         # retain last N
 # INTRA-SEGMENT PROGRESS (2026-07-09, Fix C) — the SHOW/segment spine only banked a checkpoint AFTER a
 # whole segment completed, so a deep failure (e.g. losing to Brock at the END of pallet_to_brock) made
 # the supervisor resume from seg_opening and REPLAY THE ENTIRE SEGMENT from the bedroom (~40 min). Now
@@ -601,8 +794,22 @@ ITEM_GRAB_MAX_DIST  = int(os.getenv("POKEMON_ITEM_GRAB_MAX_DIST", "18"))   # max
 # knocking. General (per-gym via the KB), wired through StrategicPlanner. Revert: POKEMON_GYM_PREP=0.
 GYM_PREP_ENABLED     = os.getenv("POKEMON_GYM_PREP", "1") == "1"
 GYM_PARTY_TARGET     = int(os.getenv("POKEMON_GYM_PARTY_TARGET", "3"))     # aim for ~3 by the early gyms
+# GYM-READINESS FLOOR (2026-07-29): PROACTIVE head_to_gym prune while the KB says the party is
+# hard-unready (too thin / top level under the bar) and a strengthen path exists here. The
+# strategic-stuck floor only trips on >=2 IDENTICAL losses — a gym wall rarely keys identically
+# (junior trainers vs the leader), so a solo underleveled lead ping-pongs into the same gym
+# forever without ever counting as stuck (watched live: solo Wartortle L19 vs Cerulean).
+GYM_READINESS_FLOOR_ENABLED = os.getenv("POKEMON_GYM_READINESS_FLOOR", "1") == "1"
 GYM_PREP_CATCH_TRIES = int(os.getenv("POKEMON_GYM_PREP_CATCH_TRIES", "3")) # bounded catch attempts per prep
 GYM_COVERAGE_TEACH   = os.getenv("POKEMON_GYM_COVERAGE_TEACH", "1") == "1" # teach the ace a coverage move
+# BAG-TM TEACH (2026-08-02): opportunistic — TMs sitting in the case go onto the neediest
+# compatible mon (Teleport-only Abra, plan teach targets), not only the ace at a type wall.
+# Single-use: ROM tm_compatible before every teach.
+# 2026-08-03 NUCLEAR: DEFAULT OFF. New unattended overworld menu nav shipped mid-marathon =
+# exactly the loop class that wrecked the morning (bag opens on the road, stale cursor bytes,
+# no wrong-item abort). Re-arm POKEMON_BAG_TM_TEACH=1 only after an attended smoke.
+BAG_TM_TEACH_ENABLED = os.getenv("POKEMON_BAG_TM_TEACH", "0") == "1"
+BAG_TM_TEACH_MAX = int(os.getenv("POKEMON_BAG_TM_TEACH_MAX", "1"))  # per dispatch (badge / action)
 
 # COVERAGE-TEACH KB (2026-07-10, the Erika grass wall) — when the ACE's whole offense is RESISTED by a
 # gym's typing, teach it a neutral-or-better damaging move from a bag TM/HM. The Erika root: L43 Venusaur's
@@ -623,12 +830,14 @@ _COVERAGE_MOVES = {
     314: (None, 26, 89, "ground", 100),          # TM26 Earthquake
     317: (None, 29, 94, "psychic", 90),          # TM29 Psychic
     318: (None, 30, 247, "ghost", 80),           # TM30 Shadow Ball
-    319: (None, 31, 280, "fighting", 75),        # TM31 Brick Break
+    319: (None, 31, 280, "fighting", 75),        # TM31 Brick Break — Abra CAN learn (not Shock Wave)
     323: (None, 35, 53, "fire", 95),             # TM35 Flamethrower
     326: (None, 38, 126, "fire", 120),           # TM38 Fire Blast
-    291: (None, 3, 145, "water", 60),            # TM03 Water Pulse
+    291: (None, 3, 352, "water", 60),            # TM03 Water Pulse (NOT Bubble #145)
     327: (None, 39, 317, "rock", 50),            # TM39 Rock Tomb
-    322: (None, 34, 351, "electric", 60),        # TM34 Shock Wave
+    322: (None, 34, 351, "electric", 60),        # TM34 Shock Wave — Pikachu/Raichu (NOT Abra)
+    311: (None, 23, 231, "steel", 100),          # TM23 Iron Tail — Abra-compatible nuke
+    328: (None, 40, 332, "flying", 60),          # TM40 Aerial Ace — Spearow/Fearow STAB
 }
 
 
@@ -724,10 +933,21 @@ VERMILION = (3, 5)
 VERMILION_PC_DOOR, VERMILION_MART_DOOR = (15, 6), (29, 17)
 # Vermilion Gym (disasm VermilionCity_Gym; interiors live-verify on first entry): town door (14,25)
 # — CUT-LOCKED behind the fence tree until HM01. Surge at (5,2), fought from (5,3) UP; juniors at
-# (2,11)/(8,13)/(7,8); exits (4-6,19). ⚠ the leader is ALSO gated by the TRASH-CAN electric-lock
-# puzzle (two switches; disasm recon pending) — beat_gym's junior-then-leader pattern is NOT enough
-# here; do not trust a beat_gym('Lt. Surge') run until the can-puzzle solver lands.
+# (2,11)/(8,13)/(7,8); exits (4-6,19). Leader ALSO gated by the trash-can electric-lock puzzle —
+# beat_gym runs env_puzzle.TrashCanPuzzle BEFORE the junior clear (FLAG_BOTH 0x264).
 VERMILION_GYM_DOOR, SURGE_FRONT = (14, 25), (5, 3)
+VERMILION_GYM_INTERIOR = (9, 7)   # live-verified; head_to_gym must re-enter beat_gym when standing here
+CELADON_GYM_INTERIOR = (10, 16)   # live-verified (place table); Erika — same ALREADY-INSIDE contract
+CERULEAN_GYM_INTERIOR = (7, 5)
+SAFFRON_GYM_INTERIOR = (14, 3)
+# Next-gym interior maps: standing HERE must call beat_gym, NEVER route "to city" (that walks
+# her out the door — 2026-08-02 Celadon chalk: enter gym → false blackout/stranded eject).
+GYM_INTERIORS = {
+    "Misty": CERULEAN_GYM_INTERIOR,
+    "Lt. Surge": VERMILION_GYM_INTERIOR,
+    "Erika": CELADON_GYM_INTERIOR,
+    "Sabrina": SAFFRON_GYM_INTERIOR,
+}
 # FLAG_BADGE0x_GET in the SaveBlock1 flag array (base + 0x0EE0): Boulder 0x820, Cascade 0x821.
 FLAG_BADGE_BOULDER, FLAG_BADGE_CASCADE = 0x820, 0x821
 FLAG_BADGE_THUNDER = 0x822
@@ -738,6 +958,29 @@ FLAG_BADGE_RAINBOW = 0x823
 CELADON = (3, 6)
 CELADON_PC_DOOR = (48, 11)
 CELADON_GYM_DOOR = (11, 30)
+# Celadon has NO Poké Mart — the Department Store 2F items clerk IS the Mart (pret
+# CeladonCity_DepartmentStore_2F scripts.inc). Door/stairs/clerk from recon_tm_errand
+# (live 2026-07-07) + IndoorCeladon group index 10 → 1F=(10,0) 2F=(10,1).
+CELADON_DEPT_DOOR = (11, 14)          # overworld → Dept 1F
+CELADON_DEPT_STAIRS_1F = (4, 2)       # 1F → 2F
+CELADON_DEPT_STAIRS_2F = (3, 2)       # 2F → 1F
+CELADON_DEPT_2F = (10, 1)
+CELADON_DEPT_ITEMS_FRONT = (3, 8)     # customer side of counter; items clerk at (1,8)
+# 2026-08-03 (OP-team pass, the Jolteon rite): the 4F "Wiseman Gifts" stone counter. Ground truth
+# pret CeladonCity_DepartmentStore_3F/4F map JSONs: 2F stairs-up (9,2) -> 3F (10,2); 3F stairs-up
+# (3,2) -> 4F (10,3); clerk at (3,13) behind the counter -> customer stands (5,13) facing LEFT
+# (same one-tile-counter shape as the 2F items clerk). Stock order (scripts.inc, row = list index):
+# 0 Poke Doll, 1 Retro Mail, 2 Fire Stone, 3 THUNDER STONE, 4 Water Stone, 5 Leaf Stone.
+CELADON_DEPT_3F = (10, 2)
+CELADON_DEPT_4F = (10, 3)
+CELADON_DEPT_STAIRS_2F_UP = (9, 2)    # 2F → 3F
+CELADON_DEPT_STAIRS_3F_UP = (3, 2)    # 3F → 4F
+CELADON_DEPT_STAIRS_4F_DOWN = (3, 2)  # 4F → 3F
+CELADON_DEPT_STAIRS_3F_DOWN = (9, 2)  # 3F → 2F
+CELADON_DEPT_STONE_FRONT = (5, 13)    # customer side; stones clerk at (3,13)
+ITEM_THUNDER_STONE = 96
+DEPT4F_ROW_THUNDER_STONE = 3
+SPECIES_EEVEE_N, SPECIES_JOLTEON_N = 133, 135
 LAVENDER = (3, 4)                 # the graph gateway to Route 7/8/Celadon, reached only across Rock Tunnel (Flash-gated)
 # Fuchsia (badge 5, Koga) — door/NPC coords from the disasm (FuchsiaCity/FuchsiaCity_Gym
 # map.json, 2026-07-07); the CITY MAP ID is the city-block extrapolation (Pallet 3,0 ..
@@ -780,6 +1023,11 @@ ERIKA_FRONT = (6, 5)     # Erika NPC at (6,4) FACE_DOWN (pret CeladonCity_Gym ma
 # (recon_blaine QUIZ_CHAIN) — if a live general walk wedges there, that seam is the port target.
 CINNABAR = (3, 8)
 CINNABAR_GYM_DOOR = (20, 4)
+# Cinnabar Mart door (2026-08-05, the ball-restock loop postmortem): pret CinnabarIsland
+# map.json warp (19,11) -> MAP_CINNABAR_ISLAND_MART. Without this row the victory lap read
+# "no ball shelf here (3,8)" while standing METERS from a mart that sells Ultra+Great Balls,
+# and marched at Fuchsia through the Seafoam-severed Route 20 forever (the 16:19 stream loop).
+CINNABAR_MART_DOOR = (19, 11)
 BLAINE_FRONT = (5, 5)
 FLAG_BADGE_VOLCANO = 0x826
 # Viridian (badge 8, Giovanni) — same fix. Door (36,10) -> interior (5,1), LIVE-read off
@@ -805,14 +1053,56 @@ CITY_PC_DOORS = {VIRIDIAN: VIRIDIAN_PC_DOOR, PEWTER: PEWTER_PC_DOOR,
                  SAFFRON: SAFFRON_PC_DOOR,   # Saffron: (24,38) (disasm SaffronCity map.json 2026-07-07)
                  (3, 8): (14, 11),           # Cinnabar: (disasm CinnabarIsland map.json 2026-07-07;
                                              # the seafoam_run10 loud-fallback gap)
-                 (3, 9): (11, 6)}            # Indigo Plateau Exterior -> the League center door
+                 (3, 9): (11, 6),            # Indigo Plateau Exterior -> the League center door
                                              # (disasm IndigoPlateau_Exterior.json; victory_run10's
                                              # heal wandered south to R23 without this)
+                 # SEVII CENTERS (2026-08-05, the One-Island teleport-back: with no Sevii entry
+                 # here, _center_reachable_here read the WHOLE archipelago as un-healable, so no
+                 # known-good was ever banked post-ferry and the escape hatch's only target was
+                 # Kanto. pret map.json ground truth, cached .tmp_sym):
+                 (3, 12): (14, 5),           # One Island -> OneIsland_PokemonCenter_1F
+                 (3, 13): (21, 7),           # Two Island -> TwoIsland_PokemonCenter_1F
+                 (3, 14): (14, 27)}          # Three Island -> ThreeIsland_PokemonCenter_1F
 
 # PC interiors share ONE layout — EXCEPT the League center (2-story, nurse behind the long
-# counter at (13,10), stand (13,11)). heal_at_center consults this by DOOR before defaulting
-# to the shared NURSE_FRONT.
-NURSE_FRONT_OVERRIDES = {(11, 6): (13, 11)}
+# counter at (13,10), stand (13,11)) and the One-Island Network Center (nurse (5,2), stand
+# (5,4)). heal_at_center consults this by DOOR before defaulting to the shared NURSE_FRONT.
+NURSE_FRONT_OVERRIDES = {(11, 6): (13, 11), (14, 5): (5, 4)}
+
+# Standing INSIDE one of these maps IS heal-safe by definition (the nurse is in the room) —
+# _center_reachable_here's KB can't see interiors any other way on virgin ground.
+PC_INTERIOR_MAPS = {(32, 0), (33, 2), (34, 1)}   # One/Two/Three Island PokemonCenter_1F
+
+
+# ── REGION PARTITION: Kanto vs the Sevii archipelago (2026-08-05, the teleport-back) ─────────
+# There is NO overworld road between the regions — only Bill's ferry / the Seagallop. A wedge
+# on one side must therefore NEVER be answered with a savestate banked on the other side (the
+# 08:50 incident: two watchdog trips inside the One-Island PC reloaded the pre-ferry Cinnabar
+# bank — "teleported randomly back across the sea"). Partition (pret map_groups.json):
+#   group 3 (TownsAndRoutes): 0-11 Kanto towns, 12-18 the island hubs, 19-44 Kanto routes,
+#     45+ Sevii routes (Kindle Road (3,45) .. the later islands' paths);
+#   group 1 (Dungeons): 96+ are Sevii (Mt. Ember 96-108, Berry Forest 109, Icefall etc.);
+#   group 2 (SpecialArea: Navel Rock / Trainer Tower / Birth Island) = ferry-only = Sevii;
+#   interiors: groups 4-30 are Kanto city/route rooms, 31+ are island rooms.
+def map_region(m):
+    """'kanto' | 'sevii' for a (group, num) map id. Deterministic, total (unknowns bucket by
+    their group's side) — the reload law needs an answer for every map she can stand on."""
+    g, n = int(m[0]), int(m[1])
+    if g == 3:
+        return "sevii" if (12 <= n <= 18 or n >= 45) else "kanto"
+    if g == 1:
+        return "sevii" if n >= 96 else "kanto"   # 96 = MtEmber_RubyPath_B4F (oddly filed
+        #                                          BEFORE the Exterior in pret's group order)
+    if g == 2 or g >= 31:
+        return "sevii"
+    return "kanto"
+
+
+# NEW-AREA GRACE (2026-08-05): the first minutes on a map the harness has NO NAME for are
+# EXPLORATION, not a wedge — arriving somewhere never-visited is progress by definition. While
+# the grace holds, the watchdog's disengage ladder keeps its gentle rungs (B + step-away, exit
+# to the overworld) but must NOT escalate to a savestate reload.
+NEW_AREA_GRACE_S = float(os.getenv("POKEMON_NEW_AREA_GRACE_S", "300"))
 
 # Bill's PC console stand in the SHARED Center interior — top wall, right of the nurse (screenshot-
 # calibrated in recon_pcbox on the Route 10 Center). Same shared layout as NURSE_FRONT=(7,4), so this
@@ -840,8 +1130,8 @@ GYMS = {
     "Brock": GymSpec("Brock", PEWTER, PEWTER_GYM_DOOR, BROCK_FRONT, FLAG_BADGE_BOULDER, 2, "UP"),
     "Misty": GymSpec("Misty", CERULEAN, CERULEAN_GYM_DOOR, MISTY_FRONT, FLAG_BADGE_CASCADE, 0, "UP"),
     # Registered so head_to_gym routes to the door (whose approach is the CUT TREE — standing at it
-    # arms the HM_OBSTACLE gate -> the hm01 questline -> the S.S. Anne). The gym itself stays
-    # UNBEATABLE until the trash-can puzzle solver lands (see VERMILION_GYM_DOOR note).
+    # arms the HM_OBSTACLE gate -> the hm01 questline -> the S.S. Anne). Interior puzzle solved by
+    # TrashCanPuzzle (env_puzzle) before juniors/leader — see VERMILION_GYM_DOOR note.
     "Lt. Surge": GymSpec("Lt. Surge", VERMILION, VERMILION_GYM_DOOR, SURGE_FRONT,
                          FLAG_BADGE_THUNDER, 0, "UP"),
     "Erika": GymSpec("Erika", CELADON, CELADON_GYM_DOOR, ERIKA_FRONT,
@@ -869,6 +1159,37 @@ GYMS = {
 # resolves through gamedata/frlg_gates.json (a strike step, no door) so _derive_questline -> the
 # registered dungeon strike fires. FireRed facts isolated to the KB + this table (rule 14). Sabrina's
 # gym is Rocket-blocked until Silph Co. clears (FLAG_HIDE_SAFFRON_ROCKETS 0x3E).
+# ON-ROAD BLOCKER questline keys (hoisted 2026-08-04 from the head_to_gym executor so the team-build
+# breather shares the same truth): errands that ARE the billed road (Flash-class), never detours —
+# GO-HARD waives its park for these, and roster surgery (the team-build breather) yields to them.
+ROAD_BLOCKER_KEYS = {
+    "flash", "cut", "silph_scope",
+    "FLAG_GOT_POKE_FLUTE", "FLAG_WOKE_UP_ROUTE_12_SNORLAX",
+    "FLAG_GOT_TEA", "FLAG_HIDE_SAFFRON_ROCKETS",
+    # BLAINE SEA-ROAD CHAIN (2026-08-04 LIVE, badges=6, the Route 19 open-sea wedge Jonny watched
+    # ~30 min): the badge-7 billed road is Fuchsia -> Route 19 -> Route 20 -> Cinnabar and its
+    # west/south legs are OPEN SEA — impassable on foot. The proactive HM-PREREQ correctly opened
+    # the Surf errand ("Blaine needs surf — opening the acquisition errand before the sea march"),
+    # but 'surf' wasn't listed here, so GO-HARD/ACE-CARRIES parked it every tick ("head_to_gym
+    # IGNORES the questline hijack ('surf'/step=surf...)") and drove head_to_gym into the sea:
+    # "genuine wall/zone gap ... TRAVEL WEDGE ... no_route", BORDER PING-PONG + SEAM-THRASH
+    # breakers firing, Fuchsia<->Route19 regroup forever. Same class as the SAFFRON PAIR
+    # (2026-08-03): these errands ARE the billed road, never detours. Whole chain billed at once
+    # so the NEXT gate doesn't wedge the same way: surf/strength are the Safari strike ('strength'
+    # chains through its prereq step 'gold_teeth', the Warden's item ball — the actionable.missing
+    # while unfetched, so it must be waived too), 'seafoam' = the Seafoam B3F boulder crossing
+    # (success flag FLAG_STOPPED_SEAFOAM_B3F_CURRENT), 'secret_key' = the Mansion key that opens
+    # Blaine's door (success flag FLAG_HIDE_POKEMON_MANSION_B1F_SECRET_KEY). Keys match
+    # Gate.missing / Step.missing (frlg_gates.json capability keys), NOT the flag names — the
+    # gates bill missing='surf'/'seafoam'/'secret_key' (GYM_PREREQS + _seafoam_gate/_mansion_gate).
+    "surf", "strength", "gold_teeth", "seafoam", "secret_key",
+}
+# LEGENDARY-HUNT questline keys (2026-08-04): deliberately NOT in ROAD_BLOCKER_KEYS — a trophy
+# hunt must never hijack the badge march from across the map. GO-HARD instead waives its park
+# for these via a PROXIMITY test (_hunt_anchor_proximate): the hunt runs only when its anchor
+# country is the map under her feet or one live edge-connection away (the Cinnabar->Route 20
+# Articuno return after the Ultra restock). Keys match Gate.missing (frlg_gates.json entries).
+LEGENDARY_HUNT_KEYS = {"zapdos", "articuno", "moltres", "mewtwo"}
 GYM_PREREQS = {
     "Sabrina": (0x3E, "FLAG_HIDE_SAFFRON_ROCKETS",
                 "Sabrina's gym is blocked — Team Rocket has Silph Co. locked down in the middle of the city"),
@@ -915,8 +1236,17 @@ HEAL_ITEMS = {13: "Potion", 22: "Super Potion", 21: "Hyper Potion", 20: "Max Pot
 # status NAME -> (cure item id, cure name). Awakening(17) cures sleep; Parlyz Heal(18) paralysis; etc.
 STATUS_CURE = {"poison": (14, "Antidote"), "burn": (15, "Burn Heal"), "freeze": (16, "Ice Heal"),
                "sleep": (17, "Awakening"), "paralysis": (18, "Parlyz Heal")}
-ITEM_NAMES = {**HEAL_ITEMS, 4: "Poké Ball", 3: "Great Ball", 23: "Full Heal",
-              **{cid: cn for cid, cn in STATUS_CURE.values()}}
+ITEM_NAMES = {**HEAL_ITEMS, 4: "Poké Ball", 3: "Great Ball", 2: "Ultra Ball", 23: "Full Heal",
+              **{cid: cn for cid, cn in STATUS_CURE.values()},
+              110: "Nugget", 109: "Star Piece", 107: "Big Pearl", 108: "Stardust", 106: "Pearl"}
+# PURE-CASH LOOT (2026-08-04, the Ice Beam fund — 'get ice beam to OP herself through the
+# game'): items whose ONLY use is selling (pret items.h ids; sell = half list price).
+# Nugget ¥5,000 | Star Piece ¥4,900 | Big Pearl ¥3,750 | Stardust ¥1,000 | Pearl ¥700.
+# Mushrooms are DELIBERATELY excluded (Two Island move-tutor currency) and Heart Scale too.
+# Sold richest-first on every buy_at_mart trip (_mart_sell_loot) — a human always cashes
+# Nuggets at the counter they're already standing at; the proceeds bankroll the Game Corner
+# TM13 budget (the _icebeam_gate arms itself the tick the money's there).
+MART_SELL_LOOT = (110, 109, 107, 108, 106)
 
 # CITY -> Mart town door (extend as towns are reached; an unmapped city = no stock-up offered, LOUD).
 CITY_MART_DOORS = {PEWTER: PEWTER_MART_DOOR, VIRIDIAN: VIRIDIAN_MART_DOOR,
@@ -927,7 +1257,15 @@ CITY_MART_DOORS = {PEWTER: PEWTER_MART_DOOR, VIRIDIAN: VIRIDIAN_MART_DOOR,
                    # Fuchsia Mart (night-shift 1) — the badge-5 Koga potion-stall stock-up.
                    FUCHSIA: FUCHSIA_MART_DOOR,
                    # Saffron Mart (night-shift 4) — the pre-Silph Hyper-Potion stock-up (Gary/Charizard).
-                   SAFFRON: SAFFRON_MART_DOOR}
+                   SAFFRON: SAFFRON_MART_DOOR,
+                   # Cinnabar Mart (2026-08-05) — the endgame sea corridor's OWN ball/kit shelf.
+                   CINNABAR: CINNABAR_MART_DOOR,
+                   # Three Island Mart (2026-08-06) — Sevii Ultra shelf while stranded on the
+                   # archipelago (Bill's sail-home is Lostelle-gated; Two Island's market only
+                   # sells Great Balls until Lostelle is rescued). Door (18,12) from pret
+                   # ThreeIsland/map.json warp -> MAP_THREE_ISLAND_MART.
+                   (3, 14): (18, 12)}
+# Celadon "Mart" = Dept Store 2F items clerk (no CITY_MART_DOORS entry — buy_at_celadon_dept owns it).
 
 # DOOR APPROACH WAYPOINTS (game-knowledge, rule 14): some Mart/building doors sit in a pocket the
 # direct BFS-travel OSCILLATES into and never reaches (Fuchsia's central ponds wall the Mart door
@@ -961,6 +1299,20 @@ MART_STOCK = {
     # pret SaffronCity_Mart scripts.inc pokemart list (2026-07-10). Hyper Potion(21) is row 1 — the
     # NS4 pre-Silph stock-up target; buy_at_mart's per-purchase bag-delta guards any mis-row LOUD.
     SAFFRON: [3, 21, 24, 23, 85, 88],
+    # Celadon Dept Store 2F items clerk (pret CeladonCity_DepartmentStore_2F_Items):
+    # GreatBall, SuperPotion, Revive, Antidote, ParlyzHeal, Awakening, BurnHeal, IceHeal, SuperRepel.
+    # Keyed by overworld CELADON so _cure_item_on_shelf / _best_potion_for_sale see the shelf;
+    # actual buys go through buy_at_celadon_dept (stairs + items clerk), not buy_at_mart.
+    CELADON: [3, 22, 24, 14, 18, 17, 15, 16, 87],
+    # Cinnabar rows (2026-08-05) from pret CinnabarIsland_Mart scripts.inc pokemart list:
+    # UltraBall, GreatBall, HyperPotion, Revive, FullHeal, EscapeRope, MaxRepel. The per-purchase
+    # bag-delta verify guards any mis-row LOUD (balls land in the Balls pocket; the pocket-aware
+    # count covers them — pitfall 7). This shelf is the victory lap's hunt-restock anchor.
+    CINNABAR: [2, 3, 21, 24, 23, 85, 88],
+    # Three Island Mart (2026-08-06) from pret ThreeIsland_Mart scripts.inc:
+    # UltraBall, HyperPotion, Revive, FullHeal, EscapeRope, MaxRepel. The Moltres war-chest
+    # restock leg sails here from One Island Harbor (no Cinnabar road until Lostelle).
+    (3, 14): [2, 21, 24, 23, 85, 88],
 }
 MART_CURSOR = 0x02039940   # u16 sShopData.selectedRow (pret sym 0x02039934+0xC) — the WINDOW row only
 MART_SCROLL = 0x02039942   # u16 sShopData.scrollOffset — items hidden above the window
@@ -969,13 +1321,31 @@ MART_SCROLL = 0x02039942   # u16 sShopData.scrollOffset — items hidden above t
 # exited the shop and the buy-mash re-entered and bought row 0). Every shop nav reads the SUM.
 # Shopping policy (named, tunable): top potions up to this; buy this many of each needed cure; keep this
 # much money in reserve (never drain the wallet). Quantities are sensible, not min-max hoarding.
-SHOP_POTION_TARGET = 6
+# 2026-08-03 creator doctrine ("make yourself broke so that she's stocked up"): a lost gym-road
+# battle with a near-empty bag proved 6 was a snack, not a kit. Money exists to be converted
+# into not-losing; the SHOP_MONEY_FLOOR still guards true bankruptcy.
+SHOP_POTION_TARGET = 12
+# THE ULTRA WAR-CHEST (2026-08-05 addendum, Jonny at Moltres: "maybe she needs more ultra
+# balls, like the buy limit"; 2026-08-06 chat: "~50 balls" with only 6 in the bag): while a
+# legendary hunt is owed, restock fills the Ultra tier to a HEALTHY STACK — ~1200 each, so
+# 50 is ~60k; buy_at_mart's SHOP_MONEY_FLOOR + the sell-loot-first pass keep the wallet
+# honest, and the buy loop stops early if funds run dry (buys what she can afford).
+# Env override for soak tuning without a code push.
+HUNT_ULTRA_TARGET = int(os.getenv("POKEMON_HUNT_ULTRA_TARGET", "50"))
+# HARD ENGAGE FLOOR (2026-08-06 LIVE, Jonny: 'going back to Moltres with only 5-6'):
+# never press A on a legendary below this Ultra count — war-chest re-arms even after a
+# soft-reload of an old 6-ball pre-bank. Wallet may stop short of TARGET; this is the
+# "enough to try" bar (~$24k + sell-loot at 1200 each).
+HUNT_ULTRA_MIN_ENGAGE = int(os.getenv("POKEMON_HUNT_ULTRA_MIN_ENGAGE", "20"))
+# Baseline potions EVERY gym gets before the door (2026-08-02 Erika chalk — she walked into
+# Celadon Gym empty-handed and blacked out). Stall gyms override with a deeper stock.
+GYM_POTION_TARGET = int(os.getenv("POKEMON_GYM_POTION_TARGET", "12"))
 # POTION-STALL gyms (night-shift 1): a leader that is an ATTRITION wall for a solo-carry — Koga's
 # 4-mon poison gauntlet (~390 HP) out-damages a lone L53 Venusaur that has NO healing items (shift-17:
 # 5+ straight losses without potions; WINS with them). A real player stocks Super Potions at the
 # gym-city Mart and heals through it. gym.name -> how many potions to carry into the fight. Game-fact
 # isolated here (rule 14); the pre-gym stock-up leg buys up to this from the gym-city Mart.
-POTION_STALL_GYMS = {"Koga": 30}
+POTION_STALL_GYMS = {"Koga": 30, "Erika": 12}
 # PRE-SILPH HYPER-POTION target (night-shift 4): Gary's Silph gauntlet ends on a Charizard (Fire/Flying)
 # that 2x-burns solo Venusaur while QUAD-resisting her Grass — she can only chip with weak Cut, so the
 # ONLY winning line is to OUT-HEAL the Fire. Super Potions (50 HP) ~= Charizard's chip (tread water ->
@@ -992,8 +1362,27 @@ SILPH_REVIVE_TARGET = 5
 # BATCH 6 PHASE 2 — FORESIGHT target: when she's up against a wall she can't beat yet, a real player
 # stocks up DEEPER before pushing on (she has $7-9k here). Bumps the buy-to target so "stock up before
 # I take that bridge" is a live, characterful option — not only a restock when she's already empty.
-SHOP_POTION_FORESIGHT = 10
-SHOP_CURE_QTY = 2
+SHOP_POTION_FORESIGHT = 16
+SHOP_CURE_QTY = 3
+# Pre-gym Bulbapedia kit (2026-08-02): how many of each KB `bring_cures` status cure to
+# carry into the fight (Parlyz Heal vs Surge, Antidote vs Koga). Tunable; not a hoard.
+GYM_CURE_TARGET = int(os.getenv("POKEMON_GYM_CURE_TARGET", "4"))
+ITEM_FULL_HEAL = 23
+# ── FIELD-HEAL DOCTRINE (2026-08-05, the Mt. Ember climb: 'she is not healing outside of
+# battle when she probably should'): between battles / at strike leg boundaries, if the ACE
+# is under FIELDHEAL_ACE_FRAC (or any other standing member under FIELDHEAL_BENCH_FRAC),
+# drink from the bag via the PROVEN TeachFlow rails — cheapest-adequate tier first (never a
+# Full Restore on a 20-point chip). The legendary press adds a TOP-UP seam (ace to near-full
+# before the static A-press). Bounded, honest empty-pocket skip, never mid-battle (that's
+# battle_agent's item flow), never over an open dialogue box. All logs tagged [fieldheal].
+FIELD_HEAL_ENABLED = os.getenv("POKEMON_FIELD_HEAL", "1") == "1"
+FIELDHEAL_ACE_FRAC = float(os.getenv("POKEMON_FIELDHEAL_ACE_FRAC", "0.50"))
+FIELDHEAL_BENCH_FRAC = float(os.getenv("POKEMON_FIELDHEAL_BENCH_FRAC", "0.35"))
+FIELDHEAL_TOPUP_FRAC = float(os.getenv("POKEMON_FIELDHEAL_TOPUP_FRAC", "0.85"))
+FIELDHEAL_TOPUP_MIN_MISSING = int(os.getenv("POKEMON_FIELDHEAL_TOPUP_MIN_MISSING", "20"))
+FIELDHEAL_MAX_PER_SEAM = int(os.getenv("POKEMON_FIELDHEAL_MAX_PER_SEAM", "3"))
+# How much each potion tier heals (Gen 3) — same fact table battle_agent._POTION_HEALS uses.
+POTION_HEAL_AMOUNT = {13: 20, 22: 50, 21: 200, 20: 9999, 19: 9999}
 # BATCH 6 PHASE 3 — Poké Ball FORESIGHT: a teammate is the answer to a wall (Phase 2), and you can't
 # catch one with an empty bag. When she's running a thin team and low on balls, "grab some Poké Balls"
 # surfaces as a real shopping need — so she goes into the grass equipped to actually come home with a
@@ -1179,6 +1568,13 @@ class Campaign:
         # so a blocker was re-discovered + re-bumped forever). Fed from travel's chokepoint gauntlet,
         # the B-2 dialogue-loop disengage, and the Layer-B watchdog wedge-spot mark — one source of truth.
         self._blocked_npcs = set()
+        # WEDGE MEMORY ACROSS RESTARTS (2026-07-30): reload the persisted block memory so a fresh
+        # process (supervisor relaunch after an abandon / a crash / Jonny's morning resume) wakes up
+        # REMEMBERING which tiles trapped her — instead of re-approaching the same wedge with amnesia.
+        self._load_wedge_memory()
+        # GYM-PREP BUMP ACROSS RESTARTS (2026-08-01): same class of hole as momentum — a Surge loss
+        # bump that only lived in RAM vanished on resume_marathon and DOMINANT re-armed at L33.
+        self._gym_prep_bump = self._load_gym_prep_bump()
         # LAYER B — UNIVERSAL WALL-CLOCK WATCHDOG: created at free_roam start. `_stuck_request` is the
         # latched disengage the live render hook sets when StuckWatch trips (honored at the top of the
         # roam loop AND cooperatively by travel via stuck_check); `_watchdog_trips` counts trips this
@@ -1186,6 +1582,7 @@ class Campaign:
         self._stuckwatch = None
         self._stuck_request = None
         self._watchdog_trips = 0
+        self._latch_bails = 0     # consecutive travel legs bailed on ONE latch (storm breaker)
         # Batch-WORLD — her WORLD-MODEL + CAPABILITY-MODEL (sense of place). Pure data/awareness,
         # headless-safe; feeds the oracle via the same `place` seam, never decides for her. Seeded
         # with the known overworld nodes, enriched live each tick, persisted across --resume.
@@ -1220,6 +1617,16 @@ class Campaign:
         self._raw_battle_runner = battle_runner
         self.battle_runner = self._observed_battle_runner
         battle_runner = self._observed_battle_runner   # travel + every consumer gets the observed one
+        # LEGEND SOFT-RELOAD hook (2026-08-06 LIVE): catch_pokemon MUST NOT flee a static
+        # legendary (RUN → MonFlewAway → free-retry "respawn"). BattleAgent calls this to
+        # rewind 'pre-<key>' without pressing RUN.
+        def _legend_soft_reload(key):
+            ok = self._reload_hunt_checkpoint(key)
+            if ok:
+                self._legend_soft_reloads = getattr(self, "_legend_soft_reloads", 0) + 1
+            return ok
+        battle_agent.LEGEND_SOFT_RELOAD = _legend_soft_reload
+        self._legend_soft_reloads = 0
         # default sink must accept emit's kwargs (PokemonSoul.emit calls on_event(text, kind=, tier=));
         # a 1-arg default crashed headless soul fires (live passes voice.emit which already accepts them).
         self.on_event = on_event or (lambda s, **_k: log(f"[event] {s}"))
@@ -1274,6 +1681,10 @@ class Campaign:
         # that moment (badges, party size, dex caught) so a reload can NEVER rewind past a real gain.
         self._last_good_state = None
         self._last_good_gain = None
+        self._last_good_map = None       # (group, num) at bank time — the region-partition law
+        self._map_first_seen = {}        # map -> first-tick ts this session (NEW-AREA grace)
+        self._region_reload_skips = 0    # region-local disk fallback: how many newest same-
+        #                                  region checkpoints to skip (walks BACK; GREEN resets)
         # PHASE 1 (deep-wedge floor) — rolling ring of checkpoints banked at GAIN SEAMS (badge/teammate/
         # catch): the progressively-older fallbacks the deep-wedge revert walks back through when the
         # escape-hatch (recent-good) keeps re-wedging. Each entry: {state, gain, label}. In-memory (the
@@ -1295,7 +1706,7 @@ class Campaign:
         self.trav = tv.Traveler(bridge, battle_runner=battle_runner, render=self.render,
                                 on_event=self.on_event, beat=self.beat,
                                 pause_check=lambda: self.needs_heal() and not self._suppress_heal,
-                                stuck_check=lambda: self._stuck_request is not None,
+                                stuck_check=self._stuck_latched,   # latch honor + TTL self-heal (no instabail storms)
                                 blocked_npcs=self._blocked_npcs,   # LAYER A: shared route-around memory
                                 field_clear=lambda hm, face: (
                                     self.field.clear_obstacle(hm, face)
@@ -1324,8 +1735,10 @@ class Campaign:
         self._battle_ran_this_action = True    # blackout-evidence: a whiteout implies a battle RAN
         # P-1(a): the FIRSTS — a first-timer's first wild rustle / first real trainer fight
         # are events a viewer should feel. One beat each, early-game gated in _first_beat.
+        _was_trainer = False           # captured NOW while the flags are live (stale post-battle)
         try:
             if bool(self.b.rd32(ram.GBATTLE_TYPE_FLAGS) & 0x08):
+                _was_trainer = True
                 self._first_beat("trainer_battle",
                                  "my first REAL trainer battle — an actual person wants to "
                                  "fight me. okay. deep breath. this is what training's for.")
@@ -1475,6 +1888,24 @@ class Campaign:
                 self._struggle_flagged = False             # bench recovered — re-arm for the next scare
         except Exception as _e:
             log(f"   [struggle] check skipped: {_e}")
+        # FIGHT-WON CHECKPOINT SEAM (2026-08-04, Jonny: 'we better be saving after every fight so
+        # we can reload her insta when things go wrong and not have to waste time'). The periodic
+        # cadence is ~2 min and DEFERS while a battle is live, so a Silph gauntlet win could sit
+        # up to two minutes unbanked — a wedge in the NEXT fight rewound the previous victory.
+        # Bank the full sanctity bundle right at the victory seam: trainer wins only (unrepeatable
+        # progress; wild grass fights stay on the cadence — 80-slot history churn for nothing),
+        # and only once the battle is actually over (a mid-battle pin is a losing-fight rewind
+        # trap, same doctrine as the roam-loop deferral). Resets the cadence clock so the
+        # periodic path doesn't double-bank seconds later. Best-effort + LOUD (Constraint #3).
+        try:
+            if (_was_trainer and str(record_out).lower() == "win"
+                    and AUTO_CKPT_ENABLED and not st.in_battle(self.b)):
+                self._save_campaign("fight-won"); self._continuity_save()
+                if self._auto_checkpoint("fight-won"):
+                    self._last_ckpt_t = time.time()
+                    log("   [ckpt] FIGHT-WON checkpoint banked — reload lands right after this victory")
+        except Exception as _cke:
+            log(f"   [ckpt] fight-won checkpoint skipped ({_cke}) — LOUD")
         return out
 
     def _advance_dialogue(self, taps=12):
@@ -1564,6 +1995,9 @@ class Campaign:
             here = tv.coords(self.b)
             if here is None:
                 return False
+            if tuple(m) in PC_INTERIOR_MAPS:         # standing INSIDE a Center — heal-safe by definition
+                return True                          # (2026-08-05: the One-Island PC read 'un-healable'
+                                                     #  and no known-good ever banked post-ferry)
             if m == ROUTE3:                          # Route 3 heals west at Pewter (its normal connection)
                 return True
             grid = tv.Grid(self.b)
@@ -1783,9 +2217,25 @@ class Campaign:
         fights en route) blows the 300s default at half-distance (run-5: aborted at step 72,
         door 28 tiles away, 'no reachable door warped')."""
         before = tv.map_id(self.b)
+        # Clear a stale watchdog latch BEFORE the approach leg — grind/prep wedges latch it and
+        # then every 1-tile walk to the gym door instabails (2026-08-02 Erika door forever-loop).
+        try:
+            self._stuck_request = None
+            if self._stuckwatch is not None:
+                self._stuckwatch.reset()
+        except Exception:
+            pass
         doors = self._door_tiles()
         if not doors:
             log("   no door/warp tiles (0x6x) found on this map"); return "no_warp"
+        # CLEARED-DUNGEON REFUSE (2026-08-02): post-Cascade never re-enter Mt. Moon via a Route 4
+        # mouth — graph priors + Diglett adjacency kept walking her back into finished ground.
+        _warp_dest = {}
+        try:
+            _warp_dest = {tuple(wxy): tuple(d) for (wxy, d, _i) in tv.read_warps(self.b)}
+        except Exception:
+            _warp_dest = {}
+        _bc_now = sum(1 for i in range(8) if self.has_badge(0x820 + i))
         cur = tv.coords(self.b)
         # WAYPOINT-GUIDED APPROACH: a door in a maze-walled pocket (Fuchsia Mart (11,15)) makes the
         # direct BFS-travel oscillate and cap far away. If we have KB waypoints for this exact door,
@@ -1810,6 +2260,11 @@ class Campaign:
         approach_dy, step_key = (-1, "DOWN") if prefer == "south" else (1, "UP")
         log(f"   {len(doors)} door(s); candidates (chosen order): {order}")
         for door in order:
+            _dest = _warp_dest.get(tuple(door))
+            if (_dest in getattr(self, "_MT_MOON_MAPS", ()) and _bc_now >= 2):
+                log(f"   [warp] REFUSING door {door} -> {_dest} (Mt. Moon already cleared; "
+                    f"badge_count={_bc_now}) — not re-entering finished dungeon")
+                continue
             approach = (door[0], door[1] + approach_dy)  # stand just beside the door
             # FAST reachability pre-check (BFS only) so unreachable doors are skipped
             # instantly instead of a slow walk-then-fail. Uses grass-ALLOWED collision
@@ -1820,12 +2275,52 @@ class Campaign:
             # route's south half. Same water-start law as _reachable_grass/_door_passthrough.
             grid = tv.Grid(self.b)
             _wk = grid.walkable_or_surf if self._surf_usable() else grid.walkable
+            _here = tv.coords(self.b)
+            # Already ON / near the approach tile — step in NOW. No travel.
+            # Erika chalk: she stood at (11,32)/(11,31) while travel→approach kept getting
+            # watchdog-bailed, so enter never pressed UP into (11,30).
+            _door_md = abs(_here[0] - approach[0]) + abs(_here[1] - approach[1])
+            if _here == approach or _here == tuple(door) or _door_md <= 2:
+                if _here != approach and _here != tuple(door):
+                    log(f"   door {door}: near approach ({_here}→{approach}, d={_door_md}) — short step")
+                    for _ in range(6):
+                        _h = tv.coords(self.b)
+                        if _h == approach or _h == tuple(door):
+                            break
+                        if _h[1] > approach[1]:
+                            self.b.press("UP", 8, 8, self.render, owner="agent")
+                        elif _h[1] < approach[1]:
+                            self.b.press("DOWN", 8, 8, self.render, owner="agent")
+                        elif _h[0] > approach[0]:
+                            self.b.press("LEFT", 8, 8, self.render, owner="agent")
+                        elif _h[0] < approach[0]:
+                            self.b.press("RIGHT", 8, 8, self.render, owner="agent")
+                        self._advance_dialogue(taps=1)
+                        if tv.map_id(self.b) != before:
+                            log(f"   WARPED {before} -> {tv.map_id(self.b)} via door {door} (short-step)")
+                            self._learn_transit()
+                            return "warped"
+                log(f"   door {door}: at {tv.coords(self.b)} (approach={approach}) — stepping {step_key} in")
+                for _ in range(10):
+                    self.b.press(step_key, 8, 8, self.render, owner="agent")
+                    self._advance_dialogue(taps=2)
+                    if tv.map_id(self.b) != before:
+                        log(f"   WARPED {before} -> {tv.map_id(self.b)} via door {door} (on-tile)")
+                        self._learn_transit()
+                        return "warped"
             if tv.bfs(grid, tv.coords(self.b), lambda t: t == approach,
                       walkable=_wk):
                 log(f"   reachable door {door}: walking to approach {approach}")
                 # max_steps 900 (was 300): a long-map approach (Route 12's ~100-row pier maze,
                 # sabrina_run2) burns 300 steps on obstacle re-routing and dies 26 rows short —
                 # a BUDGET failure misread as entry geometry. Wall-clock stays the real bound.
+                # Re-clear watchdog each approach — grind leftovers must not kill a 1-tile walk.
+                try:
+                    self._stuck_request = None
+                    if self._stuckwatch is not None:
+                        self._stuckwatch.reset()
+                except Exception:
+                    pass
                 r = self.trav.travel(target_map=None, arrive_coord=approach, max_steps=900,
                                      max_seconds=(budget_s or 300))
                 if r == "need_heal":
@@ -1833,8 +2328,8 @@ class Campaign:
                 if r == "timeout" and pick is not None:
                     log(f"   approach to {door} ran out of steps/time — retryable, NOT entry geometry")
                     return "no_reach"
-                if r == "arrived":
-                    for _ in range(5):                   # step INTO the doorway -> warp
+                if r == "arrived" or tv.coords(self.b) == approach:
+                    for _ in range(8):                   # step INTO the doorway -> warp
                         self.b.press(step_key, 8, 8, self.render, owner="agent")
                         self._advance_dialogue(taps=2)   # gate buildings may print a line
                         if tv.map_id(self.b) != before:
@@ -1872,12 +2367,17 @@ class Campaign:
     def _learn_transit(self):
         """TRANSIT-TIME warp learning (2026-07-07, flute_run4): _learn_map fires once per roam
         TICK, but door-passthrough/enter_warp cross interiors WITHIN one action — the UGP huts'
-        warps were never recorded (world model: visited=False, warps={}), so the mental-map BFS
+        warps were never recorded (world model: visited=False, warps={}), so         the mental-map BFS
         dead-ended at the hut door and read 'no route Lavender->Celadon' though she'd WALKED that
-        road. Fold the map we just landed on into the graph immediately. Pure reads; never raises."""
+        road. Fold the map we just landed on into the graph immediately. Pure reads; never raises.
+        RENDERED (2026-07-30, the 'pixelated glitch with a noise' stream report): this fires on
+        EVERY travel map change, and the old loop advanced frames without the render hook — the
+        window froze on FireRed's mid-mosaic transition frame (~0.5s of pixelated freeze) while the
+        warp SFX kept playing. Every settle frame now draws."""
         try:
             for _ in range(30):                 # settle past the mid-transition layout window
                 self.b.run_frame()
+                self.render()
             self._learn_map()
         except Exception as _lt:
             log(f"   [world] transit learn skipped: {_lt}")
@@ -1970,9 +2470,11 @@ class Campaign:
                         self.b.press(k2, 8, 10, self.render, owner="agent")
                         for _ in range(30):
                             self.b.run_frame()
+                            self.render()
                         if tuple(tv.map_id(self.b)) != m0:
                             for _ in range(60):
                                 self.b.run_frame()
+                                self.render()
                             log(f"   directional warp {wt} (behavior 0x{bh:02x}) fired on approach via {k2}")
                             self._learn_transit()
                             return True
@@ -1995,12 +2497,13 @@ class Campaign:
             if tuple(tv.map_id(self.b)) == m0 and tuple(tv.coords(self.b) or ()) == tuple(wt):
                 for _ in range(240):
                     self.b.run_frame()
+                    self.render()                     # escalator wait ~4s — MUST draw (frozen-mosaic fix)
                     if tuple(tv.map_id(self.b)) != m0:
                         break
             if tuple(tv.map_id(self.b)) != m0:
                 for _ in range(60):                   # SETTLE the fade-in: the map header/layout
                     self.b.run_frame()                # pointers are mid-transition the instant the
-                #                                       id flips — a back-to-back tile read gets 0s
+                    self.render()                     # id flips — a back-to-back tile read gets 0s
                 log(f"   directional warp {wt} (behavior 0x{bh:02x}) entered via {key}")
                 self._learn_transit()
                 return True
@@ -2021,7 +2524,10 @@ class Campaign:
     # 2-door gatehouse over the 1-door UGP hut (ns6_bail025 NS#8: 8× wedge at (18,0) on the Route-6
     # Celadon leg before self-recovery). Skip them as connector candidates until GOT_TEA opens the
     # guards; post-Tea the set is empty so the gates become normal roads (zero behaviour change).
-    _SAFFRON_GATE_MAPS = {(18, 0), (19, 0)}
+    # 2026-08-04 LIVE: (20,0) added — Route 8's west-end warp (7,10)->(20,0) live-learned this
+    # morning, so it IS the Route 8–Saffron gate ((19,0) = Route 7's, (18,0) = Route 6's, all
+    # live-proven). It was MISSING here, which is half of the post-Koga Saffron orbit story.
+    _SAFFRON_GATE_MAPS = {(18, 0), (19, 0), (20, 0)}
 
     def _saffron_gate_dead_ends(self):
         """The Saffron gatehouse maps that dead-end at guard-blocked Saffron pre-Tea (FLAG_GOT_TEA
@@ -2093,6 +2599,15 @@ class Campaign:
             dm = tuple(door_dest.get(tuple(t)) or ())
             if want_map and dm == tuple(want_map):
                 return 0                              # a door straight into the wanted map
+            # SAFFRON LAST-MILE (2026-08-04 LIVE, the post-Tea Route-8 orbit Jonny watched): a
+            # gatehouse door IS the door into Saffron — but its warp dest reads the gate
+            # INTERIOR ((20,0) etc.), never (3,10), so the want-rank above can't see it. Tied
+            # on rank, the 1-tile UGP hut then beat the 11-tile gate on the DISTANCE key every
+            # tick: she "crossed" to the wrong side of the city forever, with the Tea in her
+            # pocket. Post-Tea (dead-end set empty) a gate door ranks like the city itself.
+            if (want_map and tuple(want_map) == SAFFRON
+                    and dm in self._SAFFRON_GATE_MAPS and not _saf_gate):
+                return 0
             try:
                 return 2 if self.world.visited(dm) else 1   # unvisited interiors beat known ground
             except Exception:
@@ -2635,10 +3150,10 @@ class Campaign:
         it) so the leg progresses. Costs a little HP but never wedges; byte-neutral where flee wins.
         GENERAL (rule 14): fixes ANY unescapable-wild retreat, not just Seafoam."""
         out = BattleAgent(self.b, on_event=lambda s, **k: self.on_event(s),
-                          render=self.render, log=lambda m: None).flee(max_seconds=90)
+                          render=self.render, log=log).flee(max_seconds=90)
         if out == "stuck" and st.in_battle(self.b):
             out = BattleAgent(self.b, on_event=lambda s, **k: self.on_event(s),
-                              render=self.render, log=lambda m: None).run(max_seconds=120)
+                              render=self.render, log=log).run(max_seconds=120)
         return out
 
     def level_check(self, min_level, leader="Brock"):
@@ -3170,12 +3685,12 @@ class Campaign:
         cnt = b.rd8(ram.GPLAYER_PARTY_CNT)
         party = []
         for s in range(min(cnt, 6)):
-            sp = st.read_party_species(b, s)
-            base = ram.GPLAYER_PARTY + s * st.PARTY_MON_SIZE
-            lvl = b.rd8(base + self._PARTY_LEVEL_OFF)
-            hp, mx = b.rd16(base + P_HP), b.rd16(base + P_MAXHP)   # PHASE 8 HUD: party-as-family HP bars
-            party.append({"species": st.SPECIES_NAME.get(sp, f"species#{sp}"), "level": lvl,
-                          "hp": hp, "maxhp": mx, "species_id": sp})
+            # Tear-safe public read (2026-08-02): never publish impossible HP like ekans 115/40
+            # that made chat think Blastoise/Ekans swapped stats/abilities.
+            pub = st.read_party_public(b, s)
+            party.append({"species": pub["species"], "level": pub["level"],
+                          "hp": pub["hp"], "maxhp": pub["maxhp"],
+                          "species_id": pub["species_id"]})
         try:                                      # current-map grass: does catch work HERE (vs needing to travel)?
             on_grass_map = bool(tv.Grid(b).grass)
         except Exception:
@@ -3320,14 +3835,21 @@ class Campaign:
         return out
 
     def _engage_trainer(self, T, facing):
-        """Walk to a LAND-standable tile adjacent to a junior trainer, face it, and let its line of
-        sight fire the battle (a trainer can't be A-talked into a fight - it must SEE the player).
+        """Walk to a LAND-standable tile adjacent to a junior trainer, face it, and fire the battle.
         POOL-GYM FIX (the Misty stuck, 2026-07-09): a swimmer stands ON water with only ONE
         land-standable side (Cerulean's (10,12) is engageable only from (9,12); the other 3 fronts
         are water tiles travel WEDGES on -> the old code wedged x4 then FALSELY marked it beaten ->
         walked into a still-gated Misty). So we (a) attempt ONLY standable fronts, and (b) after
         arriving on the sight axis, NUDGE off-and-back so the trainer's 'player entered sight' edge
-        re-fires even when we arrived already standing inside its line. True iff a battle started."""
+        re-fires even when we arrived already standing inside its line.
+
+        Returns 'battle' | 'talked' | 'no' (2026-07-31, the LIVE re-talk loop Jonny watched):
+        an A-talk to an UNDEFEATED gen-3 trainer runs its intro text INTO the battle; a DEFEATED
+        one shows its post-defeat line and closes. So a box that drains WITHOUT a battle is the
+        AUTHORITATIVE in-save 'already beaten' read (survives relaunch, unlike any session set) —
+        report it as 'talked' so callers mark the trainer done and NEVER re-engage it. The old
+        code left that box OPEN and returned False: the box then wedged the next travel leg, the
+        caller re-engaged, and she stood on the walkway re-opening the junior's line forever."""
         try:
             grid = tv.Grid(self.b)
         except Exception:
@@ -3343,19 +3865,30 @@ class Campaign:
                 continue                                       # water/wall front - travel would wedge
             self._gym_move(front, label="engage")
             if st.in_battle(self.b):
-                return True                                    # LoS fired during the walk-in
+                return "battle"                                # LoS fired during the walk-in
             if tv.coords(self.b) != front:
                 continue                                       # couldn't reach this side - try next
             face = self._TOWARD[(-adj[0], -adj[1])]            # turn back toward the trainer body
             for _ in range(4):
                 if st.in_battle(self.b):
-                    return True
+                    return "battle"
                 self.b.press(face, 8, 8, self.render, owner="agent")
                 self.b.press("A", 6, 12, self.render, owner="agent")
                 for _ in range(20):
                     self.b.run_frame()
+                # A box without a battle: drain it ONCE, cleanly, and read the outcome. Battle
+                # after the drain = that was the intro text (undefeated) -> fight. Box closed, no
+                # battle = the post-defeat line -> ALREADY BEATEN in the save. Never blind-A a
+                # live box (that's the page-cycling loop from the stream screenshots).
+                if not st.in_battle(self.b) and dd_box_open(self.b):
+                    self._drain_overworld(label="junior-talk")
+                    if st.in_battle(self.b):
+                        return "battle"
+                    log(f"   GYM: trainer at {T} TALKED instead of fighting (post-defeat line "
+                        f"drained, no battle) — ALREADY BEATEN in the save")
+                    return "talked"
             if st.in_battle(self.b):
-                return True
+                return "battle"
             # LoS didn't fire while we stood still (we arrived already inside its sight, so there was
             # no 'entered' edge). RE-TRIGGER: step to an adjacent standable tile and back onto the
             # front, forcing a fresh sight check. Each neighbour tried once.
@@ -3367,15 +3900,15 @@ class Campaign:
                     continue
                 self._gym_move(nb, label="engage-nudge")
                 if st.in_battle(self.b):
-                    return True
+                    return "battle"
                 self._gym_move(front, label="engage-reenter")
                 for _ in range(10):
                     if st.in_battle(self.b):
-                        return True
+                        return "battle"
                     self.b.run_frame()
                 if st.in_battle(self.b):
-                    return True
-        return False
+                    return "battle"
+        return "no"
 
     def _talkable_npcs(self):
         """Active NON-trainer object events (trainerType==0): the plain townsfolk she can chat to —
@@ -3618,24 +4151,56 @@ class Campaign:
             log(f"   [roam] !! drain '{label}' requested during a LIVE battle -> skipping "
                 f"(battle engine owns that UI)")
             return "in_battle"
+        from dialogue_drive import box_open as _bo
+        had_box = bool(_bo(self.b))            # a REAL conversation was driven (not a no-op poll)
         self.b.set_input_owner("agent")
         res = DialogueDriver(self.b, render=self.render, log=lambda m: log(m)).drive(label=label)
-        if res == "exhausted":
+        # LOOP-MARK ON *EVERY* abnormal end (2026-07-30, the Bill-guy loop): 'exhausted' alone missed
+        # the timeout branch, so a conversation that burned the whole press budget ended UNMARKED and
+        # she re-engaged it fresh. timeout is just as much a loop signal.
+        if res in ("exhausted", "timeout"):
+            self._mark_looping_npc(f"drive={res}")
+        elif had_box and res == "closed":
+            # CROSS-CALL RE-DRAIN NET (2026-07-30): each drive() call carries its own cycle counter,
+            # so a conversation that CLOSES cleanly and then gets RE-INITIATED (beaten trainer's
+            # post-battle line, greet-pull re-talk) loops forever with every single call looking
+            # healthy — that's the 10-minute Nugget Bridge loop Jonny watched. Count real (box-open)
+            # drains per stand-tile: 3 within 2 minutes = a re-engagement loop, whatever each call
+            # returned -> mark and walk away.
             try:
-                mp = tuple(tv.map_id(self.b))
-                cur = tuple(tv.coords(self.b))
-                self._looped_spots.add((mp, cur))
-                # LAYER A — feed the UNIFIED block memory too: the tile she's FACING is the looping NPC's
-                # body, so travel (not just the talk path) routes AROUND it next time. One shared set.
-                d = self._FACE_DELTA.get(wf._facing(self.b))
-                if d is not None:
-                    body = (cur[0] + d[0], cur[1] + d[1])
-                    self._blocked_npcs.add((mp, body))
-                log(f"   [roam] !! LOOPING/RESOLVED NPC disengaged at {(mp, cur)} — won't re-initiate "
-                    f"talk there + travel routes around its body (B-2 + LAYER A unified guard)")
+                now = time.time()
+                key = (tuple(tv.map_id(self.b)), tuple(tv.coords(self.b)))
+                hist = getattr(self, "_drain_history", None)
+                if hist is None:
+                    hist = self._drain_history = {}
+                stamps = [t for t in hist.get(key, ()) if now - t < 120.0] + [now]
+                hist[key] = stamps
+                if len(stamps) >= 3:
+                    log(f"   [roam] !! RE-DRAIN LOOP: {len(stamps)} full conversations at {key} inside "
+                        f"2 minutes — she keeps re-engaging the same NPC; marking it resolved")
+                    self._mark_looping_npc("re-drain net")
+                    hist.pop(key, None)
             except Exception:
                 pass
         return res
+
+    def _mark_looping_npc(self, reason):
+        """B-2 + LAYER A unified: mark the current stand tile a resolved talk-spot and the faced tile a
+        blocked body, so the talk path won't re-initiate here and travel routes around the NPC. Persists
+        immediately (wedge memory) so the mark survives a restart."""
+        try:
+            mp = tuple(tv.map_id(self.b))
+            cur = tuple(tv.coords(self.b))
+            self._looped_spots.add((mp, cur))
+            d = self._FACE_DELTA.get(wf._facing(self.b))
+            if d is not None:
+                body = (cur[0] + d[0], cur[1] + d[1])
+                self._blocked_npcs.add((mp, body))
+            log(f"   [roam] !! LOOPING/RESOLVED NPC disengaged at {(mp, cur)} ({reason}) — won't "
+                f"re-initiate talk there + travel routes around its body (B-2 + LAYER A unified guard)")
+            self._save_wedge_memory()
+        except Exception:
+            pass
 
     def _party_damaging_pp(self):
         """True iff ANY alive party member still has PP on a damaging move — the PP-famine ground
@@ -3743,15 +4308,24 @@ class Campaign:
         beaten = set()                                         # object indices CONFIRMED fought
         fails = {}                                             # idx -> failed-engage rounds (pool class)
         PER_TRAINER_TRIES = 4
+        # SAVE-BEATEN MEMORY (2026-07-31, the live re-talk loop): `beaten` is per-CALL, so every
+        # beat_gym re-entry (and every relaunch) re-engaged juniors the SAVE already counts beaten —
+        # each engage opened their post-defeat line on the walkway, forever. _engage_trainer now
+        # reads beaten-ness authoritatively (talked-not-fought = defeated in-save); remember it
+        # per (gym map, object index) for the session so re-entries skip them outright.
+        if not hasattr(self, "_gym_talked_objs"):
+            self._gym_talked_objs = set()
+        _gmap = tuple(tv.map_id(self.b))
         for rnd in range(max_rounds):
             self.b.set_input_owner("agent")
-            trs = [(i, c, f) for (i, c, f) in self._gym_trainers() if i not in beaten]
+            trs = [(i, c, f) for (i, c, f) in self._gym_trainers()
+                   if i not in beaten and (_gmap, i) not in self._gym_talked_objs]
             if trs:
                 px, py = tv.coords(self.b) or (0, 0)
                 trs.sort(key=lambda t: abs(t[1][0] - px) + abs(t[1][1] - py))
                 idx, T, facing = trs[0]
                 log(f"   GYM: engaging junior trainer obj{idx} at {T} (facing {facing})")
-                self._engage_trainer(T, facing)
+                _eng = self._engage_trainer(T, facing)
                 if st.in_battle(self.b):
                     _jr = self.battle_runner()
                     log(f"   GYM: junior trainer -> {_jr}")
@@ -3761,6 +4335,13 @@ class Campaign:
                             "-> needs_heal (juniors stay beaten; we come back full)")
                         return "pp_famine"
                     beaten.add(idx)                            # a REAL battle happened -> truly done
+                elif _eng == "talked":
+                    # AUTHORITATIVE already-beaten read (post-defeat line, no battle) — done for
+                    # the whole session, not just this call. No retry rounds burned on it.
+                    beaten.add(idx)
+                    self._gym_talked_objs.add((_gmap, idx))
+                    log(f"   GYM: junior obj{idx} at {T} is ALREADY BEATEN in the save "
+                        f"(talked, no battle) — marked done for the session, never re-engaging")
                 else:
                     # No battle this round. A pool-gym swimmer WANDERS and is engageable only from its
                     # one land tile when it turns the right way (the Misty stuck: the old code FALSELY
@@ -3785,26 +4366,102 @@ class Campaign:
                     log("   GYM: gauntlet PP FAMINE (stuck battle + no damaging PP anywhere) "
                         "-> needs_heal (juniors stay beaten; we come back full)")
                     return "pp_famine"
-                nt = [(i, c, f) for (i, c, f) in self._gym_trainers() if i not in beaten]
+                nt = [(i, c, f) for (i, c, f) in self._gym_trainers()
+                      if i not in beaten and (_gmap, i) not in self._gym_talked_objs]
                 if nt:
                     px, py = tv.coords(self.b) or (0, 0)
                     nt.sort(key=lambda t: abs(t[1][0] - px) + abs(t[1][1] - py))
                     beaten.add(nt[0][0])
                 continue
-            if [(i, c, f) for (i, c, f) in self._gym_trainers() if i not in beaten]:
+            if [(i, c, f) for (i, c, f) in self._gym_trainers()
+                    if i not in beaten and (_gmap, i) not in self._gym_talked_objs]:
                 continue                                       # a far trainer just loaded -> engage it
             log(f"   GYM: all junior trainers cleared (beaten obj {sorted(beaten)})")
             return
         log(f"   !! GYM: hit {max_rounds} clear-rounds with trainers still loaded - proceeding LOUD")
 
+    def _load_gym_prep_bump(self):
+        """Load persisted per-gym prep bumps. WHY (2026-08-01): Surge L33 Wartortle read DOMINANT,
+        marched into Raichu with a paper bench, lost, then resume_marathon wiped the in-memory bump
+        and GO HARD re-armed immediately — she needs the escalated bar to survive a relaunch."""
+        import json as _j
+        try:
+            if not os.path.exists(GYM_PREP_BUMP_JSON):
+                return {}
+            with open(GYM_PREP_BUMP_JSON, encoding="utf-8") as f:
+                data = _j.load(f) or {}
+            bumps = data.get("bumps") if isinstance(data, dict) else None
+            if not isinstance(bumps, dict):
+                bumps = data if isinstance(data, dict) else {}
+            out = {str(k): int(v) for k, v in bumps.items()
+                   if isinstance(v, (int, float)) and int(v) > 0}
+            if out:
+                log(f"   GYM-PREP: restored loss bumps from disk {out} — relaunch will NOT "
+                    f"re-arm DOMINANT/GO HARD past a proven wall")
+            return out
+        except Exception as e:
+            log(f"   GYM-PREP: bump load skipped ({e}) — starting fresh (LOUD)")
+            return {}
+
+    def _save_gym_prep_bump(self):
+        """Persist _gym_prep_bump next to momentum.json. Best-effort; never raises."""
+        import json as _j
+        try:
+            os.makedirs(STATES_CAMPAIGN, exist_ok=True)
+            bumps = {k: int(v) for k, v in (getattr(self, "_gym_prep_bump", {}) or {}).items()
+                     if int(v) > 0}
+            tmp = GYM_PREP_BUMP_JSON + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _j.dump({"bumps": bumps}, f)
+            os.replace(tmp, GYM_PREP_BUMP_JSON)
+        except Exception as e:
+            log(f"   GYM-PREP: bump save skipped ({e}) (LOUD)")
+
     def _bump_gym_prep(self, gym_name, step=2):
         """Fix B: on a gym LOSS, escalate the prep demand so the retry doesn't throw the SAME losing team
         back in — prep_for_gym reads this as extra levels to grind + a bigger team to field. Reset when the
-        badge lands (the gym is done)."""
-        self._gym_prep_bump = getattr(self, "_gym_prep_bump", {})
+        badge lands (the gym is done). PERSISTED to disk (2026-08-01) so resume_marathon cannot re-arm
+        DOMINANT/GO HARD. Squirtle-line: escalate to Blastoise (L36); once she's Blastoise, to L38
+        (2026-08-02 — L36 still barely lost to Raichu; short grass farm, not gym spam)."""
+        self._gym_prep_bump = getattr(self, "_gym_prep_bump", {}) or {}
         self._gym_prep_bump[gym_name] = self._gym_prep_bump.get(gym_name, 0) + step
+        # Squirtle-line rematch bar (2026-08-01/02): Wartortle → Blastoise L36 first; Blastoise
+        # rematch → L38 so the ace can finish Raichu (or leave scraps a ~L20 bench can clean).
+        try:
+            party = (self.read_live_state() or {}).get("party") or []
+            top = max(party, key=lambda m: m.get("level", 0)) if party else None
+            sp = (top.get("species") or "").lower() if top else ""
+            if sp in _SQUIRTLE_LINE:
+                rec = (getattr(getattr(self, "planner", None), "threats", None) or {}).get(gym_name) or {}
+                band = rec.get("level_band") or [0, 0]
+                ace_level = int(band[-1] if band else 0)
+                bar = (BLASTOISE_REMATCH_LEVEL if sp == "blastoise"
+                       else BLASTOISE_EVO_LEVEL)
+                need = max(0, bar - (ace_level + GYM_LEVEL_MARGIN))
+                if self._gym_prep_bump[gym_name] < need:
+                    self._gym_prep_bump[gym_name] = need
+                    log(f"   GYM-PREP: '{gym_name}' Squirtle-line rematch bar — bump raised to "
+                        f"{need} so grind targets L{bar} "
+                        f"(ace~L{ace_level}+margin; species={sp})")
+                    try:
+                        if sp == "blastoise":
+                            self.on_event(
+                                "close — Blastoise needs a couple more levels and at least one "
+                                "bench mon that can take a hit from Raichu. grass farm, then we "
+                                "walk back in.",
+                                kind="gym", tier=2)
+                        else:
+                            self.on_event(
+                                "that hit hard — next time I'm walking in as Blastoise with a bench "
+                                "that can take a punch, not paper mons Raichu farms.",
+                                kind="gym", tier=2)
+                    except Exception:
+                        pass
+        except Exception as e:
+            log(f"   GYM-PREP: Blastoise-bar bump adjust skipped ({e}) (LOUD)")
         log(f"   GYM-PREP: '{gym_name}' loss -> prep demand escalated (+{step} → bump "
             f"{self._gym_prep_bump[gym_name]}); the retry grinds/teams up higher")
+        self._save_gym_prep_bump()
 
     def prep_for_gym(self, gym):
         """Fix B (2026-07-09) — ENFORCED pre-gym readiness, wired through the StrategicPlanner KB. Before a
@@ -3819,23 +4476,66 @@ class Campaign:
             return "off"
         if os.getenv("POKEMON_WATCH_GOAL"):                 # focused watch → don't wander off to prep
             return "pinned"
+        # CREATOR ORDER (2026-07-31, LAW): Jonny said fight — walk in, no prep detour. The dominance
+        # override below usually agrees anyway; this makes his word binding even when it wouldn't.
+        if self._creator_order(None):
+            log(f"   GYM-PREP [{gym.name}]: CREATOR ORDER (LAW) — Jonny said go; skipping prep, "
+                f"walking in as-is")
+            return "ordered"
         try:
             party = (self.read_live_state() or {}).get("party") or []
         except Exception as e:
             log(f"   GYM-PREP: state read failed ({e}) — skipping (LOUD)"); return "no_state"
+        # ACE-CARRIES MARCH (2026-08-02 Celadon door loop): Blastoise L42 already clears Erika's
+        # level bar, but paper_bench=True still sent her to grind. Celadon has NO reachable grass
+        # → grind wedges → watchdog latch → enter_warp bails forever at the gym door. If the ace
+        # carries (or dominates), SKIP catch/grind and walk in.
+        try:
+            _pst = {"party": party, "next_gym": {"leader": gym.name, "city": ""},
+                    "badge_count": sum(1 for i in range(8) if self.has_badge(0x820 + i)),
+                    "map": tuple(tv.map_id(self.b))}
+            if self._ace_carries_next_gym(_pst) or self._gym_dominant(_pst):
+                log(f"   GYM-PREP [{gym.name}]: ACE CARRIES / DOMINANT — skipping catch+grind "
+                    f"(no Celadon grass farm; walking into the gym NOW)")
+                self.on_event(f"bench is thin but the ace already clears {gym.name} — "
+                              f"we're walking in. they can catch XP on the road after.",
+                              kind="gym", tier=2)
+                return "ace_carries"
+        except Exception as _acx:
+            log(f"   GYM-PREP ace-carries check skipped: {_acx}")
         bump = self._gym_prep_bump.get(gym.name, 0)
         r = self.planner.gym_readiness(gym.name, party, party_target=GYM_PARTY_TARGET, loss_bump=bump)
         if not r:
             return "no_kb"
         if r["ready"]:
-            log(f"   GYM-PREP [{gym.name}]: READY — party {r['party_size']}, top L{r['top_level']} "
-                f">= L{r['level_target']}, type answer ✓")
+            if r.get("dominant") and not r["has_type_answer"]:
+                # DOMINANCE PATH (2026-07-31 pacing tune): she overpowers the leader outright — say
+                # so, so skipping the by-the-book type-answer prep reads as confidence, not a bug.
+                log(f"   GYM-PREP [{gym.name}]: DOMINANT — top L{r['top_level']} >= "
+                    f"L{r['level_target']}+{r['top_level'] - r['level_target']} (no type answer, and "
+                    f"none needed at this power gap) — going in")
+                self.on_event(f"no perfect type matchup for {gym.name}, but honestly? we're way past "
+                              f"needing one. we're strong enough — let's just go win this.",
+                              kind="gym", tier=2)
+            elif r.get("overlevel_carry") and not r["has_type_answer"]:
+                log(f"   GYM-PREP [{gym.name}]: OVERLEVEL CARRY — top L{r['top_level']} "
+                    f"(>= ace ~L{r['ace_level']}+14) + fieldable bench L{r.get('bench_max', 0)} "
+                    f"— going in without a type answer")
+                self.on_event(f"no ground type yet, but the lead is strong enough and the bench "
+                              f"can finish — time to take {gym.name}.",
+                              kind="gym", tier=2)
+            else:
+                log(f"   GYM-PREP [{gym.name}]: READY — party {r['party_size']}, top L{r['top_level']} "
+                    f">= L{r['level_target']}, type answer ✓")
             return "ready"
         log(f"   GYM-PREP [{gym.name}]: NOT ready (loss-bump {bump}) — party {r['party_size']}/"
             f"{r['target_size']}, topL {r['top_level']}/{r['level_target']}, type_answer={r['has_type_answer']}, "
-            f"want={r['want_types']} — prepping BEFORE the gym")
+            f"paper_bench={r.get('paper_bench')}, want={r['want_types']} — prepping BEFORE the gym")
         # her voice: ONE plan beat (soul-safe raw fact; the oracle colours it) — the endearing "did my homework"
-        if not r["has_type_answer"] and r["want_types"]:
+        if r.get("paper_bench") and not r["underleveled"]:
+            self.on_event(f"{gym.name}'s ace farms my bench — quick grass farm so someone besides "
+                          f"the lead can take a hit, then we knock.", kind="gym", tier=2)
+        elif not r["has_type_answer"] and r["want_types"]:
             self.on_event(f"{gym.name}'s a {r['ace']} wall — I really want a {' or '.join(r['want_types'][:2])} "
                           f"type before I knock. Let me go catch one.", kind="gym", tier=2)
         elif r["thin"]:
@@ -3869,9 +4569,14 @@ class Campaign:
                 log(f"   GYM-PREP [{gym.name}]: coverage-teach dispatch -> {_cvr}")
             except Exception as e:
                 log(f"   GYM-PREP [{gym.name}]: coverage-teach dispatch crashed ({e}) (LOUD)")
-        # 2) GRIND — bring the team up to the KB-derived level target (ace level + margin, escalated on loss)
-        if r["underleveled"]:
-            log(f"   GYM-PREP [{gym.name}]: grinding to L{r['level_target']} (ace ~L{r['ace_level']})")
+        # 2) GRIND — bring the team up to the KB-derived level target (ace level + margin, escalated
+        # on loss). Also grind when the bench is still paper (2026-08-02 Surge chalk): ace can be
+        # at the bar while Raichu still one-shots everyone else — field the weak ones in grass.
+        if r["underleveled"] or r.get("paper_bench"):
+            _why = ("underleveled" if r["underleveled"]
+                    else f"paper bench (max L{r.get('bench_max', 0)} < fieldable ~L{r.get('fieldable_floor', 0)})")
+            log(f"   GYM-PREP [{gym.name}]: grinding to L{r['level_target']} "
+                f"(ace ~L{r['ace_level']}; {_why})")
             try:
                 gr = self.grind(r["level_target"])
                 log(f"   GYM-PREP [{gym.name}]: grind -> {gr}")
@@ -3880,21 +4585,14 @@ class Campaign:
         return "prepped"
 
     def _stock_potions_for_gym(self, gym):
-        """PRE-GYM POTION-STALL STOCK-UP (night-shift 1, badge-5 Koga). Some leaders beat a solo-carry by
-        ATTRITION, not type: Koga's 4-mon poison gauntlet out-damages a lone L53 Venusaur with no heals
-        (verified 5+ losses w/o potions, WINS with them). A real player buys Super Potions at the gym-city
-        Mart and heals through it. For a POTION_STALL_GYMS gym, if she's short of the target, buy the
-        shortfall (strongest potion on the shelf) from the current city's Mart. Best-effort + bounded; the
-        buy_at_mart bag-delta guards every purchase, and a no-mart / too-poor case just enters as-is (LOUD).
-        Returns a short status string. General resource/economy bedrock #6; game-facts in POTION_STALL_GYMS."""
-        target = POTION_STALL_GYMS.get(gym.name)
+        """PRE-GYM POTION STOCK-UP. Every gym gets at least GYM_POTION_TARGET heals before the door
+        (2026-08-02 Erika chalk: empty bag → blackout). Stall gyms (Koga/Erika) buy deeper.
+        Celadon has no Poké Mart — buys go through the Dept Store 2F items clerk. Best-effort +
+        bounded; bag-delta guards; no-shop / too-poor → enter as-is (LOUD)."""
+        target = POTION_STALL_GYMS.get(gym.name, GYM_POTION_TARGET)
         if not target:
             return "not_flagged"
         city = tv.map_id(self.b)
-        door = CITY_MART_DOORS.get(city)
-        if door is None:
-            log(f"   POTION-STALL [{gym.name}]: not standing in a Mart city ({city}) — can't stock here (LOUD)")
-            return "no_mart"
         have = sum(self.bag_count(i) for i in (ITEM_POTION, 22, 21, 20, 19))
         if have >= target:
             log(f"   POTION-STALL [{gym.name}]: already carrying {have} potion(s) (>= {target}) — good to go")
@@ -3904,14 +4602,471 @@ class Campaign:
             log(f"   POTION-STALL [{gym.name}]: too poor ({self.money()}) to stock potions — entering as-is (LOUD)")
             return "too_poor"
         need = target - have
-        self.on_event(f"{gym.name}'s a war of attrition — I'm not tanking that gauntlet on one Pokémon with "
-                      f"an empty bag. Quick Mart run for potions first.", kind="gym", tier=2)
+        self.on_event(f"not walking into {gym.name}'s gym with an empty bag — quick shop for potions, "
+                      f"THEN we take the badge.", kind="gym", tier=2)
         log(f"   POTION-STALL [{gym.name}]: have {have}/{target} — buying {need}x "
-            f"{ITEM_NAMES.get(pot, pot)} at {city} Mart before the fight")
-        bought = self.buy_at_mart(door, [(pot, need)])
+            f"{ITEM_NAMES.get(pot, pot)} before the fight")
+        bought = self._shop_for_gym([(pot, need)])
+        if bought is None:
+            log(f"   POTION-STALL [{gym.name}]: no shop at {city} — can't stock here (LOUD)")
+            return "no_mart"
         got = sum(self.bag_count(i) for i in (ITEM_POTION, 22, 21, 20, 19))
         log(f"   POTION-STALL [{gym.name}]: bought {bought} — now carrying {got} potion(s)")
         return "bought" if bought else "buy_failed"
+
+    def _kb_bring_cures(self, gym_name):
+        """Statuses the strategy KB says to stock before `gym_name` (Bulbapedia kit). Empty if none."""
+        try:
+            rec = (getattr(getattr(self, "planner", None), "threats", None) or {}).get(gym_name) or {}
+            return [s for s in (rec.get("bring_cures") or []) if s in STATUS_CURE]
+        except Exception:
+            return []
+
+    def _cure_item_on_shelf(self, status, city=None):
+        """Item id to BUY for `status` at this city's Mart: specific cure if sold, else Full Heal.
+        None if neither is on the shelf (don't invent a mis-buy)."""
+        cure = STATUS_CURE.get(status)
+        if not cure:
+            return None
+        city = city if city is not None else tv.map_id(self.b)
+        try:
+            city = tuple(city)
+        except Exception:
+            pass
+        stock = MART_STOCK.get(city, [])
+        if cure[0] in stock:
+            return cure[0]
+        if ITEM_FULL_HEAL in stock:
+            return ITEM_FULL_HEAL
+        return None
+
+    def _status_cure_have(self, status):
+        """How many cures she can already spend on `status` (specific + Full Heal)."""
+        cure = STATUS_CURE.get(status)
+        if not cure:
+            return 0
+        return self.bag_count(cure[0]) + self.bag_count(ITEM_FULL_HEAL)
+
+    def _stock_status_cures_for_gym(self, gym):
+        """PRE-GYM STATUS-CURE KIT (2026-08-02). Strategy KB `bring_cures` = the statuses a human
+        who read Bulbapedia would stock for (Surge → Parlyz Heal for Thunder Wave; Koga → Antidote).
+        Buys the shortfall at the gym-city Mart before the door so in-battle item instinct can
+        un-lock the ace mid-fight — not only after she's already lost a turn to para. Best-effort
+        + bounded; buy_at_mart bag-delta guards; no-mart / too-poor / nothing-on-shelf → enter as-is
+        (LOUD). Game-facts in frlg_strategy.json; returns a short status string."""
+        statuses = self._kb_bring_cures(gym.name)
+        if not statuses:
+            return "not_flagged"
+        city = tv.map_id(self.b)
+        buy = []
+        names = []
+        for status in statuses:
+            have = self._status_cure_have(status)
+            if have >= GYM_CURE_TARGET:
+                continue
+            iid = self._cure_item_on_shelf(status, city)
+            if iid is None:
+                log(f"   CURE-KIT [{gym.name}]: no {status} cure on {city} shelf — skip (LOUD)")
+                continue
+            need = GYM_CURE_TARGET - have
+            buy.append((iid, need))
+            names.append(ITEM_NAMES.get(iid, str(iid)))
+        if not buy:
+            log(f"   CURE-KIT [{gym.name}]: already carrying cures for {statuses} "
+                f"(target {GYM_CURE_TARGET}) — good to go")
+            return "already_stocked"
+        # Parlyz Heal is $200 — cheap; Full Heal $600. Floor + one unit of the dearest line.
+        if self.money() < SHOP_MONEY_FLOOR + 200:
+            log(f"   CURE-KIT [{gym.name}]: too poor ({self.money()}) to stock cures — entering as-is (LOUD)")
+            return "too_poor"
+        who = ", ".join(names)
+        self.on_event(
+            f"{gym.name}'s gym is built to lock you down — I'm not walking in without {who}. "
+            f"quick shop, then we take the badge.",
+            kind="gym", tier=2)
+        log(f"   CURE-KIT [{gym.name}]: buying {buy} before the fight "
+            f"(KB bring_cures={statuses})")
+        bought = self._shop_for_gym(buy)
+        if bought is None:
+            log(f"   CURE-KIT [{gym.name}]: no shop at {city} — can't stock here (LOUD)")
+            return "no_mart"
+        got = {s: self._status_cure_have(s) for s in statuses}
+        log(f"   CURE-KIT [{gym.name}]: bought {bought} — now carrying {got}")
+        return "bought" if bought else "buy_failed"
+
+    def _shop_for_gym(self, shopping_list):
+        """Buy `shopping_list` at the gym-city shop. Celadon → Dept Store 2F; else Poké Mart.
+        Returns {item_id: qty} or None if this city has no shop mapping."""
+        city = tuple(tv.map_id(self.b))
+        if city == tuple(CELADON):
+            return self.buy_at_celadon_dept(shopping_list)
+        door = CITY_MART_DOORS.get(city) or CITY_MART_DOORS.get(tv.map_id(self.b))
+        if door is None:
+            return None
+        return self.buy_at_mart(door, shopping_list)
+
+    def _stock_pre_gym_kit(self, gym):
+        """ONE shop trip: potions (stall/baseline) + KB status cures. Celadon Dept is multi-floor —
+        combining avoids a double enter before Erika (2026-08-02). Returns a short status string."""
+        city = tv.map_id(self.b)
+        buy = []
+        # Potions
+        pot_target = POTION_STALL_GYMS.get(gym.name, GYM_POTION_TARGET)
+        have_p = sum(self.bag_count(i) for i in (ITEM_POTION, 22, 21, 20, 19))
+        if pot_target and have_p < pot_target:
+            pot = self._best_potion_for_sale() or 22
+            if self.money() >= SHOP_MONEY_FLOOR + 700:
+                buy.append((pot, pot_target - have_p))
+            else:
+                log(f"   PRE-GYM-KIT [{gym.name}]: too poor for potions ({self.money()})")
+        elif pot_target:
+            log(f"   PRE-GYM-KIT [{gym.name}]: potions ok ({have_p}>={pot_target})")
+        # Status cures
+        statuses = self._kb_bring_cures(gym.name)
+        cure_names = []
+        for status in statuses:
+            have = self._status_cure_have(status)
+            if have >= GYM_CURE_TARGET:
+                continue
+            iid = self._cure_item_on_shelf(status, city)
+            if iid is None:
+                log(f"   PRE-GYM-KIT [{gym.name}]: no {status} cure on shelf — skip (LOUD)")
+                continue
+            buy.append((iid, GYM_CURE_TARGET - have))
+            cure_names.append(ITEM_NAMES.get(iid, str(iid)))
+        if not buy:
+            log(f"   PRE-GYM-KIT [{gym.name}]: already stocked — walking in")
+            return "already_stocked"
+        bits = []
+        if any(i in (ITEM_POTION, 22, 21, 20, 19) for i, _ in buy):
+            bits.append("potions")
+        if cure_names:
+            bits.append(", ".join(cure_names))
+        self.on_event(
+            f"not walking into {gym.name}'s gym empty-handed — grabbing {' + '.join(bits)} first.",
+            kind="gym", tier=2)
+        log(f"   PRE-GYM-KIT [{gym.name}]: shopping list {buy} (cures KB={statuses})")
+        bought = self._shop_for_gym(buy)
+        if bought is None:
+            log(f"   PRE-GYM-KIT [{gym.name}]: no shop at {city} — entering as-is (LOUD)")
+            return "no_mart"
+        got_p = sum(self.bag_count(i) for i in (ITEM_POTION, 22, 21, 20, 19))
+        got_c = {s: self._status_cure_have(s) for s in statuses} if statuses else {}
+        log(f"   PRE-GYM-KIT [{gym.name}]: bought {bought} — potions={got_p} cures={got_c}")
+        return "bought" if bought else "buy_failed"
+
+    def buy_at_celadon_dept(self, shopping_list):
+        """Celadon Dept Store 2F items clerk — the city's only real Mart (no street Poké Mart).
+        Enter door (11,14) → stairs to 2F → stand (3,8) facing the items clerk → BUY list with
+        the same bag-delta verify as buy_at_mart → exit to overworld. Ground truth: pret
+        CeladonCity_DepartmentStore_2F_Items + recon_tm_errand (2026-07-07). Best-effort; LOUD
+        abort never silent-misbuys. Returns {item_id: bought}."""
+        stock = MART_STOCK.get(CELADON) or []
+        if not stock:
+            log("   !! DEPT: no CELADON MART_STOCK — can't shop"); return {}
+        # Already on 2F (retry / mid-errand) — skip the approach.
+        if tuple(tv.map_id(self.b)) != CELADON_DEPT_2F:
+            if tuple(tv.map_id(self.b)) != tuple(CELADON):
+                log(f"   !! DEPT: not in Celadon ({tv.map_id(self.b)}) — can't reach Dept Store")
+                return {}
+            try:
+                self._stuck_request = None
+                if self._stuckwatch is not None:
+                    self._stuckwatch.reset()
+            except Exception:
+                pass
+            if self.enter_warp(pick=CELADON_DEPT_DOOR) != "warped":
+                log("   !! DEPT: couldn't enter Dept Store 1F"); return {}
+            for _ in range(60):
+                self.b.run_frame()
+            if self.enter_warp(pick=CELADON_DEPT_STAIRS_1F) != "warped":
+                log("   !! DEPT: couldn't take stairs to 2F"); self._exit_to_overworld(); return {}
+            for _ in range(60):
+                self.b.run_frame()
+            if tuple(tv.map_id(self.b)) != CELADON_DEPT_2F:
+                log(f"   !! DEPT: expected 2F {CELADON_DEPT_2F}, got {tv.map_id(self.b)} — abort LOUD")
+                self._exit_to_overworld(); return {}
+        # Walk to the items clerk (not the TM clerk at y=6).
+        if (self.trav.travel(target_map=None, arrive_coord=CELADON_DEPT_ITEMS_FRONT,
+                             max_steps=80, max_seconds=60) != "arrived"
+                and not self._step_to(CELADON_DEPT_ITEMS_FRONT)):
+            log(f"   !! DEPT: couldn't reach items clerk front {CELADON_DEPT_ITEMS_FRONT}")
+            self._exit_to_overworld(); return {}
+        self.b.set_input_owner("agent")
+        guard = self.money()
+        opened = False
+        for _ in range(8):
+            self.b.press("LEFT", 8, 8, self.render, owner="agent")
+            self.b.press("A", 8, 10, self.render, owner="agent")
+            for _ in range(40):
+                self.b.run_frame()
+                if dd_box_open(self.b):
+                    opened = True
+                    break
+            if opened:
+                break
+        if not opened:
+            log("   !! DEPT: items clerk never opened a dialog — abort LOUD")
+            self._exit_to_overworld(); return {}
+        stable = 0
+        for _ in range(30):
+            if dd_box_open(self.b):
+                stable = 0
+                self.b.press("A", 8, 12, self.render, owner="agent")
+                for _ in range(20):
+                    self.b.run_frame()
+            else:
+                stable += 1
+                if stable >= 2:
+                    break
+                for _ in range(20):
+                    self.b.run_frame()
+        # Dept clerks often drop straight into the BUY list — only tap BUY if cursor is dead.
+        c0 = self._mart_index()
+        self.b.press("DOWN", 8, 10, self.render, owner="agent")
+        for _ in range(20):
+            self.b.run_frame()
+        list_live = self._mart_index() != c0
+        if list_live:
+            self._mart_goto_row(0)
+        else:
+            self.b.press("A", 8, 10, self.render, owner="agent")  # BUY on BUY/SELL
+            for _ in range(120):
+                self.b.run_frame()
+            c0 = self._mart_index()
+            self.b.press("DOWN", 8, 10, self.render, owner="agent")
+            for _ in range(20):
+                self.b.run_frame()
+            if self._mart_index() == c0:
+                log("   !! DEPT: BUY list didn't confirm — abort LOUD")
+                self._exit_to_overworld(); return {}
+            self._mart_goto_row(0)
+        if self.money() < guard:
+            log(f"   !! DEPT: money dropped during entry ({guard}->{self.money()}) — abort LOUD")
+            self._exit_to_overworld(); return {}
+        bought = {}
+        for item_id, qty in shopping_list:
+            nm = ITEM_NAMES.get(item_id, f"item#{item_id}")
+            if item_id not in stock:
+                log(f"   DEPT: {nm} not sold on 2F — skipping"); continue
+            row = stock.index(item_id)
+            for _ in range(qty):
+                if self.money() < SHOP_MONEY_FLOOR:
+                    log(f"   DEPT: at money floor ({self.money()}) — stopping"); break
+                before = self._item_count(item_id)
+                if not self._mart_goto_row(row):
+                    log(f"   !! DEPT: couldn't reach {nm} row {row} — abort {nm} LOUD"); break
+                price = self._mart_buy_one()
+                if price == 0 or self._item_count(item_id) != before + 1:
+                    log(f"   !! DEPT: buy-verify FAILED for {nm} (price={price}, "
+                        f"x{before}->x{self._item_count(item_id)}) — abort {nm} LOUD"); break
+                bought[item_id] = bought.get(item_id, 0) + 1
+            if bought.get(item_id):
+                log(f"   DEPT: bought {bought[item_id]}x {nm}")
+        for _ in range(8):
+            self.b.press("B", 6, 12, self.render, owner="agent")
+            for _ in range(14):
+                self.b.run_frame()
+        # Exit 2F → 1F → Celadon (south mats).
+        if self.enter_warp(pick=CELADON_DEPT_STAIRS_2F) == "warped":
+            for _ in range(40):
+                self.b.run_frame()
+        self._exit_to_overworld()
+        log(f"   DEPT: shopping done — {bought} (money now {self.money()})")
+        return bought
+
+    def buy_thunder_stone(self):
+        """Celadon Dept 4F stone counter — buy ONE Thunder Stone (2100) for the Jolteon rite
+        (2026-08-03 OP-team pass). Same proven rails as buy_at_celadon_dept, two floors higher:
+        door -> 1F -> 2F -> 3F -> 4F, stand (5,13) facing the clerk, BUY row 3, bag-delta verify,
+        stairs back down, out. Returns the number bought (0 = failed LOUD, never silent)."""
+        here = tuple(tv.map_id(self.b))
+        if here != CELADON_DEPT_4F:
+            if here == tuple(CELADON):
+                try:
+                    self._stuck_request = None
+                    if self._stuckwatch is not None:
+                        self._stuckwatch.reset()
+                except Exception:
+                    pass
+                if self.enter_warp(pick=CELADON_DEPT_DOOR) != "warped":
+                    log("   !! STONE: couldn't enter Dept Store 1F"); return 0
+                for _ in range(60):
+                    self.b.run_frame()
+                if self.enter_warp(pick=CELADON_DEPT_STAIRS_1F) != "warped":
+                    log("   !! STONE: couldn't take stairs to 2F"); self._exit_to_overworld(); return 0
+                for _ in range(60):
+                    self.b.run_frame()
+            if tuple(tv.map_id(self.b)) == CELADON_DEPT_2F:
+                if self.enter_warp(pick=CELADON_DEPT_STAIRS_2F_UP) != "warped":
+                    log("   !! STONE: couldn't take stairs to 3F"); self._exit_to_overworld(); return 0
+                for _ in range(60):
+                    self.b.run_frame()
+            if tuple(tv.map_id(self.b)) == CELADON_DEPT_3F:
+                if self.enter_warp(pick=CELADON_DEPT_STAIRS_3F_UP) != "warped":
+                    log("   !! STONE: couldn't take stairs to 4F"); self._exit_to_overworld(); return 0
+                for _ in range(60):
+                    self.b.run_frame()
+            if tuple(tv.map_id(self.b)) != CELADON_DEPT_4F:
+                log(f"   !! STONE: expected 4F {CELADON_DEPT_4F}, got {tv.map_id(self.b)} — abort LOUD")
+                self._exit_to_overworld(); return 0
+        if (self.trav.travel(target_map=None, arrive_coord=CELADON_DEPT_STONE_FRONT,
+                             max_steps=80, max_seconds=60) != "arrived"
+                and not self._step_to(CELADON_DEPT_STONE_FRONT)):
+            log(f"   !! STONE: couldn't reach the stone clerk front {CELADON_DEPT_STONE_FRONT}")
+            self._exit_to_overworld(); return 0
+        self.b.set_input_owner("agent")
+        guard = self.money()
+        opened = False
+        for _ in range(8):
+            self.b.press("LEFT", 8, 8, self.render, owner="agent")
+            self.b.press("A", 8, 10, self.render, owner="agent")
+            for _ in range(40):
+                self.b.run_frame()
+                if dd_box_open(self.b):
+                    opened = True
+                    break
+            if opened:
+                break
+        if not opened:
+            log("   !! STONE: the 4F clerk never opened a dialog — abort LOUD")
+            self._exit_to_overworld(); return 0
+        stable = 0
+        for _ in range(30):
+            if dd_box_open(self.b):
+                stable = 0
+                self.b.press("A", 8, 12, self.render, owner="agent")
+                for _ in range(20):
+                    self.b.run_frame()
+            else:
+                stable += 1
+                if stable >= 2:
+                    break
+                for _ in range(20):
+                    self.b.run_frame()
+        c0 = self._mart_index()
+        self.b.press("DOWN", 8, 10, self.render, owner="agent")
+        for _ in range(20):
+            self.b.run_frame()
+        if self._mart_index() == c0:
+            self.b.press("A", 8, 10, self.render, owner="agent")  # BUY on BUY/SELL
+            for _ in range(120):
+                self.b.run_frame()
+            c0 = self._mart_index()
+            self.b.press("DOWN", 8, 10, self.render, owner="agent")
+            for _ in range(20):
+                self.b.run_frame()
+            if self._mart_index() == c0:
+                log("   !! STONE: BUY list didn't confirm — abort LOUD")
+                self._exit_to_overworld(); return 0
+        if self.money() < guard:
+            log(f"   !! STONE: money dropped during entry ({guard}->{self.money()}) — abort LOUD")
+            self._exit_to_overworld(); return 0
+        bought = 0
+        before = self._item_count(ITEM_THUNDER_STONE)
+        if self._mart_goto_row(DEPT4F_ROW_THUNDER_STONE):
+            price = self._mart_buy_one()
+            if price > 0 and self._item_count(ITEM_THUNDER_STONE) == before + 1:
+                bought = 1
+                log(f"   STONE: bought a Thunder Stone (paid ~{price}; money now {self.money()})")
+            else:
+                log(f"   !! STONE: buy-verify FAILED (price={price}, "
+                    f"x{before}->x{self._item_count(ITEM_THUNDER_STONE)}) — abort LOUD")
+        else:
+            log(f"   !! STONE: couldn't reach BUY row {DEPT4F_ROW_THUNDER_STONE} — abort LOUD")
+        for _ in range(8):
+            self.b.press("B", 6, 12, self.render, owner="agent")
+            for _ in range(14):
+                self.b.run_frame()
+        # Exit 4F → 3F → 2F → 1F → Celadon.
+        for pick in (CELADON_DEPT_STAIRS_4F_DOWN, CELADON_DEPT_STAIRS_3F_DOWN, CELADON_DEPT_STAIRS_2F):
+            if self.enter_warp(pick=pick) == "warped":
+                for _ in range(40):
+                    self.b.run_frame()
+        self._exit_to_overworld()
+        return bought
+
+    def _jolteon_tick(self):
+        """THE JOLTEON RITE (2026-08-03 OP-team pass — 'cute Pokémon like Eevee... I want her OP').
+        Closes the loop the eevee_fetch strike opens: Eevee in the PARTY + a Thunder Stone in the
+        bag -> stone_evolve NOW (a big on-stream moment); Eevee claimed (flag 0x263) but stone-less
+        -> buy one at the Dept 4F next time she stands in Celadon. Failures latch a backoff so a
+        wedged menu flow can never loop the run. Best-effort + LOUD; one cheap RAM scan per tick."""
+        if not EEVEE_FETCH_ENABLED or time.time() < getattr(self, "_jolteon_backoff", 0):
+            return
+        try:
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            species = [st.read_party_species(self.b, s) for s in range(min(cnt, 6))]
+            if SPECIES_JOLTEON_N in species:
+                return                                       # rite complete
+            slot = species.index(SPECIES_EEVEE_N) if SPECIES_EEVEE_N in species else None
+            stones = self._item_count(ITEM_THUNDER_STONE)
+            if slot is not None and stones > 0:
+                log(f"   [roam] ⚡ JOLTEON RITE: Eevee (slot {slot}) + a Thunder Stone in the bag "
+                    f"— evolving NOW")
+                self.on_event("okay okay okay — Thunder Stone, meet Eevee. chat, WITNESS this.",
+                              kind="evolve", tier=3)
+                import hm_teach as _ht
+                r = _ht.TeachFlow(self, log=log, on_event=self.on_event).stone_evolve(
+                    ITEM_THUNDER_STONE, slot, SPECIES_JOLTEON_N)
+                if r == "evolved":
+                    self.on_event("JOLTEON!! fastest thing this team has ever fielded — Lorelei "
+                                  "and Lance just inherited a PROBLEM.", kind="evolve", tier=3)
+                else:
+                    self._jolteon_backoff = time.time() + 600
+                    log(f"   [roam] jolteon rite -> {r} — backing off 10 min (LOUD)")
+                return
+            # BUY leg: claimed Eevee (party OR box — the flag is the truth), no stone, standing in
+            # Celadon with a healthy wallet, and no boxed Jolteon (box names are best-effort).
+            _boxed = getattr(self.team_planner, "_owned_box_names", None) or set()
+            if (stones == 0 and "jolteon" not in _boxed
+                    and tuple(tv.map_id(self.b)) == tuple(CELADON)
+                    and fm.read_flag(self.b, 0x263)
+                    and self.money() > SHOP_MONEY_FLOOR + 2100):
+                log("   [roam] ⚡ THUNDER-STONE ERRAND: Eevee claimed, no stone in the bag, and "
+                    "the Dept Store is RIGHT THERE — buying one (4F)")
+                self.on_event("Dept Store run — there's a Thunder Stone on the fourth floor with "
+                              "my Eevee's name on it.", kind="shop", tier=2)
+                if self.buy_thunder_stone() <= 0:
+                    self._jolteon_backoff = time.time() + 900
+        except Exception as e:
+            log(f"   [roam] jolteon tick skipped: {e}")
+
+    def _expshare_equip_tick(self):
+        """EXP. SHARE EQUIP (2026-08-03, the Route-15 aide claim's second half): an Exp. Share
+        sitting in the BAG banks nothing — it has to RIDE on a mon. The moment the item is in the
+        Items pocket, hand it to the LOWEST-level healthy non-lead party member (the exact mon the
+        bench-development doctrine wants growing; never the ace — the ace earns its XP on the
+        field). One give per run: once the bag count reads 0 the item lives on a mon (or was never
+        claimed) and this never fires again. Failure latches a backoff so a wedged bag flow can't
+        loop the run (the menu-disease doctrine). Cheap: one bag scan per tick."""
+        if not EXPSHARE_FETCH_ENABLED or time.time() < getattr(self, "_expshare_backoff", 0):
+            return
+        try:
+            if self.bag_count(182) <= 0:                     # ITEM_EXP_SHARE — not in the bag
+                return
+            ph = self.party_health() or []
+            cands = []                                       # (level, slot) — healthy, non-lead
+            for slot, hp, _mx, _f in ph:
+                if slot == 0 or hp <= 0:
+                    continue
+                lvl = self.b.rd8(ram.GPLAYER_PARTY + slot * st.PARTY_MON_SIZE + 0x54)
+                cands.append((lvl, slot))
+            if not cands:
+                return                                       # solo/fainted bench — retry later
+            lvl, slot = min(cands)
+            nm = st.SPECIES_NAME.get(st.read_party_species(self.b, slot), f"slot{slot}").title()
+            log(f"   [roam] 📈 EXP-SHARE EQUIP: giving the Exp. Share to {nm} (L{lvl}, slot {slot}) "
+                f"— the bench's lowest healthy member")
+            self.on_event(f"Exp. Share goes to {nm} — grow, little one. every fight feeds you now.",
+                          kind="item", tier=2)
+            import hm_teach as _ht
+            r = _ht.TeachFlow(self, log=log, on_event=self.on_event).give_item(182, slot)
+            if r != "given":
+                self._expshare_backoff = time.time() + 600
+                log(f"   [roam] exp-share equip -> {r} — backing off 10 min (LOUD)")
+        except Exception as e:
+            log(f"   [roam] exp-share equip tick skipped: {e}")
 
     def stock_hyper_potions(self, hyper_target=SILPH_HYPER_TARGET, revive_target=SILPH_REVIVE_TARGET):
         """Pre-Silph SILPH KIT stock-up (night-shift 4). Gary's Silph gauntlet ends on a Charizard
@@ -4062,6 +5217,142 @@ class Campaign:
                           kind="gym", tier=2)
         return res
 
+    def _plan_teach_boosts(self):
+        """(tm_no -> set of species names) from TeamPlanner teach_plan rows that are due now."""
+        out = {}
+        try:
+            tp = getattr(self, "team_planner", None)
+            if tp is None:
+                return out
+            state = self.read_live_state() or {}
+            due = tp._due_teach(state.get("party") or [], int(state.get("badge_count", 0)))
+            if due and due.get("tm") and due.get("mon"):
+                raw = str(due["tm"]).upper().replace("TM", "")
+                try:
+                    tno = int(raw)
+                except Exception:
+                    tno = None
+                if tno:
+                    out.setdefault(tno, set()).add(str(due["mon"]).lower())
+        except Exception:
+            pass
+        return out
+
+    def _plan_bag_tm_teach(self):
+        """Best (item, tm_no, move_id, mtype, power, slot, forget_idx, mon_name) for one bag TM,
+        or None. Pure selection + ROM compat; does not actuate. Skips HMs (questline owns those)."""
+        if not BAG_TM_TEACH_ENABLED:
+            return None
+        import hm_teach as ht
+        pc = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+        if not pc:
+            return None
+        try:
+            ace_slot = max(range(pc),
+                           key=lambda s: self.b.rd8(ram.GPLAYER_PARTY + s * st.PARTY_MON_SIZE + 0x54))
+        except Exception:
+            ace_slot = 0
+        boosts = self._plan_teach_boosts()
+        best = None  # (score, item, tm_no, move_id, mtype, power, slot, forget_idx, mon)
+        for item, (hm_key, tm_no, move_id, mtype, power) in _COVERAGE_MOVES.items():
+            if hm_key is not None or tm_no is None:
+                continue                                  # HMs have their own teach bridge
+            if (power or 0) <= 0:
+                continue                                  # status TMs (Calm Mind) — not this path
+            if ht.tm_case_row(self.b, item) is None:
+                continue
+            if tm_no is not None:
+                rt, rp = st.move_info(self.b, move_id)
+                if (rt or "").lower() != mtype:
+                    log(f"   BAG-TM: TM{tm_no:02d} move#{move_id} ROM type {rt!r}!={mtype!r} — skip (LOUD)")
+                    continue
+            for slot in range(pc):
+                sp = st.read_party_species(self.b, slot)
+                if not sp or not ht.tm_compatible(self.b, tm_no, sp):
+                    continue
+                moves = st.read_party_moves(self.b, slot)
+                if move_id in moves:
+                    continue
+                dmg = []
+                for m in moves:
+                    if not m:
+                        continue
+                    mt, mp = st.move_info(self.b, m)
+                    if (mp or 0) > 0:
+                        dmg.append((mt or "normal", mp))
+                mon = (st.SPECIES_NAME.get(sp) or f"slot{slot}").lower()
+                # plan boost: teach_plan target OR same evolutionary line name substring
+                plan_boost = mon in (boosts.get(tm_no) or set())
+                if not plan_boost:
+                    for tgt in (boosts.get(tm_no) or set()):
+                        if tgt in mon or mon in tgt:
+                            plan_boost = True
+                            break
+                # also boost Abra-line for Psychic/Shadow Ball/Brick Break/Iron Tail even
+                # before teach_plan badge gate — empty offense is the whole point
+                if mon in ("abra", "kadabra", "alakazam") and tm_no in (29, 30, 31, 23, 24, 13):
+                    plan_boost = True
+                score = ht.score_tm_recipient(
+                    dmg, st.species_types(sp), mtype, power,
+                    plan_boost=plan_boost, is_ace=(slot == ace_slot))
+                if score < 0:
+                    continue
+                # Minimum bar: neediest (no damage) OR plan/STAB with real power — don't burn
+                # Shock Wave on a full Blastoise that already murders everything.
+                if score < 80 and dmg:
+                    continue
+                forget_idx = ht.forget_idx_for_tm(self.b, slot)
+                cand = (score, item, tm_no, move_id, mtype, power, slot, forget_idx, mon)
+                if best is None or cand[0] > best[0]:
+                    best = cand
+        if best is None:
+            return None
+        _sc, item, tm_no, move_id, mtype, power, slot, forget_idx, mon = best
+        return {
+            "item": item, "tm_no": tm_no, "move_id": move_id, "mtype": mtype,
+            "power": power, "slot": slot, "forget_idx": forget_idx, "mon": mon,
+            "score": _sc,
+        }
+
+    def teach_bag_tms(self, max_teaches=None):
+        """Opportunistic bag-TM teach (2026-08-02 dream): spend single-use TMs on the neediest
+        compatible teammate — Teleport-only Abra before a full-moveset ace. Bounded, best-effort,
+        never blocks the caller. Returns 'taught' | 'nothing' | 'failed' | 'off'."""
+        if not BAG_TM_TEACH_ENABLED:
+            return "off"
+        import hm_teach as ht
+        n = max_teaches if max_teaches is not None else BAG_TM_TEACH_MAX
+        taught_any = False
+        for _ in range(max(1, n)):
+            plan = self._plan_bag_tm_teach()
+            if not plan:
+                break
+            label = f"TM{plan['tm_no']:02d}"
+            mon = plan["mon"]
+            self.on_event(
+                f"{mon} needs a real move — teaching {label} from the case. "
+                f"that's what the TM case is for.",
+                kind="team", tier=2)
+            log(f"   BAG-TM: teaching {label} ({plan['mtype']} {plan['power']}) -> {mon} "
+                f"slot {plan['slot']} (score {plan['score']}, forget={plan['forget_idx']})")
+            tf = ht.TeachFlow(self, log=log, on_event=self.on_event)
+            res = tf.teach("_tm", plan["slot"], plan["forget_idx"],
+                           item_override=plan["item"], move_override=plan["move_id"])
+            log(f"   BAG-TM: {label} -> {mon} -> {res}")
+            if res == "taught":
+                taught_any = True
+                try:
+                    tp = getattr(self, "team_planner", None)
+                    if tp is not None:
+                        tp.on_teach(f"TM{plan['tm_no']:02d}", mon)
+                except Exception:
+                    pass
+                self.on_event(f"{mon} knows {label} now — finally something that hits.",
+                              kind="team", tier=2)
+            else:
+                return res if not taught_any else "taught"
+        return "taught" if taught_any else "nothing"
+
     def beat_gym(self, name):
         """GENERAL gym handler (gyms gate the leader behind their junior trainers): reserve move
         slots if this gym has a level-up double-learn, enter, BEAT EVERY JUNIOR TRAINER, then engage
@@ -4070,22 +5361,50 @@ class Campaign:
         gym = GYMS.get(name)
         if gym is None:
             log(f"   !! GYM: no spec for '{name}'"); return "stuck"
+        # ICE BEAM ERRAND — DEFAULT OFF (2026-08-02 stream chalk): "broke" returned need_cash_for_tm,
+        # marked head_to_gym a dead route on Celadon, and she farmed grass for ¥66k instead of
+        # walking into Erika. Blastoise Water already carries the gym. Opt-in:
+        # POKEMON_ICE_BEAM_BEFORE_ERIKA=1. Never defer the door for cash.
+        if name == "Erika" and os.getenv("POKEMON_ICE_BEAM_BEFORE_ERIKA", "0") == "1":
+            _already_in_erika = tuple(tv.map_id(self.b)) == CELADON_GYM_INTERIOR
+            if _already_in_erika:
+                log("   GYM-PREP [Erika]: already inside Celadon Gym — skipping Ice Beam street errand")
+            else:
+                try:
+                    from game_corner import IceBeamErrand, ice_beam_cash_shortfall
+                    _ibr = IceBeamErrand(self, log=log).run()
+                    log(f"   GYM-PREP [Erika]: ice-beam errand -> {_ibr}")
+                    if _ibr == "broke":
+                        log(f"   GYM-PREP [Erika]: short ¥{max(int(ice_beam_cash_shortfall(self) or 0), 1)} "
+                            f"for Ice Beam — ENTERING ANYWAY (never defer the gym for TM cash)")
+                        self.on_event("skipping the Game Corner detour — straight to Erika.",
+                                      kind="gym", tier=2)
+                    self._ice_beam_cash_needed = 0
+                except Exception as e:
+                    log(f"   !! GYM-PREP ice-beam errand crashed ({e}) — entering Erika as-is (LOUD)")
+        elif name == "Erika":
+            self._ice_beam_cash_needed = 0
+            log("   GYM-PREP [Erika]: Ice Beam errand OFF (default) — walking into the gym NOW")
+        # Deliberate gym interiority: junior fights must NOT trip the stranded/blackout eject
+        # (2026-08-02 Celadon: fight a junior → next tick "BLACKOUT/STRANDED" walks her out).
+        try:
+            self._ql_inside_target = True
+            self._ql_inside_map = tuple(tv.map_id(self.b))
+        except Exception:
+            pass
         # Fix B: ENFORCED pre-gym readiness (catch a team / type answer / level) BEFORE entering — she
         # must never solo a gym underleveled. Best-effort; a crash here never blocks the gym (LOUD).
         try:
             self.prep_for_gym(gym)
         except Exception as e:
             log(f"   !! GYM-PREP crashed ({e}) — walking into {name} unprepped (LOUD)")
-        # POTION-STALL STOCK-UP (night-shift 1, the badge-5 Koga attrition wall): for gyms flagged as a
-        # solo-carry attrition wall, buy a stall stock of Super Potions at the gym-city Mart BEFORE
-        # entering, so the in-battle item instinct can heal her ace through the gauntlet (the proven
-        # potion-stall win). Runs here (not inside prep_for_gym) so it fires even on a goal-pinned watch
-        # — prep_for_gym returns "pinned" and skips its body. Best-effort + bounded; a crash never blocks
-        # the gym (LOUD). Resource/economy bedrock #6; game-facts isolated to POTION_STALL_GYMS.
+        # PRE-GYM KIT (potions + KB bring_cures) in ONE shop trip — Celadon Dept is a multi-floor
+        # errand; never enter twice for potions then Antidotes (2026-08-02 empty-bag blackouts).
+        # Fires even when prep_for_gym is pinned. Best-effort; never blocks the gym (LOUD).
         try:
-            self._stock_potions_for_gym(gym)
+            self._stock_pre_gym_kit(gym)
         except Exception as e:
-            log(f"   !! GYM potion-stall stock-up crashed ({e}) — entering {name} as-is (LOUD)")
+            log(f"   !! GYM pre-kit stock-up crashed ({e}) — entering {name} as-is (LOUD)")
         # HEAL-BEFORE-THE-GYM GATE (2026-07-07, erika_run2): she walked into Erika's gauntlet with
         # two fainted mons and a PP-dry lead and status-moved her way to a 12-battle futility wall.
         # A human ALWAYS taps the Center first — gym cities always have one and heal_at_center
@@ -4117,12 +5436,35 @@ class Campaign:
         # makes it UNIVERSAL — if the lead is still at 4 moves, free ONE slot so any learn auto-fills
         # (her pick via the soul, never the best/super-effective move). No-op if she already has room.
         self._ensure_move_room()
+        _gym_interior = GYM_INTERIORS.get(name)
         if tv.map_id(self.b) == gym.city:
+            # Prep grind / dialogue can leave the watchdog latched — clear before the door walk.
+            try:
+                self._stuck_request = None
+                if self._stuckwatch is not None:
+                    self._stuckwatch.reset()
+            except Exception:
+                pass
             if self.enter_warp(pick=gym.door) != "warped":
-                log(f"   !! GYM: couldn't enter the {name} gym"); return "stuck"
+                # One hard retry with a fresh latch — the Celadon door loop's signature.
+                try:
+                    self._stuck_request = None
+                    if self._stuckwatch is not None:
+                        self._stuckwatch.reset()
+                except Exception:
+                    pass
+                if self.enter_warp(pick=gym.door) != "warped":
+                    log(f"   !! GYM: couldn't enter the {name} gym"); return "stuck"
+        elif _gym_interior and tuple(tv.map_id(self.b)) == _gym_interior:
+            log(f"   GYM: already inside {name}'s gym {_gym_interior} — staying (no re-enter/exit)")
         for _ in range(45):
             self.b.run_frame()
         gym_map = tv.map_id(self.b)                             # the gym interior we just entered
+        try:
+            self._ql_inside_target = True
+            self._ql_inside_map = tuple(gym_map) if gym_map else self._ql_inside_map
+        except Exception:
+            pass
         # CINNABAR QUIZ-DOOR GYM (NS#13): the general junior-clear + leader-engage below can't beat Blaine —
         # the leader sits behind SIX quiz doors the general handler never opens (it sees one accessible
         # trainer, calls the juniors "cleared", then A-taps a leader it can't reach). blaine_gym.run_gym does
@@ -4194,7 +5536,68 @@ class Campaign:
         # is a multi-box speech that a few A-taps don't fully clear; the primitive advances it and
         # stops the instant the battle starts). Misty starts the battle near-immediately - same path.
         self.b.set_input_owner("agent")
-        self._gym_move(gym.leader_front, label="leader")
+        _lf_ok = self._gym_move(gym.leader_front, label="leader")
+        # POOL-MAZE LEADER-APPROACH RETRY (2026-07-31, HARDENED same day after the live re-talk
+        # loop): travel to leader_front can wedge on a platform/pool interior for two DIFFERENT
+        # reasons, and the retry must do something DIFFERENT each time, never repeat a failing move:
+        #   (a) an UNBEATEN junior gates the walkway -> probe it (one un-probed junior per round;
+        #       _engage_trainer's talked-read marks the already-beaten ones done, NEVER re-talked —
+        #       the first version re-swept beaten juniors and she stood there re-opening their
+        #       post-defeat line forever, the loop in Jonny's screenshots);
+        #   (b) a WANDERING NPC body sits ON the one-tile walkway -> there is nothing to fight;
+        #       WAIT it out (rendered frame pump, ~4s) so the wanderer steps off, then re-path.
+        # Bounded: 3 rounds, each probing at most one junior / one wait. Stray dialogue boxes are
+        # drained BEFORE pathing (an open box eats travel input — half the original wedge).
+        if not _lf_ok and not st.in_battle(self.b) and not self.has_badge(gym.badge_flag):
+            _ldd = {"UP": (0, -1), "DOWN": (0, 1), "LEFT": (-1, 0), "RIGHT": (1, 0)}.get(gym.leader_dir, (0, -1))
+            _leader_tile = (gym.leader_front[0] + _ldd[0], gym.leader_front[1] + _ldd[1])
+            if not hasattr(self, "_gym_talked_objs"):
+                self._gym_talked_objs = set()
+            _probed = set()                                # 'no'-engages: skip for THIS entry only
+            for _rt in range(1, 4):
+                if tv.map_id(self.b) != gym_map:
+                    break                                  # blacked out / left — the checks below handle it
+                if dd_box_open(self.b):
+                    log("   GYM: stray dialogue box open before the leader retry — draining it "
+                        "(an open box wedges travel)")
+                    self._drain_overworld(label="gym-stray-box")
+                px, py = tv.coords(self.b) or (0, 0)
+                _cand = [(i, c, f) for (i, c, f) in self._gym_trainers()
+                         if tuple(c) != _leader_tile and i not in _probed
+                         and (tuple(gym_map), i) not in self._gym_talked_objs
+                         and (tuple(gym_map), tuple(c)) not in self._blocked_npcs]
+                _cand.sort(key=lambda t: abs(t[1][0] - px) + abs(t[1][1] - py))
+                if _cand:
+                    _ji, _jc, _jf = _cand[0]
+                    log(f"   !! GYM: leader front {gym.leader_front} unreachable (try {_rt}/3) — "
+                        f"probing junior obj{_ji} at {_jc} (a gating trainer, e.g. the pool swimmer)")
+                    _eng = self._engage_trainer(_jc, _jf)
+                    if st.in_battle(self.b):
+                        _jr = self.battle_runner()
+                        log(f"   GYM: retry-probe junior obj{_ji} -> {_jr}")
+                        self._drain_overworld(label="trainer")
+                    elif _eng == "talked":
+                        self._gym_talked_objs.add((tuple(gym_map), _ji))
+                        log(f"   GYM: junior obj{_ji} ALREADY BEATEN in the save (talked, no "
+                            f"battle) — marked done for the session, never re-talking it")
+                    else:
+                        _probed.add(_ji)
+                        log(f"   GYM: junior obj{_ji} didn't engage — not re-probing it this entry")
+                else:
+                    log(f"   !! GYM: leader front {gym.leader_front} unreachable (try {_rt}/3) — no "
+                        f"un-probed junior left, so the wedge is an NPC BODY on the walkway; "
+                        f"WAITING ~4s (rendered) for the wanderer to step off, then re-pathing")
+                    for _ in range(240):
+                        self.b.run_frame()
+                        self.render()
+                _lf_ok = self._gym_move(gym.leader_front, label="leader-retry")
+                if _lf_ok or st.in_battle(self.b) or self.has_badge(gym.badge_flag):
+                    break
+            if (not _lf_ok and not st.in_battle(self.b) and not self.has_badge(gym.badge_flag)
+                    and tv.coords(self.b) != gym.leader_front):
+                log(f"   !! GYM: leader front {gym.leader_front} STILL unreachable after 3 retry "
+                    f"rounds — surfacing stuck (never A-mash the leader from across the pool)")
+                return "stuck"
         _lvl = self.b.rd8(ram.GPLAYER_PARTY + 0x54)
         _sp = st.SPECIES_NAME.get(st.read_party_species(self.b, 0), "?")
         log(f"   GYM: at {tv.coords(self.b)} (leader front {gym.leader_front}) - engaging {name} "
@@ -4270,6 +5673,7 @@ class Campaign:
         if self.has_badge(gym.badge_flag):
             log(f"   GYM: *** {name.upper()} BADGE obtained ***")
             getattr(self, "_gym_prep_bump", {}).pop(name, None)   # Fix B: gym done -> clear the loss-bump
+            self._save_gym_prep_bump()                            # persist the clear (relaunch must not re-prep)
             self.on_event(f"I beat {name} - that's the badge!")
             if tv.map_id(self.b)[0] != 3:                      # still in the gym interior -> leave to
                 pn = getattr(self, "_gym_pads", None)          # pad maze: ride back beside a door first
@@ -4282,6 +5686,14 @@ class Campaign:
                         pn.goto_region(_adj, label="pads->exit")
                 self._exit_to_overworld()                      # the city via the general hardened exit
                 log(f"   GYM: exit -> now {tv.map_id(self.b)}@{tv.coords(self.b)}")
+            # BAG-TM TEACH (2026-08-02): gym reward TMs land in the case during the award drain —
+            # spend them on the neediest compatible mon (Teleport-only Abra, plan targets) NOW,
+            # overworld menus clean. Best-effort; never undoes the badge.
+            try:
+                _tmr = self.teach_bag_tms(max_teaches=BAG_TM_TEACH_MAX)
+                log(f"   GYM: post-badge bag-TM teach -> {_tmr}")
+            except Exception as _tme:
+                log(f"   GYM: post-badge bag-TM teach crashed ({_tme}) — continuing (LOUD)")
             return "badge"
         log(f"   !! GYM: {name} not beaten / no badge flag"); return "stuck"
 
@@ -5085,7 +6497,7 @@ class Campaign:
         avoid = self._wall_avoid(state)
         pcount = state.get("party_count")
         plevel = state["party"][0]["level"] if state.get("party") else None
-        dead = getattr(self, "_grind_dead", set())
+        dead = getattr(self, "_grind_dead", set()) | getattr(self, "_seam_nogo", set())
         inadeq = getattr(self, "_grind_inadequate_set", set())
         try:
             known = self.world.reachable_with_trait(cur, "has_grass", avoid) or []
@@ -5458,6 +6870,20 @@ class Campaign:
         the wander SEEKS that ONE species — every non-target wild is FLED (no ball/PP waste, keep
         hunting) and the target is FORCE-caught (roster-judgment bypassed; it's on the plan, she's
         certain). None = the original judged forward-catch (roster_judgment picks keepers)."""
+        # Already-owned target (2026-08-02 Diglett chalk): never wander a cave hunting a dupe —
+        # Diglett's Arena Trap + re-catch loops emptied her balls and stuck the RUN menu.
+        if target_species:
+            _want = (target_species or "").lower()
+            _sid = next((k for k, v in st.SPECIES_NAME.items() if v == _want), None)
+            if _sid and (_sid in self._owned_species_ids()
+                         or ram.pokedex_owns(self.b, _sid) is True):
+                log(f"   CATCH: target {_want} already owned (dex/party/box) — skip wander")
+                return "already_owned"
+        # Creator get_flash / fight_gym: do not start a catch wander mid-errand.
+        _ord = self._creator_order(None)
+        if _ord and _ord.get("order") in ("get_flash", "fight_gym"):
+            log(f"   CATCH: creator order {_ord.get('order')} active — skipping catch wander")
+            return "order_override"
         t0 = time.time()
         cur0 = tv.coords(self.b)
         # Grid.grass is in BUFFER coords (save + MAP_OFFSET); travel's arrive_coord + coords() are
@@ -5582,10 +7008,12 @@ class Campaign:
                 self.on_event(f"there it is — a wild {_tfname}! this is the one I came for.",
                               kind="roster", tier=2)
                 # fall through to the commit (skip the judgment block)
+            # CREATOR CATCH LAW (2026-08-02): Jonny said catch — skip judgment, commit balls.
             # BLOCK #3 — THE CHOICE (2026-07-06 nursery): a real player doesn't ball everything that
             # rustles the grass. Size the wild up (dupe/coverage/level/room), offer the call to the
             # oracle (hers, live), follow the framework's lean headless — and VOICE it both ways.
-            elif CATCH_JUDGMENT_ENABLED:
+            elif CATCH_JUDGMENT_ENABLED and not (
+                    (self._creator_order(None) or {}).get("order") == "catch_now"):
                 # FOE SOURCE = gEnemyParty[0] (written at wild-mon CREATION, before the battle
                 # intro even fades in), NOT the gBattleMons snapshot: at hand-off time
                 # gBattleMons[1] can still hold the PREVIOUS battle's foe — the voltorb_run1
@@ -5678,6 +7106,7 @@ class Campaign:
             if res == "caught":
                 caught[0] = True
                 self.on_event("I caught a new teammate!")
+                self._fulfill_catch_order()
             elif res == "no_balls":
                 out_of_balls[0] = True              # STOP the wander — wandering ball-less just hits
             elif res == "cant_weaken":
@@ -6031,30 +7460,37 @@ class Campaign:
             self.b.run_frame()
         self.b.set_input_owner("agent")
         # 2) to the nurse counter + drive the YES heal dialogue
-        self._step_to(NURSE_FRONT_OVERRIDES.get(tuple(pc_door), NURSE_FRONT))
-        self.b.press("UP", 6, 8, self.render, owner="agent")     # face the nurse
-        for _ in range(26):
-            # YES/NO box eats the first press; UP engages (YES is top, can't move off), A=YES
-            self.b.press("UP", 4, 4, self.render, owner="agent")
-            self.b.press("A", 6, 10, self.render, owner="agent")
-            for _ in range(30):
-                self.b.run_frame()
-            if self._party_fully_healed():            # WHOLE party revived+topped (not just the lead — a
-                break                                 #   full lead + fainted bench used to break instantly)
-        if not self._party_fully_healed():
-            h1 = self.lead_hp()
-            log(f"   !! HEAL: nurse dialogue did not complete (party not full; lead {h1[0]}/{h1[1]})")
-            return "stuck"
-        log(f"   HEAL: restored party to full (lead was {h0[0]}/{h0[1]})")
-        # a successful heal on this map proves the Center reachable from HERE — clear any strand-guard
-        # memo (the mark was for a one-way pocket; from the normal side the offer must return)
-        getattr(self, "_heal_dead_maps", set()).discard(tuple(tv.map_id(self.b)))
-        # 3) EXIT: the post-heal script holds control for a beat and the exit mat only fires when you
-        # STEP onto it. PATIENTLY clear the nurse's closing text (B, harmless in the overworld) and
-        # walk DOWN the counter column onto the mat, retrying until we're back in the city. The old
-        # single DOWN-burst was too impatient and froze at the counter (the Cerulean heal-exit bug).
-        for _ in range(6):                          # clear the nurse's closing text (B = harmless)
-            self.b.press("B", 3, 8, self.render, owner="agent")
+        # WATCHDOG HOLD (2026-07-31, the Center bail storm — live 14:15 log): the heal jingle holds
+        # ONE static "Okay, I'll take your POKéMON…" box for 8s+, which read as frozen_box and
+        # TRIPPED the watchdog mid-heal; the latch then instabailed every Center-EXIT leg (~45s of
+        # standing still, right as the momentum march to Vermilion needed clean legs — the visible
+        # Route-4↔Cerulean 'stuck' Jonny watched). The nurse interaction is DELIBERATE stillness,
+        # exactly what watchdog_hold exists for.
+        with self.watchdog_hold("nurse heal"):
+            self._step_to(NURSE_FRONT_OVERRIDES.get(tuple(pc_door), NURSE_FRONT))
+            self.b.press("UP", 6, 8, self.render, owner="agent")     # face the nurse
+            for _ in range(26):
+                # YES/NO box eats the first press; UP engages (YES is top, can't move off), A=YES
+                self.b.press("UP", 4, 4, self.render, owner="agent")
+                self.b.press("A", 6, 10, self.render, owner="agent")
+                for _ in range(30):
+                    self.b.run_frame()
+                if self._party_fully_healed():        # WHOLE party revived+topped (not just the lead — a
+                    break                             #   full lead + fainted bench used to break instantly)
+            if not self._party_fully_healed():
+                h1 = self.lead_hp()
+                log(f"   !! HEAL: nurse dialogue did not complete (party not full; lead {h1[0]}/{h1[1]})")
+                return "stuck"
+            log(f"   HEAL: restored party to full (lead was {h0[0]}/{h0[1]})")
+            # a successful heal on this map proves the Center reachable from HERE — clear any strand-guard
+            # memo (the mark was for a one-way pocket; from the normal side the offer must return)
+            getattr(self, "_heal_dead_maps", set()).discard(tuple(tv.map_id(self.b)))
+            # 3) EXIT: the post-heal script holds control for a beat and the exit mat only fires when you
+            # STEP onto it. PATIENTLY clear the nurse's closing text (B, harmless in the overworld) and
+            # walk DOWN the counter column onto the mat, retrying until we're back in the city. The old
+            # single DOWN-burst was too impatient and froze at the counter (the Cerulean heal-exit bug).
+            for _ in range(6):                      # clear the nurse's closing text (B = harmless)
+                self.b.press("B", 3, 8, self.render, owner="agent")
         self._exit_to_overworld()                   # the general, stress-tested building-exit (south
         #                                             door / DOWN-mat fallback). The old DOWN-only loop
         #                                             wedged inside some PCs ('stuck inside' at (5,4)).
@@ -6143,6 +7579,35 @@ class Campaign:
         except Exception as e:
             log(f"   [roam] chaff-swap target skipped: {e}")
             return None
+
+    def _team_build_breather_ok(self, state):
+        """TEAM-BUILD BREATHER gate (2026-08-04, Jonny + chat: 'box the dead bench, catch at the
+        area's level — stop hand-leveling hour-one catches'): may a forced gym march yield THIS
+        tick to a cheap roster move (box_chaff / swap_keeper / fetch_keeper)? True only when the
+        bench is genuinely LOPSIDED (ace-to-floor gap >= TEAM_BUILD_LOPSIDED_GAP — the L54 ace /
+        L17 bench shape), the per-badge budget isn't burned (the march can never be starved), and
+        no story-liberation (road-blocker) errand is in flight — Silph/Tea/Flute-class errands ARE
+        the road and outrank roster surgery. The creator-order LAW check lives at the call site."""
+        try:
+            party = state.get("party") or []
+            lvls = [int(m.get("level") or 0) for m in party if isinstance(m, dict)]
+            if len(lvls) < 2:
+                return False
+            if (max(lvls) - min(lvls)) < TEAM_BUILD_LOPSIDED_GAP:
+                return False                  # bench roughly keeps up -> just march
+            bc = int(state.get("badge_count") or 0)
+            if getattr(self, "_tb_breather_spent", {}).get(bc, 0) >= TEAM_BUILD_BREATHER_MAX:
+                return False                  # budget burned this badge -> march only
+            q = getattr(self, "_active_questline", None)
+            if q is not None:
+                _miss = getattr(q.gate, "missing", None)
+                _step = getattr(getattr(q, "actionable", None), "missing", None)
+                if _miss in ROAD_BLOCKER_KEYS or _step in ROAD_BLOCKER_KEYS:
+                    return False              # story liberation owns the tick
+            return True
+        except Exception as e:
+            log(f"   [roam] team-build breather gate skipped: {e}")
+            return False
 
     def _box_keeper_swap_target(self, state):
         """swap_keeper GATE (PC/BOX, NS#39): the mirror of box_chaff for the OTHER half of the loop —
@@ -6644,6 +8109,72 @@ class Campaign:
             log(f"   [roam] ENSURE-HM skipped: {e}")
             return False
 
+    def _teleport_rescue(self, reason="rescue"):
+        """RETIRED FROM ALL AUTOMATIC PATHS (2026-08-01). Live 2026-07-31/08-01: the blind
+        submenu drive pressed A on SUMMARY, not TELEPORT (the FRLG party submenu row order does
+        NOT match the field-moves-first assumption for this case), so instead of a warp the
+        stream showed her opening Abra's summary in a loop — twice. NOBODY may call this until
+        the submenu row is READ BACK (pixel/RAM truth), not assumed (pitfall-13 class). Kept for
+        reference and possible manual invocation only.
+
+        ORIGINAL INTENT (2026-07-31, the Route-4↔Cerulean border war): field-TELEPORT to the last
+        Pokémon Center used — the game's own 'get me out of here' move, so it needs NO pathfinding
+        and cannot be defeated by whatever is fighting over a map seam. Requires a party mon that
+        knows TELEPORT (her Abra — this is the one job a moveless Abra can do from day one) and an
+        OUTDOOR standing spot (the game refuses it indoors, use_field_move just fails clean).
+        Runs through the SAME proven party-menu flow as Flash (hm_teach.use_field_move, cursor-
+        readback START-menu nav, bounded retries, B-cascade fail-safe). Verified by RAM truth:
+        the map changed OR she moved a long way on the same map (a Teleport inside Cerulean lands
+        at the Center on the same city map). Returns True iff the warp verifiably happened."""
+        try:
+            import hm_teach as ht
+            if st.in_battle(self.b):
+                log(f"   [rescue-tp] skipped ({reason}): mid-battle")
+                return False
+            pc = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            slot = st.party_knows_move(self.b, TELEPORT_MOVE_ID, pc)
+            if slot is None:
+                log(f"   [rescue-tp] skipped ({reason}): nobody in the party knows Teleport")
+                return False
+            m0, c0 = tuple(tv.map_id(self.b)), tv.coords(self.b)
+
+            def _warped():
+                try:
+                    m1, c1 = tuple(tv.map_id(self.b)), tv.coords(self.b)
+                    if m1 != m0:
+                        return True
+                    return bool(c0 and c1 and abs(c1[0] - c0[0]) + abs(c1[1] - c0[1]) >= 8)
+                except Exception:
+                    return False
+            mon = st.SPECIES_NAME.get(st.read_party_species(self.b, slot), f"slot {slot}")
+            log(f"   [rescue-tp] 🌀 ({reason}) {mon} TELEPORT from {self.world.name(m0)} {c0} "
+                f"-> the last Pokémon Center (no pathfinding, the game does the moving)")
+            self.on_event(f"you know what — {mon}, get us OUT of here. Teleport, straight back "
+                          f"to the Center, and we take the road properly from there.",
+                          kind="travel", tier=2)
+            # drain_frames=600 (~10s of game frames): Teleport's spin+fade+warp takes SECONDS —
+            # the default 90-frame drain read a fired warp as a miss (2026-07-31 live, "she
+            # clicked tp and nothing happened"). fixed_row=0: a one-field-move mon (Abra) lists
+            # TELEPORT at row 0 every time — never let the retry scan press A on SUMMARY/SWITCH.
+            r = ht.TeachFlow(self, log=log, on_event=self.on_event).use_field_move(
+                slot, _warped, label="rescue-teleport", max_seconds=90,
+                drain_frames=600, fixed_row=0)
+            if r == "used":
+                self._wait_overworld()
+                # the warp invalidates every position-anchored suspicion from the border war
+                self._seam_hist = []
+                self._nomove_streak = 0
+                if hasattr(self, "_dead_moves"):
+                    self._dead_moves.clear()
+                log(f"   [rescue-tp] VERIFIED: now at {self.world.name(tuple(tv.map_id(self.b)))} "
+                    f"{tv.coords(self.b)} — resuming with a clean slate")
+                return True
+            log(f"   [rescue-tp] !! Teleport did not verify ({reason}) — she stays put, LOUD")
+            return False
+        except Exception as e:
+            log(f"   [rescue-tp] skipped ({reason}): {e}")
+            return False
+
     def grind(self, target_level, fragile=False, budget_s=480):
         """Train the lead to target_level in the grass, healing when low. Self-sufficient gym-readiness
         capability (the 'walk away' vision needs autonomous leveling). From a CITY with no grass
@@ -6821,6 +8352,15 @@ class Campaign:
                     break
                 r = self.trav.travel(target_map=None, arrive_coord=wp,
                                      max_steps=60, max_seconds=80, avoid=doors)
+                # WATCHDOG UNWIND (2026-07-30, the Route-4 instabail storm): a leg bailed on the
+                # latched disengage. The old loop only caught battle_loss/no_path/need_heal, so this
+                # fell through and the NEXT leg instabailed too — for the whole grind budget (then
+                # the outer prep loop re-entered). Surface it NOW so the roam top runs its recovery
+                # in seconds instead of minutes of bailed legs.
+                if r == "stuck" and getattr(self.trav, "last_fail_reason", "") == "watchdog":
+                    log("   GRIND: watchdog disengage latched — surfacing to the roam loop for "
+                        "recovery (not spinning the grind budget on instabailed legs)")
+                    return "stuck"
                 if r == "battle_loss":
                     return "battle_loss"
                 if r == "no_path":
@@ -6952,20 +8492,76 @@ class Campaign:
     def _swap_party_slots(self, i, j):
         """Swap two party slots' raw 100-byte structs in gPlayerParty (the same intact move the in-menu
         'switch order' does — save-safe, see the block comment). Overworld-only (NEVER mid-battle, where
-        the active-mon pointer would dangle). No-op if i==j or either slot is out of the live count."""
+        the active-mon pointer would dangle). No-op if i==j or either slot is out of the live count.
+
+        VERIFIED + BELIEF-SYNCED (2026-07-30, Jonny live report: 'she fields the wrong mon and doesn't
+        know it'): the swap now (a) re-reads slot 0 afterwards and logs LOUD what actually leads, and
+        (b) updates the cached lead identity (_last_lead_species/_last_lead_pid) so the evolve-watch and
+        every downstream 'who am I fielding' read stays truthful after a DELIBERATE reorder."""
         if i == j:
             return
         cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
         if not (0 <= i < cnt and 0 <= j < cnt):
             log(f"   GRIND-WEAK: !! refusing slot swap {i}<->{j} (party count {cnt}) — no-op")
             return
+        want_lead = st.read_party_species(self.b, j if i == 0 else i if j == 0 else 0)
         base = ram.GPLAYER_PARTY
         ai, aj = base + i * st.PARTY_MON_SIZE, base + j * st.PARTY_MON_SIZE
-        for k in range(st.PARTY_MON_SIZE // 4):           # 100 B = 25 u32 words
-            wi = self.b.rd32(ai + k * 4)
-            wj = self.b.rd32(aj + k * 4)
-            self.b.core.memory.u32.raw_write(ai + k * 4, wj)
-            self.b.core.memory.u32.raw_write(aj + k * 4, wi)
+        # Buffer both structs first, then write — never leave a half-swapped mon in RAM
+        # (a torn mid-swap read is what published ekans 115/40 on the stream HUD).
+        wi_buf = [self.b.rd32(ai + k * 4) for k in range(st.PARTY_MON_SIZE // 4)]
+        wj_buf = [self.b.rd32(aj + k * 4) for k in range(st.PARTY_MON_SIZE // 4)]
+        for k in range(st.PARTY_MON_SIZE // 4):
+            self.b.core.memory.u32.raw_write(ai + k * 4, wj_buf[k])
+            self.b.core.memory.u32.raw_write(aj + k * 4, wi_buf[k])
+        # POST-SWAP VERIFY: read back who actually leads now; a mismatch is a real bug — say so LOUD.
+        try:
+            got = st.read_party_species(self.b, 0)
+            nm = st.SPECIES_NAME.get(got, f"#{got}")
+            if (i == 0 or j == 0) and want_lead and got != want_lead:
+                log(f"   GRIND-WEAK: !!!! SWAP VERIFY FAILED — wanted "
+                    f"{st.SPECIES_NAME.get(want_lead, want_lead)} leading, slot 0 reads {nm}")
+            else:
+                log(f"   GRIND-WEAK: swap {i}<->{j} verified — {nm} now leads")
+            # keep her belief about her own lead current (evolve-watch discriminates by PID already)
+            self._last_lead_species = got
+            self._last_lead_pid = self.b.rd32(ram.GPLAYER_PARTY + 0)
+        except Exception as _sv:
+            log(f"   GRIND-WEAK: swap verify skipped: {_sv}")
+
+    def _write_nickname(self, slot, nick):
+        """Commit a REAL in-game nickname to the mon in party `slot` by writing the 10-byte nickname
+        field of its gPlayerParty struct (offset 8 — in the plaintext header, OUTSIDE the checksummed
+        encrypted block; same save-safety class as _swap_party_slots' raw struct move, and the same
+        field recon_name_rater.py decode-verifies). WHY here and not the post-catch keyboard
+        (2026-07-30, Jonny live report: 'she announces a name then the mon keeps its species name'):
+        the in-battle "give a nickname?" prompt renders through gDisplayedStringBattle, which nothing
+        in this harness can read — driving the naming keyboard blind mid-battle is exactly the
+        pitfall-13 wedge class. So the battle flow keeps its proven B-decline, and the name lands
+        HERE, overworld-side, decode-VERIFIED. Returns the committed name, or None (declined/failed)."""
+        from naming import encode_gen3
+        from dialogue_reader import decode as _g3decode
+        try:
+            if st.in_battle(self.b):
+                log("   NICKNAME: !! refusing to write mid-battle — skipped")
+                return None
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            if not (0 <= slot < min(cnt, 6)):
+                log(f"   NICKNAME: slot {slot} out of range (party {cnt}) — skipped")
+                return None
+            raw = encode_gen3(nick, maxlen=10)
+            if not raw:
+                return None
+            addr = ram.GPLAYER_PARTY + slot * st.PARTY_MON_SIZE + 8   # BoxPokemon.nickname (plaintext)
+            for k, bt in enumerate(raw):
+                self.b.core.memory.u8.raw_write(addr + k, bt)
+            got, _junk = _g3decode(bytes(self.b.read_bytes(addr, 10)))
+            sp = st.SPECIES_NAME.get(st.read_party_species(self.b, slot), "?")
+            log(f"   NICKNAME: slot {slot} ({sp}) is now {got!r} (verified by decode)")
+            return got or None
+        except Exception as e:
+            log(f"   NICKNAME: !! write failed ({e}) — the mon keeps its species name")
+            return None
 
     def _ace_hp_frac(self):
         """HP fraction of the ACE (the highest-level member, wherever it's currently slotted), or 1.0 if
@@ -7123,7 +8719,22 @@ class Campaign:
                 ace = max(m["level"] for m in party)
                 return t if ace < t else None
             t = self.strat.underlevel_target()              # FIELD-WEAK (switch armed)
-            floor = min(m["level"] for m in party)
+            # FIELDABLE FLOOR (2026-07-31, the post-Misty Route-4 forever-farm): mirror grind_weak's
+            # MOVELESS-LEAD GUARD at the PIN level. A mon with zero damaging PP (Teleport-only Abra,
+            # Harden-only Metapod) can never be FIELDED by the grind machinery, so it can never gain
+            # grind XP — letting it pin the team floor makes the bench target UNSATISFIABLE and the
+            # strengthen framing farms the same grass forever ("get abra to L20" while abra never
+            # fights). Those mons are development projects that level opportunistically (evolution
+            # thresholds, participation switches once they have a real move) — they must not anchor
+            # the grind. Floor + pin math run on FIELDABLE members only; all-unfieldable = no prep.
+            try:
+                _fld_lv = [m["level"] for i, m in enumerate(party)
+                           if st.slot_has_damaging_pp(self.b, i)]
+            except Exception:
+                _fld_lv = [m["level"] for m in party]
+            if not _fld_lv:
+                return None
+            floor = min(_fld_lv)
             if (not t and PROACTIVE_BENCH and len(party) >= 2
                     and tuple(tv.map_id(self.b)) not in getattr(self, "_grind_dead", ())):
                 # WALL-LESS bench-raising (2026-07-06 nursery): a fresh catch shouldn't ride the bench
@@ -7196,8 +8807,274 @@ class Campaign:
             return None
 
     def _prep_team_weak(self, state, target):
-        """The under-target members' species names (for the rationale/framing). Pure read off state."""
-        return [m["species"] for m in (state.get("party") or []) if m["level"] < target]
+        """The under-target members' species names (for the rationale/framing). FIELDABLE only
+        (2026-07-31): never name a mon the grind machinery refuses to field (Teleport-only Abra) —
+        the goal read "get abra to L20" while abra never entered a fight, which looked broken."""
+        party = state.get("party") or []
+        try:
+            return [m["species"] for i, m in enumerate(party)
+                    if m["level"] < target and st.slot_has_damaging_pp(self.b, i)]
+        except Exception:
+            return [m["species"] for m in party if m["level"] < target]
+
+    def _gym_dominant(self, state):
+        """True when the top mon clearly OVERPOWERS the next gym (the planner's dominance read — see
+        gym_readiness). HUMAN-PACING stand-down key (2026-07-31, Jonny: 'she can already destroy Misty
+        with Wartortle alone, stop farming'): while dominant, the PARKED prep machinery (strengthen-
+        first framing, the lopsided-bench march prune) steps aside — the bench still levels ORGANICALLY
+        on the march because road-bench-XP reads _prep_team_target independently of this. Self-
+        correcting: a loss bumps the readiness bar (loss_bump), dominance evaporates, full prep returns.
+        Mid-evo starters + paper benches never dominate (planner gates, 2026-08-01 Surge chalk)."""
+        try:
+            ng = state.get("next_gym") if state else None
+            if not ng or getattr(self, "planner", None) is None:
+                return False
+            r = self.planner.gym_readiness(
+                ng["leader"], state.get("party") or [], party_target=GYM_PARTY_TARGET,
+                loss_bump=getattr(self, "_gym_prep_bump", {}).get(ng["leader"], 0))
+            return bool(r and r.get("dominant"))
+        except Exception:
+            return False
+
+    def _ace_carries_next_gym(self, state):
+        """True when the ACE alone is at/above the next gym's grind bar — MARCH; train the bench
+        on the road (road-bench-XP), don't park in the same grass for a +6 pin.
+
+        WHY (2026-08-02, post-Surge Celadon chalk): after Thunder Badge the milestone rose to
+        Erika L31, the bench pin re-armed at L19, and she farmed Route 6 for Ekans/Rattata while
+        narrating 'Celadon, ready to go'. Blastoise L36 already clears the Erika level bar —
+        credits are the spine; grass parks that aren't a rematch bar are a pacing bug. Mid-evo
+        / rematch bumps still require the real grind (level_target rises; this returns False).
+
+        PAPER + STATUS-GYM GUARD: Blastoise L36 vs Surge ALSO clears the raw level bar, but
+        Thunder Wave / Raichu farm a paper bench — that rematch chalk must keep GO-HARD blocked.
+        KB `bring_cures` with paralysis (Surge Thunder Wave) + paper bench stays a short farm.
+        Poison/sleep (Erika) do NOT block the march — the pre-gym Dept kit stocks Antidote/
+        Awakening, and the ace already clears the level bar."""
+        try:
+            ng = state.get("next_gym") if state else None
+            if not ng or getattr(self, "planner", None) is None:
+                return False
+            party = state.get("party") or []
+            if not party:
+                return False
+            bump = getattr(self, "_gym_prep_bump", {}).get(ng["leader"], 0)
+            r = self.planner.gym_readiness(
+                ng["leader"], party, party_target=GYM_PARTY_TARGET, loss_bump=bump)
+            if not r or r.get("mid_evo_block"):
+                return False
+            top = int(r.get("top_level") or 0)
+            target = int(r.get("level_target") or 0)
+            if not (top and target and top >= target):
+                return False
+            if r.get("paper_bench"):
+                rec = (self.planner.threats or {}).get(ng["leader"]) or {}
+                # Only STATUS-LOCK cures (paralysis) block the march — Thunder Wave strands the
+                # ace mid-turn. Poison/sleep (Erika) are healable mid-fight once the Dept kit is
+                # stocked; don't park a Celadon grass farm for Antidotes (2026-08-02).
+                if "paralysis" in (rec.get("bring_cures") or []):
+                    return False
+            return True
+        except Exception:
+            return False
+
+    def _gym_go_hard_blocked(self, state):
+        """True when DOMINANT/MOMENTUM must NOT force head_to_gym. Creator order still wins (LAW).
+        WHY (2026-08-01): Wartortle L33 + paper bench vs Surge was called DOMINANT and GO HARD
+        marched her into Raichu; after loss, a missing bump / leftover momentum seed could re-latch.
+        WHY (2026-08-02): Blastoise L36 + paper bench STILL rode Misty MOMENTUM into Surge
+        (bump was 0, so the old gate only blocked mid-evo). ALWAYS consult gym_readiness —
+        not ready (paper bench / underleveled rematch bar) means no GO HARD, even with live
+        momentum. Short grass farm, then rematch — never bang the gym forever.
+        EXCEPTION (same day, Celadon chalk): when the ACE already carries the next gym's level
+        bar, paper-bench 'not ready' must NOT park a grass farm — march; road trains the bench."""
+        try:
+            if self._ace_carries_next_gym(state):
+                return False
+            ng = state.get("next_gym") if state else None
+            if not ng:
+                return False
+            party = state.get("party") or []
+            top = max(party, key=lambda m: m.get("level", 0)) if party else None
+            if top:
+                sp = (top.get("species") or "").lower()
+                lv = int(top.get("level") or 0)
+                if sp in ("squirtle", "wartortle") and lv < BLASTOISE_EVO_LEVEL:
+                    return True
+            if getattr(self, "planner", None) is None:
+                return False
+            bump = getattr(self, "_gym_prep_bump", {}).get(ng["leader"], 0)
+            r = self.planner.gym_readiness(
+                ng["leader"], party, party_target=GYM_PARTY_TARGET, loss_bump=bump)
+            if r and not r.get("ready"):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _momentum_live(self, state):
+        """True while a persisted DECISIVE-WIN momentum latch covers the CURRENT badge count (armed by
+        the badge branch of _route_action when the gym fell with zero faints + a healthy ace). While
+        live: the readiness floor spares head_to_gym, the GO block prunes grind/detour picks, and
+        goals say 'ride the momentum'. Auto-releases when the badge count moves past the latch (the
+        NEXT win re-evaluates decisiveness fresh); a gym LOSS deletes the file (hard-release branch).
+        Disk-persisted so a mid-march relaunch resumes the march, not a backward grass park (the
+        live post-Misty Route-4 loop was exactly this evaporating with the process). Never raises."""
+        import json as _j
+        if not MOMENTUM_ENABLED:
+            return False
+        try:
+            if not os.path.exists(MOMENTUM_JSON):
+                # ── ONE-SHOT SEED (2026-07-31, "she can go to vermillion now"): a committed seed
+                # matching the LIVE badge count latches momentum retroactively — the win predated
+                # the latch code, so the disk state never got written. Consumed-by-id so a pull
+                # can never re-arm it; checked once per process (cheap after that).
+                if not getattr(self, "_momentum_seed_checked", False):
+                    self._momentum_seed_checked = True
+                    try:
+                        if os.path.exists(MOMENTUM_SEED_JSON) and state:
+                            with open(MOMENTUM_SEED_JSON, encoding="utf-8") as f:
+                                seed = _j.load(f) or {}
+                            sid = str(seed.get("id") or "")
+                            done = []
+                            if os.path.exists(MOMENTUM_SEED_DONE):
+                                with open(MOMENTUM_SEED_DONE, encoding="utf-8") as f:
+                                    done = _j.load(f) or []
+                            _bc_now = int(state.get("badge_count", -1))
+                            if sid and sid not in done and int(seed.get("badge_count", -1)) == _bc_now >= 0:
+                                with open(MOMENTUM_JSON, "w", encoding="utf-8") as f:
+                                    _j.dump({"ts": time.time(), "badge_count": _bc_now,
+                                             "beat": seed.get("beat") or "the last gym",
+                                             "decisive": True, "seed_id": sid}, f)
+                                done.append(sid)
+                                with open(MOMENTUM_SEED_DONE, "w", encoding="utf-8") as f:
+                                    _j.dump(done, f)
+                                log(f"   [roam] 🔥 MOMENTUM SEEDED from repo ({sid!r}, badges={_bc_now}) — "
+                                    f"Jonny says GO: march for the next gym, train on the road")
+                    except Exception as _sx:
+                        log(f"   [roam] momentum seed skipped: {_sx}")
+                if not os.path.exists(MOMENTUM_JSON):
+                    return False
+            with open(MOMENTUM_JSON, encoding="utf-8") as f:
+                data = _j.load(f) or {}
+            bc = int(state.get("badge_count", -1)) if state else -1
+            if bc < 0:
+                return False
+            if int(data.get("badge_count", -1)) != bc:
+                os.remove(MOMENTUM_JSON)
+                log(f"   [roam] 🔥 MOMENTUM released (badge count moved {data.get('badge_count')} -> "
+                    f"{bc} — the next win re-evaluates fresh)")
+                return False
+            # flavor hint for the framing layers (a scrappy win rides too, but she shouldn't
+            # claim she "crushed it without breaking a sweat" when the stream saw a slugfest)
+            self._momentum_decisive = bool(data.get("decisive", True))
+            # who fell + the LIVE badge count, for UNAMBIGUOUS framing (2026-07-31 live: the old
+            # "badge in hand... march for Lt. Surge" phrasing got narrated as "Surge is down,
+            # 3 badges" — the voice must never be handed text it can misread as a future win
+            # already banked)
+            self._momentum_beat = str(data.get("beat") or "the last gym leader")
+            self._momentum_badges = bc
+            return True
+        except Exception as e:
+            log(f"   [roam] momentum read skipped: {e}")
+            return False
+
+    def _creator_order(self, state=None):
+        """JONNY'S WORD IS LAW (2026-07-31 pacing debrief: 'me and chat tell her to go fight Misty,
+        she says yes then keeps grinding'). The bot writes creator_order.json when Jonny speaks a
+        direct gameplay order; while it's live this returns the payload and the prep/prune layers
+        stand down (chat stays advice — only Jonny's VOICE reaches the writer). Lifecycle: expires
+        after CREATOR_ORDER_TTL_S; a fight_gym order is FULFILLED (released, celebrated) the moment
+        a badge is earned after it; a catch_now order is fulfilled by BattleAgent / catch_one (not
+        by badge). Acknowledged in her voice exactly once per order. Never raises."""
+        import json as _j
+        try:
+            if not os.path.exists(CREATOR_ORDER_JSON):
+                return None
+            with open(CREATOR_ORDER_JSON, encoding="utf-8") as f:
+                data = _j.load(f) or {}
+            ts = float(data.get("ts") or 0)
+            if not ts or time.time() - ts > CREATOR_ORDER_TTL_S:
+                os.remove(CREATOR_ORDER_JSON)
+                log(f"   [order] creator order expired ({CREATOR_ORDER_TTL_S / 60:.0f}m TTL) — released")
+                return None
+            order = data.get("order") or "fight_gym"
+            bc = int(state.get("badge_count", -1)) if state else -1
+            if "badges_at_order" not in data and bc >= 0:
+                data["badges_at_order"] = bc            # stamp the fulfillment baseline on first sight
+                with open(CREATOR_ORDER_JSON, "w", encoding="utf-8") as f:
+                    _j.dump(data, f)
+            # get_flash fulfilled when HM05 is taught (not by badge).
+            if order == "get_flash":
+                try:
+                    if st.party_knows_move(self.b, 148, self.b.rd8(ram.GPLAYER_PARTY_CNT)) is not None:
+                        os.remove(CREATOR_ORDER_JSON)
+                        log("   [order] creator get_flash FULFILLED (Flash taught) — released")
+                        self.on_event("Flash is mine — order done. moving on.", kind="order", tier=2)
+                        return None
+                except Exception:
+                    pass
+            # Badge fulfillment is for fight_gym / stop-grind ONLY — catch_now stays live until a
+            # catch settles (or TTL), otherwise "catch that Diglett" dies the moment she earns Erika.
+            if (order not in ("catch_now", "get_flash") and bc >= 0
+                    and int(data.get("badges_at_order", bc)) < bc):
+                os.remove(CREATOR_ORDER_JSON)
+                log("   [order] creator order FULFILLED (badge earned since the order) — released")
+                self.on_event("did what you asked, by the way. badge secured. never doubt me.",
+                              kind="order", tier=2)
+                return None
+            if getattr(self, "_order_ack_ts", None) != ts:
+                self._order_ack_ts = ts
+                log(f"   [order] !! CREATOR ORDER ACTIVE (LAW): {order} {data.get('raw', '')!r}")
+                if order == "catch_now":
+                    self.on_event("catch order locked in — next wild gets the ball treatment, "
+                                  "not a KO. I'm listening.", kind="order", tier=3)
+                elif order == "get_flash":
+                    self.on_event("Flash order — stop balling Digletts, cross the cave, get the HM. "
+                                  "moving forward NOW.", kind="order", tier=3)
+                else:
+                    self.on_event("okay okay — direct order from the boss. dropping everything else, "
+                                  "we're doing it NOW.", kind="order", tier=3)
+            return data
+        except Exception as e:
+            log(f"   [order] creator-order read skipped: {e}")
+            return None
+
+    def _fulfill_catch_order(self):
+        """Release a live catch_now creator order after a committed catch (success or clear attempt)."""
+        import json as _j
+        try:
+            if not os.path.exists(CREATOR_ORDER_JSON):
+                return
+            with open(CREATOR_ORDER_JSON, encoding="utf-8") as f:
+                data = _j.load(f) or {}
+            if data.get("order") != "catch_now":
+                return
+            os.remove(CREATOR_ORDER_JSON)
+            log("   [order] creator catch_now FULFILLED — released")
+            self.on_event("caught what you told me to. order done.", kind="order", tier=2)
+        except Exception as e:
+            log(f"   [order] catch-order fulfill skipped: {e}")
+
+    def _release_catch_order_for_restock(self):
+        """Quiet-release catch_now when the Ultra war-chest arms (2026-08-06 LIVE).
+
+        Jonny's 'catch that bird' latches catch_now; mid-ferry that diverts wilds to
+        flee/reserve Ultras and wedges the Kindle sea cross. Drop the order LOUD without
+        the 'caught what you told me' celebration — the bird is still owed after the Mart."""
+        import json as _j
+        try:
+            if not os.path.exists(CREATOR_ORDER_JSON):
+                return
+            with open(CREATOR_ORDER_JSON, encoding="utf-8") as f:
+                data = _j.load(f) or {}
+            if data.get("order") != "catch_now":
+                return
+            os.remove(CREATOR_ORDER_JSON)
+            log("   [order] !! creator catch_now RELEASED for Ultra war-chest ferry "
+                "(catch the bird AFTER the Mart) (LOUD)")
+        except Exception as e:
+            log(f"   [order] catch-order restock release skipped: {e}")
 
     def grind_weak_members(self, target, min_level=None, ace_cap=False, budget_s=None):
         """Field the WEAK members (not the ace) and level the team FLOOR to `target`, then restore the
@@ -7264,7 +9141,18 @@ class Campaign:
                     return self.b.rd32(ram.GPLAYER_PARTY + s * 100)
                 weak = [s for s, l in enumerate(levels)
                         if l < target and _slot_pid(s) not in stalled
-                        and (min_level is None or l >= min_level)]   # skip box-fodder chaff (E4-prep floor)
+                        and (min_level is None or l >= min_level)    # skip box-fodder chaff (E4-prep floor)
+                        # MOVELESS-LEAD GUARD, SWITCH-AWARE (2026-07-31, two Jonny debriefs): with the
+                        # participation switch OFF (solo/ace-cap), NEVER field a mon with zero damaging
+                        # PP (a Teleport-only Abra) — it can't win, can't flee a trainer, and
+                        # war-must-advance spams its failing move forever (the 10-minute Ekans fight).
+                        # With the switch ARMED it's the OPPOSITE: a moveless mon is exactly who should
+                        # lead — the turn-1 switch fields the ace BEFORE the foe's move resolves (a
+                        # switch outprioritises attacks in Gen 3), so the moveless lead takes zero hits
+                        # and banks its XP share. That is literally how a human levels an Abra to 16.
+                        # Fail-safes if the switch doesn't confirm: the PP-FAMINE switch fires the next
+                        # turn (moveless = famine by definition), and the stall set stops re-fielding.
+                        and (use_switch or st.slot_has_damaging_pp(self.b, s))]
                 if not weak:
                     remaining = [s for s, l in enumerate(levels) if l < target]
                     if remaining:                             # floor un-raisable — the under-target mon(s)
@@ -7280,6 +9168,22 @@ class Campaign:
                 if wk != 0:
                     log(f"   GRIND-WEAK: fielding slot {wk} (L{levels[wk]}) as lead to train it")
                     self._swap_party_slots(0, wk)
+                    # NARRATE THE MANEUVER with the VERIFIED lead (2026-07-30, Jonny live report: she'd
+                    # announce training ekans while the stream showed wartortle finishing fights — the
+                    # participation switch was invisible + unexplained, so it read as a bug AND her own
+                    # commentary drifted). One beat per fielded mon, naming who's up front and why the
+                    # ace still appears: the weak mon leads for the shared XP, the ace cleans up.
+                    try:
+                        _led = st.SPECIES_NAME.get(st.read_party_species(self.b, 0), "the little one")
+                        _ace_lv = max(levels)
+                        if getattr(self, "_gw_last_voiced", None) != _led:
+                            self._gw_last_voiced = _led
+                            self.on_event(
+                                f"training time — {_led} leads so it soaks up the XP, and if things get "
+                                f"hairy my L{_ace_lv} closer steps in to finish. that's the trick.",
+                                kind="grind", tier=1)
+                    except Exception:
+                        pass
                 lv_before, pid_before = self.b.rd8(ram.GPLAYER_PARTY + 0x54), _pid0()
                 r = self.grind(target, fragile=True, budget_s=GRIND_WEAK_PROBE_S)  # weak mon can faint ->
                 #   reachable grass only; SHORT probe so a hopeless mon stalls out fast (not an 8-min sink)
@@ -7454,6 +9358,11 @@ class Campaign:
         key = getattr(getattr(q, "gate", None), "missing", None)
         if key not in OVERWORLD_SAFE_QUESTLINES:
             return False
+        # Outer gate can be allowlisted (Snorlax) while the CURRENT step is a dungeon strike
+        # (silph_scope). Weak lead into Hideout Giovanni = Kangaskhan wipe (2026-08-02).
+        step = getattr(getattr(q, "actionable", None), "missing", None)
+        if step in DUNGEON_QUESTLINE_STEPS:
+            return False
         return self._on_overworld_now()
 
     def _road_bench_xp_arm(self, pick, state):
@@ -7475,6 +9384,17 @@ class Campaign:
             return False
         if pick != "head_to_gym" and not str(pick).startswith("travel:"):
             return False
+        # GO-HARD / PRE-SCOPE / FORCE-GYM (2026-08-02): never open the party menu to put Ekans
+        # (or any paper bench) in slot 0. That swap-theater every tick IS the "keeps picking Ekans
+        # over and over" stream look — and a paper lead into Hideout Giovanni is a wipe. Ace leads.
+        if getattr(self, "_force_gym_pick", False):
+            return False
+        try:
+            if (self._creator_order(state) or self._gym_dominant(state)
+                    or self._ace_carries_next_gym(state)):
+                return False
+        except Exception:
+            pass
         # QUESTLINE GUARD, MAP-TYPE-RELAXED (2026-07-13 — fresh_go_2 ace-runaway root). Errands do
         # nav-critical traversal: the Flash errand crosses pitch-dark Diglett's Cave, dungeon strikes cross
         # gauntlet interiors — a demoted ace LIVELOCKS there (the weak lead can't clear an L29 cave Dugtrio
@@ -7521,13 +9441,62 @@ class Campaign:
                     pid = None
                 if pid is not None and pid in stalled:   # can't earn XP on this route -> skip
                     continue
+                # MOVELESS-LEAD GUARD, LEG-AWARE (2026-07-31, two Jonny debriefs): on a questline-
+                # RELAXED leg the participation switch is OFF — a mon with zero damaging PP
+                # (Teleport-only Abra) would fight trainers ALONE with a move that can't deal
+                # damage and can't flee (the 10-minute Ekans fight) → skip it there. On a NORMAL
+                # march leg the switch is ARMED (set below), so a moveless mon is exactly who
+                # should ride shotgun: it leads, the turn-1 switch fields the ace before the foe's
+                # move resolves, and it banks the XP share — the human Abra-to-16 trick. Fail-safes
+                # on a non-confirm: PP-FAMINE switch next turn + the stall set.
+                if _ql_leg and not st.slot_has_damaging_pp(self.b, s):
+                    log(f"   [roam] ROAD-BENCH-XP: skipping slot {s} as lead candidate — no damaging "
+                        f"PP and no switch on this relaxed leg (it can't win a fight it leads)")
+                    continue
                 cand.append((l, s))
             if not cand:
                 return False
-            wk = min(cand)[1]                      # the weakest levelable under-target member
+            cand.sort()
+            # STREAM POLISH (2026-08-02): when the ace will switch in turn 1, do NOT lead with
+            # Intimidate mons (Ekans/Arbok/Growlithe/Arcanine). Chat sees "Intimidate!" then
+            # Blastoise and reports "Blastoise stole Ekans's ability" — pure optics, real game
+            # data is fine. Prefer any other under-target bench mon; fall through if that's all
+            # we have (XP still matters more than silence).
+            # FRLG Kanto Intimidate species only — ability is species-locked, never "swappable".
+            _INTIMIDATE = {23, 24, 58, 59}
+            if not _ql_leg and len(cand) > 1:
+                try:
+                    quiet = [(l, s) for (l, s) in cand
+                             if st.read_party_species(self.b, s) not in _INTIMIDATE]
+                    if quiet:
+                        if quiet[0][1] != cand[0][1]:
+                            log(f"   [roam] ROAD-BENCH-XP: skipping Intimidate lead "
+                                f"(slot {cand[0][1]}) — ace switches turn 1; chat misreads the "
+                                f"ability flash. Leading slot {quiet[0][1]} instead")
+                        cand = quiet
+                except Exception:
+                    pass
+            wk = cand[0][1]                        # the weakest levelable under-target member
+            # LEAD ROTATION (2026-07-31): if the same mon led the previous leg and the runner-up
+            # candidate is within ROAD_XP_ROTATE_BAND levels, hand this leg to the runner-up so
+            # the whole bench climbs together (XP spread across the six, not one shotgun seat).
+            try:
+                _lastp = getattr(self, "_road_xp_last_pid", None)
+                if (ROAD_XP_ROTATE_BAND > 0 and _lastp is not None and len(cand) > 1
+                        and self.b.rd32(ram.GPLAYER_PARTY + wk * st.PARTY_MON_SIZE) == _lastp
+                        and cand[1][0] <= cand[0][0] + ROAD_XP_ROTATE_BAND):
+                    log(f"   [roam] ROAD-BENCH-XP: rotating the lead — slot {wk} rode the last leg, "
+                        f"slot {cand[1][1]} (L{cand[1][0]}) takes this one")
+                    wk = cand[1][1]
+            except Exception:
+                pass
             ace = max(range(len(levels)), key=lambda s: levels[s])
             if wk == ace:
                 return False                       # the weakest IS the ace -> nothing to protect
+            try:
+                self._road_xp_last_pid = self.b.rd32(ram.GPLAYER_PARTY + wk * st.PARTY_MON_SIZE)
+            except Exception:
+                self._road_xp_last_pid = None
             if wk != 0:
                 self._swap_party_slots(0, wk)      # weak mon leads -> "sent out" -> XP-eligible
             # MOVE-LEARN ROOM (NS#16): the weak mon banks XP via road battles here (NOT grind(), so the
@@ -7568,8 +9537,10 @@ class Campaign:
         BENCH_TO_MILESTONE keep-climb machinery active for THIS transition and (b) defers the crossing
         questline so the LOPSIDED-BENCH grind fires. Park-safe by construction — it releases (returns None)
         the instant ANY of: the bench reaches within BENCH_MS_CLOSE of the milestone, this grass proves a
-        poor spot for it (bench out-levelled it -> _bench_poor_maps), or grass is unreachable (prep-dry
-        stand-down). So it can never infinitely park: worst case she crosses with whatever the last grass
+        poor spot for it (bench out-levelled it -> _bench_poor_maps), grass is unreachable (prep-dry
+        stand-down), she is ALREADY on the sea road (R19/R20/Seafoam interior — past the last grass), or
+        GO-HARD/ACE-CARRIES has grass off the menu (the grind it waits for can't fire — 2026-08-04 wedge).
+        So it can never infinitely park: worst case she crosses with whatever the last grass
         gave. Scoped tight — only next_gym==Blaine, only in the has-Surf-not-yet-crossed window
         (_seafoam_gate open), so the rest of the climb is byte-unaffected."""
         if not OVERLEVEL_SEALEG_ENABLED:
@@ -7584,6 +9555,26 @@ class Campaign:
             # only on the NEAR side of the crossing (has Surf, not yet crossed) — the last grass before the
             # sea. _seafoam_gate() is non-None exactly in that window and self-clears once crossed.
             if self._seafoam_gate() is None:
+                return None
+            # SEA-ROAD RELEASE (2026-08-04 LIVE, the Route-20 (119,17) permanent loop): two conditions
+            # that each turn this deferral into a deadlock — release (return None) so the crossing
+            # errand arms and seafoam_strike runs, instead of waiting on a grind that can never fire.
+            #  (a) ALREADY ON THE SEA ROAD (Route 19/20 or a Seafoam interior floor): the "last grass"
+            #      rationale is moot — she's past the grass. Deferring HERE blocked the seafoam gate
+            #      every tick while she stood next to the Seafoam entrance, wedging the run.
+            #  (b) GO-HARD/ACE-CARRIES is force-picking head_to_gym and pruning 'battle' — grass is
+            #      OFF the menu, so the LOPSIDED-BENCH grind this deferral waits for can NEVER fire
+            #      (_bench_severely_lopsided itself stands down on ace-carries). Deadlock by
+            #      construction: defer-for-grind + grind-forbidden. March means march — cross.
+            # The Fuchsia-grass-with-grinding-available case (no go-hard latch, near-side maps) is
+            # untouched — the deferral still holds exactly where it was designed to.
+            try:
+                from seafoam_strike import R19, R20, SEAFOAM_MAPS
+                if tuple(tv.map_id(self.b)) in ({R19, R20} | SEAFOAM_MAPS):
+                    return None
+            except Exception:
+                pass
+            if getattr(self, "_force_gym_pick", False) or self._ace_carries_next_gym(state):
                 return None
             if getattr(self, "_prep_dry", 0) >= 2:
                 return None                          # no reachable grass here — PREP STAND-DOWN owns it
@@ -7654,6 +9645,9 @@ class Campaign:
             return None
         if not (STRATEGIC_GRIND_ENABLED and battle_agent.GRIND_SWITCH_ENABLED):
             return None                              # need the proven participation switch to level a bench
+        # Ace already clears the next gym's level bar — never force a grass park (Celadon chalk).
+        if self._ace_carries_next_gym(state):
+            return None
         if getattr(self, "_active_questline", None) is not None:
             # MAP-TYPE-RELAXED (2026-07-13 — fresh_go_2 root): keep the ace leading INSIDE a cave/dungeon
             # interior (a forced grind there is the flee-loop). But on OPEN GROUND with a questline merely
@@ -7716,6 +9710,74 @@ class Campaign:
                 return self.b.rd16(slot + 2) ^ key
         return 0
 
+    def _key_item_owned(self, item_id):
+        """True if `item_id` is in the KEY ITEMS pocket (Silph Scope 359, Poké Flute 350, …).
+        bag_count / _item_count only see the Items pocket and will ALWAYS miss these."""
+        try:
+            import hm_teach as ht
+            return item_id in ht.pocket_items(self.b, ht.KEY_ITEMS_OFF, 30)
+        except Exception:
+            return False
+
+    def _try_wake_route12_snorlax(self, state=None):
+        """Wake the Route-12 Snorlax (Poké Flute strike) when she's on the map and it's asleep.
+
+        2026-08-02 LIVE: catch_now + ACE-CARRIES GO HARD forced head_to_gym into the body at
+        (9,88) → no_path thrash; heal then tried Viridian south and failed the same way. The
+        wake ritual is the ONLY forward move. Returns a roam-result string, or None if N/A.
+        catch_now stays live → BattleAgent diverts the wake fight to balls (weaken, don't KO)."""
+        try:
+            mid = tuple((state or {}).get("map") or tv.map_id(self.b))
+            if mid != (3, 30):
+                return None
+            import field_moves as fm
+            if fm.read_flag(self.b, 0x253):
+                return None
+            if not self._key_item_owned(350):
+                log("   [roam] !! Route 12 Snorlax sleeping but NO Poké Flute — Tower first "
+                    "(can't wake without it)")
+                return None
+            from snorlax_strike import run_strike
+            _balls = self._ball_count()
+            _co = self._creator_order(state)
+            _catch = bool(_co and _co.get("order") == "catch_now")
+            # 2026-08-02 LIVE: waking with 0 balls + catch_now made battle_runner FIGHT-clear
+            # and Blastoise KO'd Snorlax. Mart FIRST, then wake.
+            if _catch and _balls <= 0:
+                log("   [roam] !! catch_now Snorlax but ZERO balls — refusing wake "
+                    "(would KO it). Mart / stock_up FIRST.")
+                self.on_event("catch order is live but I've got ZERO balls — "
+                              "I'm not waking Snorlax just to Surf it. Mart first.",
+                              kind="route", tier=3)
+                return "snorlax_need_balls"
+            log(f"   [roam] !! Route 12 Snorlax is THE roadblock — Poké Flute wake NOW "
+                f"(not head_to_gym no_path thrash); balls={_balls}"
+                + ("; catch_now LAW → weaken+ball, don't KO" if _catch else ""))
+            self.on_event(
+                ("catch order — waking Snorlax with the Flute, then balls. do NOT KO it."
+                 if _catch else
+                 "Snorlax is still snoring across the road — Poké Flute. wake it."),
+                kind="route", tier=2)
+            # Unpark dead routes so the next tick can march south after the body leaves.
+            self._dead_moves.discard("head_to_gym")
+            self._nomove_streak = 0
+            try:
+                self._dead_moves_structural.get((3, 30), set()).discard("head_to_gym")
+            except Exception:
+                pass
+            r = run_strike(self, log)
+            log(f"   [roam] snorlax wake strike -> {r}")
+            if r == "woke_snorlax":
+                self.on_event("road's clear — Snorlax's up. south to Fuchsia is open.",
+                              kind="route", tier=2)
+                return "snorlax_woke"
+            if r == "not_here":
+                return None
+            return "snorlax_wake_failed"
+        except Exception as e:
+            log(f"   [roam] snorlax wake skipped: {e}")
+            return None
+
     def party_statuses(self):
         """Set of status NAMES currently afflicting any party member (decode_status of each STATUS1 @
         +0x50). Drives PART C's 'buy the cure for what hurt me' (sampled each free-roam tick) and is
@@ -7730,6 +9792,163 @@ class Campaign:
             if nm:
                 out.add(nm)
         return out
+
+    def _field_cure_tick(self):
+        """BETWEEN-BATTLES STATUS CURE (2026-08-03: 'she's not removing poisons!!'). Poison
+        ticks damage EVERY few overworld steps in FRLG and can faint the mon mid-march — if
+        she's carrying the cure, using it is physics, not personality. Scan the party, cure
+        the worst affliction she has an item for (poison outranks everything; then the lead;
+        one cure per tick — the next tick catches the rest). Failures latch 10 minutes so a
+        wedged bag flow can't loop (a Center heal clears status anyway). Best-effort + LOUD."""
+        try:
+            if time.time() < getattr(self, "_field_cure_backoff", 0):
+                return
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            afflicted = []                     # (priority, slot, status)
+            for s in range(min(cnt, 6)):
+                base = ram.GPLAYER_PARTY + s * st.PARTY_MON_SIZE
+                if self.b.rd16(base + P_HP) <= 0:
+                    continue
+                nm = decode_status(self.b.rd32(base + P_STATUS))
+                if not nm:
+                    continue
+                pri = 0 if nm == "poison" else (1 if s == 0 else 2)
+                afflicted.append((pri, s, nm))
+            if not afflicted:
+                return
+            afflicted.sort()
+            _, slot, status = afflicted[0]
+            cure = STATUS_CURE.get(status)
+            iid = None
+            if cure and self.bag_count(cure[0]) > 0:
+                iid = cure[0]
+            elif self.bag_count(23) > 0:                     # Full Heal cures everything
+                iid = 23
+            if iid is None:
+                return                                       # nothing in the bag — the Center run owns it
+            nm_mon = st.SPECIES_NAME.get(st.read_party_species(self.b, slot), f"slot{slot}").title()
+            log(f"   [roam] 💊 FIELD CURE: {nm_mon} is {status} and the bag has "
+                f"{ITEM_NAMES.get(iid, iid)} — using it NOW (between-battles doctrine)")
+            self.on_event(f"hang on — {nm_mon} is {status} and I'm literally carrying the cure. "
+                          f"one sec.", kind="heal", tier=1)
+            import hm_teach as _ht
+            res = _ht.TeachFlow(self, log=log, on_event=self.on_event).field_cure(iid, slot)
+            if res == "cured":
+                self.on_event(f"there — {nm_mon} is back to fighting shape.", kind="heal", tier=1)
+            else:
+                self._field_cure_backoff = time.time() + 600
+                log(f"   [roam] field cure -> {res} — backing off 10 min (Center heal still cures)")
+        except Exception as _fcx:
+            log(f"   [roam] field-cure tick skipped: {_fcx}")
+
+    def _cheapest_adequate_heal(self, missing_hp):
+        """Smallest potion tier in the bag that covers `missing_hp` (Potion < Super < Hyper <
+        Max < Full Restore — never waste the big bottle on a chip); if no tier covers it
+        fully, the biggest bottle present (max value for the drink). None = heal pocket is
+        EMPTY. Pure ladder logic — recon-testable."""
+        best = None
+        for iid in (13, 22, 21, 20, 19):                 # cheapest -> priciest
+            if self.bag_count(iid) <= 0:
+                continue
+            best = iid                                   # biggest-present fallback (list ascends)
+            if POTION_HEAL_AMOUNT[iid] >= missing_hp:
+                return iid
+        return best
+
+    def _field_heal_pick(self, top_up=False):
+        """(slot, hp, mx, item_id) for the neediest heal-worthy member, or None. The ACE
+        (highest level — the mon that actually fights) heals under FIELDHEAL_ACE_FRAC and
+        OUTRANKS the bench; other standing members under FIELDHEAL_BENCH_FRAC. `top_up`
+        raises the ace's bar to FIELDHEAL_TOPUP_FRAC (the pre-legendary near-full seam).
+        Fainted mons are skipped (a potion is refused on a corpse — Revive/Center owns
+        them). An EMPTY heal pocket with a hurt mon logs an honest [fieldheal] skip
+        (rate-limited) and returns None — never a wedge."""
+        ph = self.party_health()
+        if not ph:
+            return None
+        ace = self._lap_ace_slot()
+        if ace is None:
+            ace = 0
+        need = []                                        # (ace-first, frac, slot, hp, mx)
+        for s, hp, mx, frac in ph:
+            if hp <= 0:
+                continue
+            thr = (FIELDHEAL_TOPUP_FRAC if (top_up and s == ace)
+                   else (FIELDHEAL_ACE_FRAC if s == ace else FIELDHEAL_BENCH_FRAC))
+            # Micro top-ups at the legendary doorstep look insane (Jonny 08:43: "healed
+            # Blastoise barely for no reason, then turned around") — skip <20 missing HP.
+            if top_up and s == ace and (mx - hp) < FIELDHEAL_TOPUP_MIN_MISSING:
+                continue
+            if frac < thr:
+                need.append((0 if s == ace else 1, frac, s, hp, mx))
+        if not need:
+            return None
+        need.sort()
+        _, _, s, hp, mx = need[0]
+        iid = self._cheapest_adequate_heal(mx - hp)
+        if iid is None:
+            if time.time() >= getattr(self, "_field_heal_empty_logged", 0):
+                self._field_heal_empty_logged = time.time() + 300
+                nm = st.SPECIES_NAME.get(st.read_party_species(self.b, s), f"slot{s}").title()
+                log(f"   [fieldheal] !! {nm} is hurt ({hp}/{mx}) but the heal pocket is "
+                    f"EMPTY — honest skip (the next Center/Mart owns it)")
+            return None
+        return (s, hp, mx, iid)
+
+    def field_heal_check(self, reason="tick", top_up=False):
+        """OUT-OF-BATTLE FIELD HEAL (2026-08-05, the Mt. Ember climb: 'she is not healing
+        outside of battle when she probably should' — badge-8 Blastoise grinding up Kindle
+        Road/Summit Path with potions in the bag and no Center on the mountain). The seam
+        runs between battles (free-roam tick), at strike leg boundaries, and as the
+        pre-legendary TOP-UP right before the static A-press (`top_up=True`). Drinks via
+        the PROVEN TeachFlow bag rails, cheapest-adequate first, up to
+        FIELDHEAL_MAX_PER_SEAM bottles per seam; a failed bag-drive backs off 10 minutes
+        (a Center heal still owns it — never a loop). Status on a standing mon rides the
+        existing field-cure flow at the end (the climb has no roam tick to catch it).
+        Returns how many heals landed. Best-effort + LOUD; never raises."""
+        if not FIELD_HEAL_ENABLED:
+            return 0
+        healed_n = 0
+        try:
+            if time.time() < getattr(self, "_field_heal_backoff", 0):
+                return 0
+            if st.in_battle(self.b):
+                return 0                    # mid-battle items are battle_agent's flow, never ours
+            if dd_box_open(self.b):
+                return 0                    # scripted scene / open box — never fight the script
+            voiced = False
+            for _pass in range(FIELDHEAL_MAX_PER_SEAM):
+                tgt = self._field_heal_pick(top_up=top_up)
+                if tgt is None:
+                    break
+                slot, hp, mx, iid = tgt
+                nm = st.SPECIES_NAME.get(st.read_party_species(self.b, slot),
+                                         f"slot{slot}").title()
+                log(f"   [fieldheal] {reason}{' TOP-UP' if top_up else ''}: {nm} at "
+                    f"{hp}/{mx} HP — drinking {ITEM_NAMES.get(iid, iid)} from the bag NOW "
+                    f"(cheapest-adequate; no Center on this road)")
+                if not voiced:
+                    voiced = True
+                    self.on_event(
+                        (f"before I take another step toward that thing — {nm} gets topped "
+                         f"up. walking into a legendary hurt is how runs die."
+                         if top_up else
+                         f"{nm}'s pretty beat up and I'm literally carrying potions. "
+                         f"quick drink, THEN we keep moving."), kind="heal", tier=1)
+                import hm_teach as _ht
+                res = _ht.TeachFlow(self, log=log, on_event=self.on_event).field_heal(iid, slot)
+                if res != "healed":
+                    self._field_heal_backoff = time.time() + 600
+                    log(f"   [fieldheal] !! bag-drive -> {res} — backing off 10 min "
+                        f"(LOUD; the Center path still heals)")
+                    break
+                healed_n += 1
+            # STATUS RIDE-ALONG: a poisoned/burned climber uses the proven cure flow here —
+            # during a strike the roam tick (its usual caller) never runs.
+            self._field_cure_tick()
+        except Exception as _fhx:
+            log(f"   [fieldheal] check skipped: {_fhx}")
+        return healed_n
 
     def _mart_index(self):
         """TRUE BUY-list selection = selectedRow + scrollOffset (see MART_CURSOR/MART_SCROLL)."""
@@ -7776,6 +9995,158 @@ class Campaign:
                         self.b.run_frame()
                 return d
         return 0
+
+    # Overworld BAG (mart SELL mode) list readback — gBagMenuState keeps PER-POCKET arrays
+    # (recon_bagscroll derivation, pret): cursorPosition[3] @0x0203AD04, itemsAbove[3] @0x0203AD0A,
+    # indexed by POCKET (0 Items / 1 Key Items / 2 Balls). Pocket-0 pair battle-verified live
+    # (battle_agent BAG_CURSOR/BAG_SCROLL); index-1 verified by hm_teach's Key-Items nav. The
+    # sell list shows the ITEMS pocket -> the index-0 pair. TRUE selection = cursor + scroll.
+    _OW_BAG_CURSOR0 = 0x0203AD04
+    _OW_BAG_SCROLL0 = 0x0203AD0A
+
+    def _sell_list_index(self):
+        return self.b.rd8(self._OW_BAG_CURSOR0) + self.b.rd16(self._OW_BAG_SCROLL0)
+
+    def _sell_goto_row(self, row, tries=40):
+        """Move the SELL-bag selection to true index `row` with readback verification (the
+        _mart_goto_row doctrine — an eaten d-pad press can never leave us selling the wrong
+        item; the gSpecialVar_ItemId check after A is the second lock)."""
+        for _ in range(tries):
+            cur = self._sell_list_index()
+            if cur == row:
+                for _ in range(20):                        # settle: scroll animation lag
+                    self.b.run_frame()
+                if self._sell_list_index() == row:
+                    return True
+                continue
+            self.b.press("DOWN" if cur < row else "UP", 8, 10, self.render, owner="agent")
+            for _ in range(20):
+                self.b.run_frame()
+        return self._sell_list_index() == row
+
+    def _mart_sell_loot(self, max_units=20):
+        """CASH THE LOOT (2026-08-04, Jonny: 'get ice beam to OP herself through the game at a
+        human watchable pace'): sell every pure-cash item (MART_SELL_LOOT — Nuggets first) at
+        the mart counter she is ALREADY standing at, unit-by-unit, each sale verified by money-RISE
+        + pocket-count-DROP (the _mart_buy_one doctrine in reverse). The proceeds are what
+        actually bankroll the ¥80,500 Game Corner TM13 budget — trainer payouts alone leave
+        Ice Beam a maybe. Assumes she is INSIDE a mart (buy_at_mart calls this after the warp).
+        Best-effort and fail-closed: any unverified step aborts LOUD with a B-cascade; a money
+        DROP anywhere means a wrong menu is buying things -> instant abort. Returns ¥ gained."""
+        import hm_teach as ht
+        loot = [(iid, q) for iid, q in ht.items_pocket_rows(self.b) if iid in MART_SELL_LOOT]
+        if not loot:
+            return 0
+        m_start = self.money()
+        self.b.set_input_owner("agent")
+        self._step_to(MART_CLERK_FRONT)
+        for _ in range(6):                                # engage: face the clerk until the box opens
+            if dd_box_open(self.b):
+                break
+            self.b.press("UP", 8, 8, self.render, owner="agent")
+            self.b.press("A", 8, 10, self.render, owner="agent")
+            for _ in range(16):
+                self.b.run_frame()
+        for _ in range(12):                               # DRAIN greeting: A only WHILE a box is up
+            if not dd_box_open(self.b):
+                break
+            self.b.press("A", 8, 12, self.render, owner="agent")
+            for _ in range(16):
+                self.b.run_frame()
+        self.b.press("DOWN", 8, 10, self.render, owner="agent")   # BUY/SELL/QUIT: row 1 = SELL
+        for _ in range(12):
+            self.b.run_frame()
+        self.b.press("A", 8, 10, self.render, owner="agent")
+        for _ in range(90):                               # let the bag fade in
+            self.b.run_frame()
+        if self.money() < m_start:                        # money DROP = we are BUYING somewhere — bail
+            log(f"   !! MART-SELL: money dropped during entry ({m_start}->{self.money()}) — wrong "
+                f"menu, aborting the sell pass LOUD")
+            self._mart_menus_out()
+            return 0
+        # POSITIVE bag confirmation: clamp to the Items pocket, then the pocket byte must FLIP on
+        # RIGHT and flip back on LEFT — only the live bag does that (an eaten DOWN above lands us
+        # in the BUY list, where d-pads never touch this byte). No flip -> not the bag -> out LOUD.
+        for _ in range(3):
+            if self.b.rd8(ram.GBAG_POCKET) == 0:
+                break
+            self.b.press("LEFT", 8, 10, self.render, owner="agent")
+            for _ in range(14):
+                self.b.run_frame()
+        _p0 = self.b.rd8(ram.GBAG_POCKET)
+        self.b.press("RIGHT", 8, 10, self.render, owner="agent")
+        for _ in range(14):
+            self.b.run_frame()
+        _live = self.b.rd8(ram.GBAG_POCKET) != _p0
+        if _live:
+            self.b.press("LEFT", 8, 10, self.render, owner="agent")
+            for _ in range(14):
+                self.b.run_frame()
+        if not _live or self.b.rd8(ram.GBAG_POCKET) != 0:
+            log("   !! MART-SELL: SELL bag never opened (pocket byte dead / not Items) — "
+                "aborting the sell pass LOUD (no blind sells)")
+            self._mart_menus_out()
+            return 0
+        gained, sold = 0, {}
+        for _ in range(max_units):
+            if dd_box_open(self.b):                       # stray qty/message box from a late A — B it away
+                self.b.press("B", 6, 12, self.render, owner="agent")
+                for _ in range(14):
+                    self.b.run_frame()
+            rows = [(i, iid) for i, (iid, _q) in enumerate(ht.items_pocket_rows(self.b))
+                    if iid in MART_SELL_LOOT]
+            if not rows:
+                break
+            rows.sort(key=lambda t: MART_SELL_LOOT.index(t[1]))    # richest loot first (Nuggets)
+            row, iid = rows[0]
+            nm = ITEM_NAMES.get(iid, f"item#{iid}")
+            if not self._sell_goto_row(row):
+                log(f"   !! MART-SELL: couldn't reach {nm}'s row {row} (cursor stuck) — stopping LOUD")
+                break
+            m0, q0 = self.money(), ht.items_pocket_qty(self.b, iid)
+            self.b.press("A", 8, 12, self.render, owner="agent")   # select the row
+            for _ in range(24):
+                self.b.run_frame()
+            sel = self.b.rd16(ram.GSPECIALVAR_ITEMID)
+            if sel != iid:
+                log(f"   !! MART-SELL: selected item {sel} != {nm} ({iid}) — backing out LOUD")
+                self.b.press("B", 6, 12, self.render, owner="agent")
+                for _ in range(14):
+                    self.b.run_frame()
+                break
+            got = 0
+            for _ in range(26):                           # qty(1) -> 'I can pay ¥N' YES -> payout
+                self.b.press("A", 6, 10, self.render, owner="agent")
+                for _ in range(12):
+                    self.b.run_frame()
+                got = self.money() - m0
+                if got > 0:
+                    break                                 # STOP the instant money rises (no double-A)
+            for _ in range(8):                            # drain the payout message back to the list
+                if not dd_box_open(self.b):
+                    break
+                self.b.press("A", 6, 10, self.render, owner="agent")
+                for _ in range(12):
+                    self.b.run_frame()
+            if got <= 0 or ht.items_pocket_qty(self.b, iid) != q0 - 1:
+                log(f"   !! MART-SELL: sale verify FAILED for {nm} (¥+{got}, "
+                    f"x{q0}->x{ht.items_pocket_qty(self.b, iid)}) — stopping LOUD")
+                break
+            gained += got
+            sold[nm] = sold.get(nm, 0) + 1
+        self._mart_menus_out()                            # B out of the bag + clerk menu
+        if gained:
+            log(f"   MART-SELL: cashed {sold} for ¥{gained} (money now {self.money()})")
+            self.on_event(f"sold the loot at the counter — ¥{gained:,} richer. every Nugget "
+                          f"is Game Corner money.", kind="milestone", tier=2)
+        return gained
+
+    def _mart_menus_out(self, n=8):
+        """B-cascade out of any mart/bag menu layer back to the clerk floor (never navigates)."""
+        for _ in range(n):
+            self.b.press("B", 6, 12, self.render, owner="agent")
+            for _ in range(14):
+                self.b.run_frame()
 
     def _mart_enter_buylist(self):
         """Talk to the clerk, DRAIN the greeting (A while the message box is up), pick BUY (one A on the
@@ -7831,6 +10202,13 @@ class Campaign:
             log("   !! MART: couldn't enter the Mart"); return {}
         for _ in range(60):
             self.b.run_frame()
+        # CASH THE LOOT FIRST (2026-08-04, the Ice Beam fund): she's standing at a counter —
+        # sell the Nuggets/Pearls/Stardust BEFORE buying, so the sale proceeds are spendable
+        # in the very same trip. Best-effort: a sell crash never blocks the buy (LOUD).
+        try:
+            self._mart_sell_loot()
+        except Exception as e:
+            log(f"   !! MART-SELL crashed ({e}) — proceeding to BUY as-is (LOUD)")
         if not self._mart_enter_buylist():
             self._exit_to_overworld(); return {}
         bought = {}
@@ -7899,6 +10277,219 @@ class Campaign:
 
     # Snorlax-gated coastal roads: routable only once the Poké Flute (item 350) is in the bag.
     _FLUTE_GATED_MAPS = {(3, 30), (3, 34)}    # Route 12 (south of Lavender), Route 16 (west of Celadon)
+    # Mt. Moon floors — DONE after Cascade Badge (badge ≥ 2). Graph priors + Diglett's Cave adjacency
+    # kept dragging her back in and narrating it as Rock Tunnel (2026-08-02 chalk).
+    _MT_MOON_MAPS = {(1, 1), (1, 2), (1, 3)}
+
+    def _cleared_dungeon_avoid(self, state):
+        """Maps that are CLOSED for re-entry once the story has moved past them. Post-Misty Mt. Moon
+        is dead XP and wrong-road; keep world.route / grass-target / keeper hops OUT of it.
+        Post-Flash Celadon push ALSO closes the Pewter/Route3 west pocket — the graph otherwise
+        walks Pewter→Route3→Route4 (Mt. Moon front) after the aide handoff (2026-08-02 live chalk)."""
+        out = set()
+        try:
+            if int(state.get("badge_count") or 0) >= 2:
+                out |= set(self._MT_MOON_MAPS)
+        except Exception:
+            pass
+        out |= self._post_flash_west_avoid(state)
+        return out
+
+    # Diglett's Cave west pocket + early Kanto — DEAD for the Celadon billed road (starts Vermilion).
+    _DIGLETT_CAVE_MAPS = {(1, 36), (1, 37), (1, 38)}
+    _FLASH_WEST_POCKET = {
+        ROUTE2, PEWTER, ROUTE3, VIRIDIAN, ROUTE1, PALLET, ROUTE22, (1, 0),
+    } | _DIGLETT_CAVE_MAPS
+    # Celadon billed spine + Diglett's east mouth (Route 11). Once here, Flash return is done.
+    _CELADON_SPINE_MAPS = {
+        VERMILION, (3, 24), (3, 23), CERULEAN, (3, 27), (3, 28), LAVENDER,
+        (3, 26), (3, 25), CELADON, (3, 29), (1, 81), (1, 82),
+    }
+
+    def _party_knows_flash(self):
+        try:
+            return st.party_knows_move(self.b, 148, self.b.rd8(ram.GPLAYER_PARTY_CNT)) is not None
+        except Exception:
+            return False
+
+    def _on_celadon_spine(self, mid=None):
+        mid = tuple(mid or tv.map_id(self.b))
+        return mid in self._CELADON_SPINE_MAPS
+
+    def _post_flash_west_avoid(self, state):
+        """While Flash is taught and Erika is still next, NEVER graph-route through Pewter/Route 3
+        (that path dumps her at Mt. Moon's mouth — the post-Flash rewind). SRC map is always allowed
+        by world.route, so being stranded ON Pewter still escapes."""
+        try:
+            if int(state.get("badge_count") or 0) >= 4:
+                return set()
+            if not self._party_knows_flash():
+                return set()
+            ng = ((state.get("next_gym") or {}).get("city") or "")
+            if ng and ng != "Celadon City":
+                return set()
+            # Route 4 too — Cerulean→Route4 is the Mt.Moon-mouth rewind from the east side.
+            return {PEWTER, ROUTE3, ROUTE4}
+        except Exception:
+            return set()
+
+    def _diglett_east_to_vermilion(self):
+        """From the Flash west pocket (Route 2 / Diglett / Pewter…), cross Diglett's Cave EAST to
+        Route 11 → Vermilion — the Celadon road-head. Returns a status string; sets `_flash_returned`
+        ONLY when she is actually on the Celadon spine."""
+        ROUTE11 = (3, 29)
+        b = self.b
+        cur = tuple(tv.map_id(b))
+        if self._on_celadon_spine(cur):
+            self._flash_returned = True
+            return "already_spine"
+        log(f"   [flash-return] west-pocket rescue at {cur}@{tuple(tv.coords(b))} — "
+            f"Diglett EAST → Route 11 → Vermilion (NOT Pewter/Route3/Mt.Moon)")
+        self.on_event("Flash is done — Diglett's Cave east to Vermilion. "
+                      "that's the Celadon road, not back to Pewter.", kind="route", tier=2)
+        try:
+            if cur[0] != 3 and cur not in self._DIGLETT_CAVE_MAPS:
+                # Aide gatehouse / Pewter building / Forest gate — street first.
+                self._exit_to_overworld(max_tries=6)
+                cur = tuple(tv.map_id(b))
+            if cur in self._DIGLETT_CAVE_MAPS:
+                ok = self._cross_cave(None, ROUTE11)
+                if ok:
+                    self._edge_travel(VERMILION, "west")
+            elif cur == ROUTE2:
+                DIGLETT_R2_MOUTH, CAVE_EXIT_TILE = (17, 11), (17, 12)
+                AIDE_SOUTH_DOOR = (18, 46)
+
+                def _north_pocket():
+                    try:
+                        g = tv.Grid(b)
+                        return (tuple(tv.map_id(b)) == ROUTE2 and bool(tv.bfs(
+                            g, tuple(tv.coords(b)), lambda t: t == CAVE_EXIT_TILE,
+                            walkable=g.walkable)))
+                    except Exception:
+                        return False
+
+                for _ in range(4):
+                    if _north_pocket():
+                        break
+                    if tv.map_id(b)[0] != 3:
+                        self.enter_warp(prefer="north")
+                    else:
+                        self.enter_warp(pick=AIDE_SOUTH_DOOR)
+                if _north_pocket():
+                    self.trav.travel(target_map=None, arrive_coord=CAVE_EXIT_TILE, max_steps=400)
+                    r = self.enter_warp(pick=DIGLETT_R2_MOUTH)
+                    log(f"   [flash-return] cave-mouth enter -> {r} (now {tuple(tv.map_id(b))})")
+                    if r == "warped" and self._cross_cave(None, ROUTE11):
+                        self._edge_travel(VERMILION, "west")
+                else:
+                    log(f"   [flash-return] not in north pocket (on {tuple(tv.map_id(b))}) — "
+                        f"will retry next tick")
+            elif cur in (PEWTER, ROUTE3):
+                # Walk south/west toward Route 2 Diglett mouth — NOT east toward Mt. Moon.
+                go = "west" if cur == ROUTE3 else "south"
+                nxt = ROUTE2 if cur == PEWTER else PEWTER
+                log(f"   [flash-return] {cur} — {go} toward Diglett mouth (refuse Mt.Moon east)")
+                self._edge_travel(nxt, go)
+            elif cur in (VIRIDIAN, ROUTE1, PALLET, ROUTE22, (1, 0)):
+                # North/east toward Route 2 Diglett — never further south into Pallet nostalgia.
+                if cur == (1, 0):
+                    self._exit_to_overworld(max_tries=6)
+                elif cur == VIRIDIAN:
+                    self._edge_travel(ROUTE2, "north")
+                elif cur == ROUTE1:
+                    self._edge_travel(VIRIDIAN, "north")
+                else:
+                    self._edge_travel(VIRIDIAN, "north")
+            else:
+                log(f"   [flash-return] unexpected map {cur} — exit + retry")
+                if cur[0] != 3:
+                    self._exit_to_overworld(max_tries=4)
+        except Exception as _re:
+            log(f"   [flash-return] errored: {_re} (LOUD)")
+        now = tuple(tv.map_id(b))
+        if self._on_celadon_spine(now):
+            self._flash_returned = True
+            log(f"   [flash-return] ON CELADON SPINE at {now} — Flash detour closed")
+            self.on_event("back on the Celadon road. Rock Tunnel next — Flash is ready.",
+                          kind="route", tier=2)
+            return "returned"
+        return "progress"
+
+    def _rescue_post_flash_detour(self, state):
+        """Free-roam tick hook: after Flash, refuse the Pewter→Route3→Route4 rewind AND shove
+        Route-4 strand east into Cerulean (on the billed Celadon road)."""
+        bc = int(state.get("badge_count") or 0)
+        cur = tuple(state.get("map") or tv.map_id(self.b))
+        # Route 4 post-Cascade: east to Cerulean. Never sit at the Mt. Moon healing center.
+        if bc >= 2 and cur == ROUTE4:
+            log("   [roam] !! POST-CASCADE Route 4 — forcing EAST to Cerulean "
+                "(Mt. Moon is finished ground; Celadon road is Cerulean → Route 9 → Rock Tunnel)")
+            self.on_event("Route 4 — Mt. Moon's behind us. Cerulean east, then Rock Tunnel.",
+                          kind="route", tier=2)
+            self._edge_travel(CERULEAN, "east")
+            return "route4_east"
+        if bc >= 4 or not self._party_knows_flash():
+            return None
+        ng = ((state.get("next_gym") or {}).get("city") or "Celadon City")
+        if ng != "Celadon City":
+            return None
+        if self._on_celadon_spine(cur):
+            self._flash_returned = True
+            return None
+        if cur in self._FLASH_WEST_POCKET or (
+                cur[0] != 3 and cur not in self._MT_MOON_MAPS
+                and (state.get("place") or "").lower() in (
+                    "pewter city", "viridian city", "pallet town", "viridian forest",
+                    "route 2", "route 3", "diglett's cave")):
+            return self._diglett_east_to_vermilion()
+        return None
+
+    def _escape_off_mission_mt_moon(self, state):
+        """If she's already INSIDE post-Cascade Mt. Moon, get OUT. clear_mt_moon only works from 1F
+        plan start — mid-floor PLAN-MISMATCH used to return 'stuck' every tick and `continue` forever
+        (2026-08-02 Route4 TP chalk: she froze, then escape-hatch rewound to the Route 4 Center).
+        Returns a status string to re-tick, or None to fall through to normal roam / leave_building."""
+        mid = tuple(state.get("map") or ())
+        if mid not in self._MT_MOON_MAPS:
+            self._mt_moon_escape_tries = 0
+            return None
+        if int(state.get("badge_count") or 0) < 2:
+            return None
+        tries = int(getattr(self, "_mt_moon_escape_tries", 0))
+        if tries >= 2:
+            # Exhausted — STOP parking the tick. Let leave_building / Dig / roam move her.
+            log("   [roam] !! OFF-MISSION Mt.Moon escape EXHAUSTED — releasing tick to leave_building "
+                f"(still at {mid})")
+            self._ql_inside_target = False
+            return None
+        self._mt_moon_escape_tries = tries + 1
+        place = self._place_name(mid, default="Mt. Moon")
+        log(f"   [roam] !! OFF-MISSION: inside {place} ({mid}) with "
+            f"{state.get('badge_count')} badges — escape try {self._mt_moon_escape_tries}/2")
+        self.on_event("wait — this is Mt. Moon, not Rock Tunnel. I've already cleared this cave. "
+                      "getting out.", kind="route", tier=3)
+        if mid == (1, 1) and tries == 0:
+            out = self.clear_mt_moon()
+            log(f"   [roam] Mt. Moon clear_mt_moon -> {out} (now {tv.map_id(self.b)})")
+            if out == "cleared":
+                self._mt_moon_escape_tries = 0
+                self.on_event("out of Mt. Moon — Cerulean side. Celadon road, not nostalgia tourism.",
+                              kind="route", tier=2)
+                return "cleared"
+        # Mid-floor / plan mismatch / second try: generic door exit (not the full moon plan).
+        log("   [roam] Mt.Moon: using EXIT-TO-OVERWORLD (plan can't resume mid-floor)")
+        try:
+            self._exit_to_overworld(max_tries=8)
+        except Exception as _ee:
+            log(f"   [roam] Mt.Moon exit_to_overworld errored: {_ee}")
+        now = tuple(tv.map_id(self.b))
+        if now not in self._MT_MOON_MAPS:
+            self._mt_moon_escape_tries = 0
+            log(f"   [roam] Mt.Moon ESCAPED via doors -> {now}")
+            self.on_event("out — back on the overworld. Celadon road from here.", kind="route", tier=2)
+            return "escaped_doors"
+        return "stuck"
 
     def _story_gate_avoid(self, state):
         """Story-gated maps to keep OUT of graph ROUTING until the key item is owned. The world graph is
@@ -7906,20 +10497,18 @@ class Campaign:
         warp-route now sends her Vermilion->Route 11->Route 12 toward Celadon — but Route 12 is Snorlax-
         blocked pre-Flute (the ONLY pre-Flute road to Lavender is ROCK TUNNEL — gamedata/frlg_gates.json
         roads['Celadon City']). She wedged at the Snorlax (13,70). Avoid the gated maps so the graph route
-        falls through to the billed road (Rock Tunnel). Post-Flute (item 350) they clear and become roads."""
-        try:
-            # ITEM_POKE_FLUTE (350) is a KEY item — _item_count/bag_count only scan the ITEMS pocket
-            # (0x310) and can NEVER see it, so the old `_item_count(350)>0` never fired and Route 12/16
-            # stayed avoided even POST-Flute (the docstring's "roads open" never actually happened). Read
-            # the KEY-ITEMS pocket (where the Flute lives) so the avoid clears once she can wake the
-            # Snorlaxes. (NS#11: this latent bug blocked ALL post-Flute routing TO Fuchsia — the only learned
-            # graph path south runs through Route 12 — which the proactive Surf questline is the first to need.)
-            import hm_teach as ht
-            if 350 in ht.pocket_items(self.b, ht.KEY_ITEMS_OFF, 30):
-                return set()
-        except Exception:
-            pass
-        return set(self._FLUTE_GATED_MAPS)
+        falls through to the billed road (Rock Tunnel). Post-Flute (item 350) they clear and become roads.
+        Also folds cleared-dungeon avoid (post-Cascade Mt. Moon).
+        PRE-SCOPE LAVENDER (2026-08-02): without Silph Scope the Tower/Flute chain is locked — graph
+        hops into Lavender from Route 8 reopen the Lavender↔Route 8 border thrash. Ban Lavender until
+        Scope (or Flute) is owned; SRC-map always escapes if she resumed ON Lavender."""
+        cleared = self._cleared_dungeon_avoid(state)
+        if self._key_item_owned(350):                 # Poké Flute — coastal Snorlax roads open
+            return set(cleared)
+        out = set(self._FLUTE_GATED_MAPS) | cleared
+        if not self._key_item_owned(359):             # Silph Scope — Tower chain still locked
+            out.add(LAVENDER)
+        return out
 
     def _keeper_hard_gate_avoid(self, state):
         """NS#43 — the KEEPER ROUTER (only) must not offer a keeper reachable only ACROSS a hard gate she
@@ -8009,6 +10598,14 @@ class Campaign:
         once, in character (firewall: `place`/event seam — she narrates, she still chooses)."""
         if not QUESTLINE_ENABLED:
             return False
+        # Flash already taught → NEVER re-open the Diglett west errand from Route 10
+        # (2026-08-02 chalk: every bad TP re-armed flash → Diglett's Cave tourism).
+        try:
+            if getattr(gate, "missing", None) == "flash" and self._party_knows_flash():
+                log("   [roam] QUESTLINE REFUSED: flash already taught — not re-opening Diglett errand")
+                return False
+        except Exception:
+            pass
         q = self._derive_questline(gate)
         if q.actionable is None:
             return False                       # every step already satisfied → the gate is open, no errand
@@ -8071,9 +10668,25 @@ class Campaign:
         # that for first-of-a-kind wilds ONLY. Cleared the instant Flash is known / dex hits 10.
         self._dex_catch_all = (st.party_knows_move(b, FLASH_MOVE, pc()) is None
                                and ram.pokedex_owned_count(b) < 10)
+        # Flash taught ≠ errand done. BUGFIX (2026-08-02 live): early flash_done + `_flash_returned=True`
+        # BEFORE Diglett-east succeeded left her on Route 2; graph walked Pewter→Route3→Route4 (Mt.Moon).
+        # Stay in the errand (or free-roam rescue) until she's on the Celadon spine (Vermilion+).
         if st.party_knows_move(b, FLASH_MOVE, pc()) is not None:
             self._dex_catch_all = False
-            return "flash_done"
+            # Route 10 / Rock Tunnel / Cerulean road = DONE with Diglett. Never walk west.
+            cur_now = tuple(tv.map_id(b))
+            if self._on_celadon_spine(cur_now) or cur_now in {(1, 81), (1, 82)}:
+                self._flash_returned = True
+                log(f"   [flash-errand] Flash taught + on Celadon/Rock-Tunnel road {cur_now} — "
+                    f"DONE (no Diglett rewind)")
+                return "flash_done"
+            log("   [flash-errand] Flash already taught but still WEST of Diglett's — "
+                "forcing Vermilion road-head before clearing the questline")
+            self._diglett_east_to_vermilion()
+            if self._on_celadon_spine():
+                self._flash_returned = True
+                return "flash_done"
+            return "flash_progress"
 
         def _catch_to_10(where, tries=6):
             # EARLY-BAIL on a dupe-heavy map (2026-07-09): catch_one wanders until it catches SOMETHING
@@ -8119,7 +10732,10 @@ class Campaign:
         # here" is ALWAYS cross Diglett's Cave to Route 2 (an un-swept catch source), NEVER give up. Counting
         # Route 11 tripped DEX-BLOCKED at dex 9 the moment she had balls to over-hunt it, short-circuiting the
         # cave cross below. Only Route 2 (the terminal catch strip) + inside the cave count toward the stall.
-        _catch_phase = (cur == ROUTE2 or cur[0] != 3)
+        # Diglett's Cave interiors ONLY — never Route 4 PC / Mt. Moon / random houses
+        # (same chalk as PHASE 3: `cur[0] != 3` poisoned the stall counter + flash_stuck).
+        _DIGLETT_CAVE_STALL = {(1, 36), (1, 37), (1, 38)}
+        _catch_phase = (cur == ROUTE2 or cur in _DIGLETT_CAVE_STALL)
         if _dex > getattr(self, "_flash_dex_hi", -1):
             self._flash_dex_hi, self._flash_nogain = _dex, 0
         elif _catch_phase:
@@ -8130,11 +10746,42 @@ class Campaign:
                 f"catching or an off-errand route sweep, e.g. Route 24/25). Surfacing, not spinning.")
             return "flash_stuck"
 
-        # PHASE 3 — inside Diglett's Cave (non-overworld): keep crossing toward Route 2.
-        if cur[0] != 3:
-            _catch_to_10("Diglett's Cave", tries=3)
-            ok = self._cross_cave(None, ROUTE2)
+        # PHASE 3 — Diglett's Cave ONLY (1,36..38). BUGFIX (2026-08-02 Route4 TP chalk): the old
+        # `cur[0] != 3` treated Route 4 PC / Mt. Moon / every interior as Diglett's Cave and tried
+        # `_cross_cave` to Route 2 forever (flash_stuck + escape-hatch rewind).
+        _DIGLETT_CAVE = {(1, 36), (1, 37), (1, 38)}
+        if cur in _DIGLETT_CAVE:
+            _have_ground = any(sid in self._owned_species_ids() for sid in (50, 51))
+            try:
+                _have_ground = _have_ground or ram.pokedex_owns(b, 50) or ram.pokedex_owns(b, 51)
+            except Exception:
+                pass
+            if not _have_ground and not getattr(self, "_flash_diglett_tried", False):
+                self._flash_diglett_tried = True
+                cr = self.catch_one(max_seconds=90, target_species="diglett")
+                log(f"   [flash-errand] Diglett's Cave ONE diglett catch -> {cr} "
+                    f"(dex={ram.pokedex_owned_count(b)}/10)")
+                if cr == "caught":
+                    self._fulfill_catch_order()
+            elif _have_ground:
+                log("   [flash-errand] Diglett/Dugtrio already owned — skipping cave catch, crossing")
+            saved_runner = self.trav.battle_runner
+            # FIGHT wilds (Arena Trap). diglett_keeper in battle_agent catches only if still unowned.
+            self.trav.battle_runner = self.battle_runner
+            try:
+                ok = self._cross_cave(None, ROUTE2)
+            finally:
+                self.trav.battle_runner = saved_runner
             return "flash_progress" if ok else "flash_stuck"
+        if cur[0] != 3:
+            # Wrong interior during Flash (Route 4 Center, Mt. Moon, random house) — get OUTSIDE.
+            log(f"   [flash-errand] inside non-Diglett interior {cur} "
+                f"({self._place_name(cur)}) — exiting to overworld (not Diglett's Cave)")
+            try:
+                self._exit_to_overworld(max_tries=6)
+            except Exception as _xe:
+                log(f"   [flash-errand] exit_to_overworld skipped: {_xe}")
+            return "flash_progress"
         # PHASE 2 — on Route 11: catch fresh species (Drowzee), then cross Diglett's Cave (north mouth ->
         # Route 2). Exhausted-memo: once Route 11 yields no new species, skip the re-catch (else with a full
         # ball pocket catch_one wanders the whole route 90s/pass hunting a non-dupe that isn't there) and go
@@ -8144,7 +10791,12 @@ class Campaign:
             if ram.pokedex_owned_count(b) < 10 and ROUTE11 not in _legdone:
                 if _catch_to_10("Route 11", tries=3) == "exhausted":
                     _legdone.add(ROUTE11)
-            ok = self._cross_cave("north", ROUTE2)
+            saved_runner = self.trav.battle_runner
+            self.trav.battle_runner = self.battle_runner  # Arena Trap — never flee Diglett's Cave
+            try:
+                ok = self._cross_cave("north", ROUTE2)
+            finally:
+                self.trav.battle_runner = saved_runner
             return "flash_progress" if ok else "flash_stuck"
         # PHASE 4 — on Route 2 (aide's strip): top up dex if short, reach the gatehouse, talk, teach.
         if cur == ROUTE2:
@@ -8163,83 +10815,15 @@ class Campaign:
                     ht.TeachFlow(self, log=lambda m: log(m), on_event=self.on_event).teach(
                         "flash", slot, forget_idx)
             if st.party_knows_move(b, FLASH_MOVE, pc()) is not None:
-                # RETURN TO THE CELADON ROAD-HEAD (2026-07-09 shift 2): the aide strip (Route 2) is a
-                # south-west DEAD POCKET — from here forward-drive ping-pongs Viridian<->Route 2 to a STALL
-                # (the billed Celadon road starts at VERMILION, and the only link back is EAST through
-                # Diglett's Cave, a warp-maze the world-graph won't route across). So the instant Flash is
-                # learnt, steer her back ONCE: re-cross the cave east to Route 11 -> Vermilion, where
-                # head_to_gym's billed Celadon road (Route 6 -> Underground Path) picks up cleanly.
-                if not getattr(self, "_flash_returned", False):
+                # RETURN TO THE CELADON ROAD-HEAD — every tick until spine, NOT once-and-forget.
+                # (2026-08-02: old code set `_flash_returned=True` before Diglett-east succeeded.)
+                log("   [flash-errand] Flash learnt — Diglett EAST to Vermilion road-head "
+                    "(questline stays open until she's on the Celadon spine)")
+                self._diglett_east_to_vermilion()
+                if self._on_celadon_spine():
                     self._flash_returned = True
-                    log("   [flash-errand] Flash learnt — returning EAST across Diglett's Cave to the "
-                        "Vermilion road-head (Route 2 is a SW dead-pocket)")
-                    try:
-                        # BUGFIX (2026-07-09 shift 3): the shift-2 return called _cross_cave(None,..)
-                        # which means "already inside — skip the entry warp". But the teach leaves her
-                        # INSIDE the aide GATEHOUSE (a group!=3 interior); _cross_cave then treated the
-                        # gatehouse as the cave, walked her out its door to a Route-2 pocket, and returned
-                        # False (never entering Diglett's Cave) -> _edge_travel skipped -> Route2<->Viridian
-                        # ping-pong STALL. FIX: (1) exit to the Route 2 overworld first, (2) explicitly
-                        # ENTER Diglett's Cave via its Route-2 mouth (17,11)->(1,36), (3) cross east to
-                        # Route 11, (4) edge-travel to Vermilion. The forward cross EXITS the cave at
-                        # (17,12) — right beside (17,11) — and reaches the aide from there, so the aide
-                        # pocket reaches the mouth.
-                        # The Diglett's Cave Route-2 mouth (17,11)->(1,36); its south-approach /
-                        # cave-EXIT tile is (17,12). A CUT tree sits between the aide-door pocket
-                        # and the mouth pocket, and it REGROWS on the gatehouse map-reload — so
-                        # enter_warp's plain-BFS reachability pre-check (tree=wall) would skip the
-                        # mouth. travel()'s obstacle handler CUTS the regrown tree (she owns Cut),
-                        # so route to the cave-exit tile FIRST (crosses into the mouth pocket), THEN
-                        # enter_warp fires trivially from right beside it.
-                        DIGLETT_R2_MOUTH, CAVE_EXIT_TILE = (17, 11), (17, 12)
-                        AIDE_SOUTH_DOOR = (18, 46)
-                        # REACH THE CAVE-MOUTH (NORTH) POCKET (2026-07-09 shift 3, geometry-verified via
-                        # recon_gate_exit): the aide gate (15,2) is a PASS-THROUGH. She enters from the
-                        # SOUTH door (18,46) via a ONE-WAY LEDGE and the teach leaves her inside; its south
-                        # interior door (7,10) drops back onto (18,47) [SOUTH pocket — walled off from the
-                        # cave mouth by that ledge, un-cuttable], its NORTH door (7,1) exits to (18,41)
-                        # [NORTH pocket, which reaches the mouth]. So exit NORTH; if she's already been
-                        # dumped into the south pocket, re-enter the gate and exit north. Only THEN is the
-                        # cave mouth walk-reachable.
-                        def _north_pocket():
-                            try:
-                                g = tv.Grid(b)
-                                return (tuple(tv.map_id(b)) == ROUTE2 and bool(tv.bfs(
-                                    g, tuple(tv.coords(b)), lambda t: t == CAVE_EXIT_TILE,
-                                    walkable=g.walkable)))
-                            except Exception:
-                                return False
-                        for _ in range(4):
-                            if _north_pocket():
-                                break
-                            if tv.map_id(b)[0] != 3:                # inside the gate -> exit north door
-                                self.enter_warp(prefer="north")
-                            else:                                  # on Route 2 (south pocket) -> re-enter
-                                self.enter_warp(pick=AIDE_SOUTH_DOOR)
-                        cur_r = tuple(tv.map_id(b))
-                        log(f"   [flash-errand] return: on {cur_r}@{tuple(tv.coords(b))} "
-                            f"(north_pocket={_north_pocket()}); routing to the Diglett's Cave mouth "
-                            f"{DIGLETT_R2_MOUTH} (cutting the regrown tree)")
-                        if cur_r == ROUTE2 and _north_pocket():
-                            # travel to the cave-exit tile first — travel's obstacle handler CUTS the
-                            # regrown tree (18,26) between the north-door landing and the mouth; enter_warp's
-                            # plain-BFS pre-check treats a regrown tree as a wall and would skip the mouth.
-                            self.trav.travel(target_map=None, arrive_coord=CAVE_EXIT_TILE,
-                                             max_steps=400)
-                            r = self.enter_warp(pick=DIGLETT_R2_MOUTH)
-                            log(f"   [flash-errand] return: cave-mouth enter -> {r} "
-                                f"(now on {tuple(tv.map_id(b))})")
-                            if r == "warped" and self._cross_cave(None, ROUTE11):
-                                self._edge_travel(VERMILION, "west")
-                            else:
-                                log("   [flash-errand] return: cave re-entry failed — releasing to "
-                                    "roam (head_to_gym owns the road retry) (LOUD)")
-                        else:
-                            log(f"   [flash-errand] return: couldn't reach the cave-mouth pocket "
-                                f"(on {cur_r}) — releasing to roam (LOUD)")
-                    except Exception as _re:
-                        log(f"   [flash-errand] road-head return skipped ({_re}) (LOUD)")
-                return "flash_done"
+                    return "flash_done"
+                return "flash_progress"
             return "flash_progress"
         # PHASE 1 — walk the billed back-legs home + east to Route 11.
         if cur in self._FLASH_BACK_LEGS:
@@ -8360,16 +10944,36 @@ class Campaign:
 
     def _cross_warp_maze(self, m0, budget_s=900):
         """Cross a PARTITIONED dark warp-maze (Rock Tunnel class: both mouths dest the SAME overworld
-        map, floors split into sections only linked by interior ladders). Ported verbatim from the
-        proven recon_rocktunnel strike (2026-07-07). Stronger than _cross_cave (the Diglett crosser):
-        reachability is a SECTION-relative grid BFS (a global 'unreachable' mark killed run-3 — the
-        south door, dead from the entry section, was never retried from the section that reaches it);
-        `rode` guards cycles; a dead-end section backtracks by re-riding the arrival warp; walking to a
-        warp AVOIDS the other warp tiles (the walk-through-fires trap). True once out on the overworld
-        (dest != m0 preferred — pass m0=(3,255) so BOTH real Route-10 mouths count as exits)."""
+        map, floors split into sections only linked by interior ladders). Ported from the proven
+        recon_rocktunnel strike (2026-07-07), plus the ENTRY-MOUTH BAN (2026-08-02 live chalk):
+        after Flash she stood next to the overworld exit she just walked in — nearest-exit picked
+        it and she climbed straight back out. Ban every overworld exit reachable at maze START
+        (the far mouth is partitioned off, so this only bans the entry); prefer FARTHEST exit
+        when multiple open; prefer interior ladders until an interior ride has happened."""
         b = self.b
         t0 = time.time()
         rode = set()
+        # Ban entry-side overworld mouth(s) so Flash → walk-out can't fire on tick 1.
+        entry_mid = tuple(tv.map_id(b))
+        entry_pos = tuple(tv.coords(b))
+        try:
+            _w0 = [(tuple(wxy), tuple(d)) for (wxy, d, _i) in tv.read_warps(b)]
+            _g0 = tv.Grid(b)
+            for (w, d) in _w0:
+                if d[0] != 3:
+                    continue
+                near = (w == entry_pos
+                        or abs(w[0] - entry_pos[0]) + abs(w[1] - entry_pos[1]) <= 2)
+                reach0 = near or bool(tv.bfs(
+                    _g0, entry_pos, lambda t, ww=w: t == ww, walkable=_g0.walkable))
+                if reach0:
+                    rode.add((entry_mid, w))
+                    log(f"   [tunnel] ENTRY mouth BANNED for re-exit: {w} -> {d} "
+                        f"(spawn={entry_pos} on {entry_mid})")
+        except Exception as _ee:
+            log(f"   [tunnel] entry-mouth ban skipped: {_ee}")
+        interior_rides = 0
+        entry_bounce_retries = 0
         while tuple(tv.map_id(b))[0] != 3:
             if time.time() - t0 > budget_s:
                 log(f"   [tunnel] maze crossing TIMEOUT at {tv.map_id(b)}"); return False
@@ -8393,23 +10997,49 @@ class Campaign:
             if not exits:
                 exits = [w for (w, d) in warps if d[0] == 3 and w in reach
                          and (mid, w) not in rode and w != pos]
+            # Until she's ridden an interior ladder, refuse overworld exits entirely — forces
+            # depth into the maze instead of bouncing out the entry after Flash.
+            if interior_rides < 1 and exits:
+                log(f"   [tunnel] room {mid}: deferring {len(exits)} overworld EXIT(s) until an "
+                    f"interior ladder ride (anti bounce-out)")
+                exits = []
             backtrack = False
             if exits:
-                far = min(exits, key=dist)
-                log(f"   [tunnel] room {mid}: at {pos}, EXIT door {far} reachable (of {warps})")
+                # FARTHEST overworld door = Lavender-side mouth (nearest was the entry bounce).
+                far = max(exits, key=dist)
+                log(f"   [tunnel] room {mid}: at {pos}, EXIT door {far} (farthest of {exits})")
             else:
-                fresh = [w for w in reach if (mid, w) not in rode]
+                # Prefer interior warps (dest group != 3) over any leftover overworld.
+                interior = [w for (w, d) in warps if d[0] != 3 and w in reach
+                            and (mid, w) not in rode]
+                fresh = interior or [w for w in reach if (mid, w) not in rode]
                 if fresh:
                     far = max(fresh, key=dist)
                     log(f"   [tunnel] room {mid}: at {pos}, riding fresh warp {far} (reach={reach})")
                 elif any(w == pos for (w, d) in warps):
+                    # NEVER backtrack out an overworld mouth before an interior ladder ride —
+                    # live chalk: ladder (45,2) failed → BACKTRACK (17,2) → Route 10 bounce.
+                    at_ow = any(w == pos and d[0] == 3 for (w, d) in warps)
+                    if at_ow and interior_rides < 1:
+                        entry_bounce_retries += 1
+                        log(f"   [tunnel] room {mid}: refusing OVERWORLD backtrack at {pos} "
+                            f"(no interior ride yet) — retrying ladders "
+                            f"({entry_bounce_retries}/4), not bouncing out")
+                        if entry_bounce_retries >= 4:
+                            log("   [tunnel] ladder retries exhausted — failing maze (LOUD)")
+                            return False
+                        # Un-mark failed interior rides so the next loop retries the ladder.
+                        rode = {(m, w) for (m, w) in rode if m != mid
+                                or any(ww == w and dd[0] == 3 for (ww, dd) in warps)}
+                        continue
                     far = pos; backtrack = True
                     log(f"   [tunnel] room {mid}: section exhausted — BACKTRACK via arrival warp {pos}")
                 else:
                     log(f"   [tunnel] room {mid}: exhausted, no arrival warp to backtrack on"); return False
-            if not backtrack:
-                rode.add((mid, far))
+            # Do NOT mark rode until the warp actually fires (failed ladder was getting
+            # permanently banned → only the entry mouth left → bounce-out).
             before = mid
+            before_dest = next((d for (w, d) in warps if w == far), None)
             if backtrack:
                 for d_ in ("UP", "DOWN", "LEFT", "RIGHT"):     # step off then back on to re-fire the ladder
                     b.press(d_, 10, 6, lambda: None, owner="agent")
@@ -8421,10 +11051,41 @@ class Campaign:
                 if tuple(tv.map_id(b)) == before:
                     self.enter_warp(pick=pos)
             else:
-                self.trav.travel(target_map=None, arrive_coord=far, max_steps=600, max_seconds=240,
-                                 avoid=[w for w in others if w != far])
-                if tuple(tv.map_id(b)) == before:
+                # Ladder / interior warps: approach from EVERY cardinal neighbor, then step on.
+                # Plain travel+(45,2) was "reachable" but never fired (2026-08-02 Rock Tunnel chalk).
+                approaches = [(far[0], far[1] + 1), (far[0], far[1] - 1),
+                              (far[0] + 1, far[1]), (far[0] - 1, far[1])]
+                for ap in approaches:
+                    if tuple(tv.map_id(b)) != before:
+                        break
+                    try:
+                        if not g.walkable(*ap) and ap != far:
+                            continue
+                    except Exception:
+                        pass
+                    self.trav.travel(target_map=None, arrive_coord=ap, max_steps=400, max_seconds=120,
+                                     avoid=[w for w in others if w != far])
+                    if tuple(tv.map_id(b)) != before:
+                        break
                     self.enter_warp(pick=far)
+                    if tuple(tv.map_id(b)) != before:
+                        break
+                    # Hard step from this approach tile onto the warp.
+                    cc = tuple(tv.coords(b))
+                    if abs(cc[0] - far[0]) + abs(cc[1] - far[1]) == 1:
+                        step = (("RIGHT" if far[0] > cc[0] else "LEFT") if far[0] != cc[0]
+                                else ("DOWN" if far[1] > cc[1] else "UP"))
+                        for _try in range(4):
+                            b.press(step, 10, 6, lambda: None, owner="agent")
+                            for _f in range(40):
+                                b.run_frame()
+                            if tuple(tv.map_id(b)) != before:
+                                break
+                if tuple(tv.map_id(b)) == before:
+                    self.trav.travel(target_map=None, arrive_coord=far, max_steps=200, max_seconds=90,
+                                     avoid=[w for w in others if w != far])
+                    if tuple(tv.map_id(b)) == before:
+                        self.enter_warp(pick=far)
             # EDGE cave-mouth warps (Rock Tunnel south mouth class: (18,37)->(3,28) Lavender-side)
             # sit on the map's BORDER — the warp tile is not a standable target, so travel stops ONE
             # TILE SHORT (lands at (18,36)) and the on-far fire block below never runs -> "didn't fire"
@@ -8451,8 +11112,16 @@ class Campaign:
                         break
                     if tuple(tv.coords(b)) != far:
                         self.trav.travel(target_map=None, arrive_coord=far, max_steps=20)
-            if tuple(tv.map_id(b)) == before and not backtrack:
-                log(f"   [tunnel] room {before}: warp {far} didn't fire despite reachability — next")
+            after = tuple(tv.map_id(b))
+            if after != before:
+                if not backtrack:
+                    rode.add((before, far))
+                # Count interior ladder/floor changes (same dungeon group, new map) — unlocks exits.
+                if before_dest is not None and before_dest[0] != 3:
+                    interior_rides += 1
+                    log(f"   [tunnel] interior ride #{interior_rides}: {before} -> {after}")
+            elif not backtrack:
+                log(f"   [tunnel] room {before}: warp {far} didn't fire — will retry (NOT permanently banned)")
         return True
 
     def _cross_tunnel_leg(self, cave_map, out_map, out_dir):
@@ -8502,16 +11171,32 @@ class Campaign:
         def _lit():
             return bool(fm.read_flag(b, fm.FLAG_SYS_FLASH_ACTIVE))
 
+        # HONEST PLACE NAME (2026-08-02 Mt.Moon chalk): this helper also lights Diglett's Cave /
+        # any dark warp-maze — hardcoding "Rock Tunnel" made her narrate Mt. Moon as Rock Tunnel live.
+        _cave_here = self._place_name(tuple(tv.map_id(b)), default="this cave")
         if not _lit():
-            self.on_event("Rock Tunnel — pitch dark. good thing I carry Flash now.", kind="route", tier=2)
+            self.on_event(f"{_cave_here} — pitch dark. good thing I carry Flash now.",
+                          kind="route", tier=2)
             slot = st.party_knows_move(b, FLASH_MOVE, b.rd8(ram.GPLAYER_PARTY_CNT))
             r = ht.TeachFlow(self, log=lambda m: log(m), on_event=self.on_event).use_field_move(
                 slot, verify=_lit, label="flash")
-            log(f"   [tunnel] use flash -> {r} (lit={_lit()})")
+            log(f"   [tunnel] use flash -> {r} (lit={_lit()}) place={_cave_here}")
         if not _lit():
             log("   [tunnel] FLASH did not light the cave — refusing to walk dark; deferring")
             return None
-        self.on_event("and there's light. okay, Rock Tunnel — let's do this properly.", kind="route", tier=2)
+        self.on_event(f"and there's light. okay, {_cave_here} — let's do this properly.",
+                      kind="route", tier=2)
+        # Bank INSIDE the lit cave so a resume can TP here — not 20 min away on Route 10
+        # (2026-08-02 Jonny: she wasn't saving enough in the tunnel).
+        try:
+            self._save_campaign("rock-tunnel-lit")
+            self._continuity_save()
+            self._auto_checkpoint("rock-tunnel-lit")
+            self._last_ckpt_t = time.time()
+        except Exception as _cke:
+            log(f"   [tunnel] in-cave checkpoint skipped: {_cke}")
+        entry_overworld = cur0
+        entry_mouth = mouth
         saved_runner, saved_heal = self.trav.battle_runner, self._suppress_heal
         self.trav.battle_runner = self._cave_runner       # FLEE wilds / FIGHT trainers
         self._suppress_heal = True                         # no PC in a cave -> survive-or-blackout
@@ -8522,14 +11207,34 @@ class Campaign:
         if not ok:
             log(f"   [tunnel] maze crossing failed at {tv.map_id(b)}")
             return None
-        log(f"   [tunnel] OUT of the tunnel at {tv.map_id(b)} coords={tv.coords(b)}")
+        emerged = tuple(tv.map_id(b))
+        epos = tuple(tv.coords(b))
+        log(f"   [tunnel] OUT of the tunnel at {emerged} coords={epos}")
+        # BOUNCE-OUT DETECT (2026-08-02): maze returned True because she re-exited the ENTRY mouth
+        # onto the same Route 10 pocket she started from (near the north door). That is NOT a cross —
+        # refuse and surface so the next tick re-enters instead of "arriving" on the wrong side.
+        if emerged == entry_overworld:
+            try:
+                near_entry = abs(epos[0] - entry_mouth[0]) + abs(epos[1] - entry_mouth[1]) <= 6
+            except Exception:
+                near_entry = True
+            if near_entry:
+                log(f"   [tunnel] !! BOUNCE-OUT at {emerged}@{epos} near entry mouth "
+                    f"{entry_mouth} — NOT a far-side emerge; failing the leg (LOUD)")
+                self.on_event("wait — that's the door I came in. turning around. through the tunnel.",
+                              kind="route", tier=2)
+                return None
         # emerged on the far side of the re-emergence overworld map (Rock Tunnel -> Route 10 south);
         # the billed leg's edge (south) carries her into out_map (Lavender).
-        if out_dir and out_map and tuple(tv.map_id(b)) != tuple(out_map):
+        if out_dir and out_map and emerged != tuple(out_map):
             self._edge_travel(tuple(out_map), out_dir)
         if out_map and tuple(tv.map_id(b)) == tuple(out_map):
-            self.on_event("Lavender Town — the little town with the tower. we made it through the dark.",
-                          kind="route", tier=2)
+            _out_name = self._place_name(tuple(out_map), default="the far side")
+            if tuple(out_map) == LAVENDER:
+                self.on_event("Lavender Town — the little town with the tower. we made it through the dark.",
+                              kind="route", tier=2)
+            else:
+                self.on_event(f"{_out_name} — out of the dark. good.", kind="route", tier=2)
             return "arrived"
         return "road_passthrough"
 
@@ -8642,13 +11347,20 @@ class Campaign:
         # (the catch-in-place driver species-exhausts on Route 10; the errand walks east to fresh grass
         # + the aide together). Owns BOTH the dex-prereq step and the flash step.
         if self._active_questline.gate.missing == "flash":
+            # Already have Flash (or standing on Celadon spine with it) — kill Diglett rewind NOW.
+            if self._party_knows_flash():
+                log("   [roam] 🔦 FLASH ERRAND skipped — Flash already taught; clearing questline "
+                    "(refuse Diglett west from Route 10)")
+                self._flash_returned = True
+                self._clear_questline("flash already taught")
+                return "questline_done"
             if not getattr(self, "_ql_catch_voiced", False):
                 self.on_event(step.human, kind="route", tier=2)
                 self._ql_catch_voiced = True
             r = self._flash_errand()
             log(f"   [roam] 🔦 FLASH ERRAND ({step.missing}) -> {r}")
             if r == "flash_done":
-                self.on_event("Flash — lit. now Rock Tunnel won't be pitch black. onward.",
+                self.on_event("Flash — lit. dark caves won't be pitch black now. onward.",
                               kind="route", tier=2)
                 self._clear_questline("flash taught")
                 return "questline_done"
@@ -8879,6 +11591,24 @@ class Campaign:
                 and not getattr(self, "_ql_past_anchor", False)):
             _pc2 = state.get("party_count")
             _pl2 = state["party"][0]["level"] if state.get("party") else None
+            # LIVE-EDGE SHORTCUT (2026-08-03 LIVE, the full-tunnel ping-pong): the anchor can be
+            # the LITERAL NEXT MAP OVER — Route 7's west connection IS Celadon — but this timeline
+            # never walked that border, so the learned-graph router below read 'no route', fell to
+            # dir/bend discovery, re-entered the UGP hut (the only door on Route 7), and the hut
+            # walk carried her all the way back east: a full tunnel crossing UNDONE every cycle.
+            # Map connections are ground truth from the live header (_map_connections), no learning
+            # required — when the anchor is directly attached, just walk the edge.
+            try:
+                _lw = {"N": "north", "S": "south", "E": "east", "W": "west"}
+                _lc = next((_lw[dd] for dd, m in self._map_connections()
+                            if tuple(m) == tuple(step_anchor)), None)
+            except Exception:
+                _lc = None
+            if _lc and not self.strat.is_gated(tuple(step_anchor), _pc2, _pl2):
+                log(f"   [roam] 🧭 QUESTLINE ANCHOR-FIRST: {self.world.name(step_anchor)} is the "
+                    f"live {_lc} connection of {self.world.name(cur_map)} — walking the edge "
+                    f"(ground truth beats the learned graph)")
+                return self._edge_travel(step_anchor, _lc)
             # WARP-AWARE routing (flute_run3: next_hop is EDGE-only, so Lavender->Celadon — a road
             # that crosses the Underground Path — read 'no route' and she fell into dir noise).
             # next_step routes THROUGH learned warps, executed exactly like head_to_gym's warp-route.
@@ -9258,6 +11988,70 @@ class Campaign:
             _mp_key = tuple(tv.map_id(self.b))
             talks = self._ql_talks_map.get(_mp_key, 0)
             chatted_out = talks >= talk_budget
+            # PURE-TRANSIT INTERIOR (2026-08-03, the UGP-hut girl loop): the Underground Path huts/
+            # tunnels exist only to CONNECT two routes — their occupants are decorative (the Route-8
+            # east-hut girl: 'Do you go there very often?' — no flag, no item, no script). Post-Koga
+            # the Tea/Fly errands route Lavender→Route 8→UGP→Celadon and the TALK-FIRST doctrine
+            # chatted the girl on repeat while the GO-DEEPER tour, built for target-deeper-INSIDE
+            # buildings (the ship captain), structurally CANNOT finish a through-crossing: it
+            # excludes overworld-bound warps (dest[0]!=3) AND 'exit lobby' rooms — which is exactly
+            # what the far hut is. KB-listed transit rooms skip BOTH layers and run the passthrough's
+            # proven hop-walk instead: keep taking the farthest non-arrival warp until we pop out on
+            # the overworld on the FAR side (hut → tunnel → hut → route, 3 hops).
+            try:
+                _transit = ",".join(str(x) for x in _mp_key) in set(
+                    (self._gate_recognizer.kb.get("transit_rooms") or {}).get("maps", []))
+            except Exception:
+                _transit = False
+            if _transit:
+                log("   [roam] 🚇 questline: pure-transit interior (KB transit_rooms) — no chatting; "
+                    "walking the crossing to the far side")
+                def _tsettle(frames):
+                    for _ in range(frames):
+                        self.b.run_frame()
+                        self.render()
+                    return tuple(tv.map_id(self.b))
+                for _hop in range(6):
+                    m_in = tuple(tv.map_id(self.b))
+                    if m_in[0] == 3:
+                        break                             # popped out on the overworld — crossed
+                    self._learn_transit()                 # fold the hut/tunnel into the mental map
+                    spawn = tuple(tv.coords(self.b) or (0, 0))
+                    moved = False
+                    for wt in sorted((tuple(w[0]) for w in tv.read_warps(self.b)),
+                                     key=lambda t: -(abs(t[0] - spawn[0]) + abs(t[1] - spawn[1]))):
+                        if abs(wt[0] - spawn[0]) + abs(wt[1] - spawn[1]) <= 1:
+                            continue                      # the warp we arrived by — skip
+                        self.trav.travel(target_map=None, arrive_coord=wt,
+                                         max_steps=260, max_seconds=110)
+                        if _tsettle(30) != m_in:
+                            moved = True
+                            break                         # walking onto the mat warped us
+                        if tuple(tv.coords(self.b) or ()) == wt:
+                            for key in ("UP", "DOWN", "LEFT", "RIGHT"):
+                                self.b.press(key, 8, 8, self.render, owner="agent")
+                                if _tsettle(36) != m_in:
+                                    break
+                            if tuple(tv.map_id(self.b)) != m_in:
+                                moved = True
+                                break
+                        if self._enter_directional_warp(tuple(wt)) \
+                                and tuple(tv.map_id(self.b)) != m_in:
+                            moved = True
+                            break
+                        if self.enter_warp(pick=tuple(wt), budget_s=90) == "warped" \
+                                and tuple(tv.map_id(self.b)) != m_in:
+                            moved = True
+                            break
+                    if not moved:
+                        log("   [roam] questline: transit walk found no onward warp — backing out "
+                            "to the overworld LOUD")
+                        self._exit_to_overworld()
+                        break
+                if tuple(tv.map_id(self.b))[0] == 3:
+                    log(f"   [roam] 🚇 QUESTLINE TRANSIT: surfaced at {tuple(tv.map_id(self.b))}"
+                        f"@{tuple(tv.coords(self.b) or ())} — the errand continues from here")
+                return "questline_deeper"
             if chatted_out:
                 log(f"   [roam] questline: room chatted out ({talks}/{talk_budget} talks) — moving the tour on")
             # She's inside a building she ENTERED for the quest (the blackout-recovery leaves her be while
@@ -9754,6 +12548,11 @@ class Campaign:
         except Exception:
             return None
 
+    # FERRY-ONLY success sigs (2026-08-05): objectives with NO overworld road — the strike IS
+    # the only vehicle (Bill's ferry to the Sevii archipelago). Exhausting the strike on these
+    # must surface a bounded lap failure, never fall through to compass navigation.
+    _QL_FERRY_ONLY = {("flag", "FLAG_FOUGHT_MOLTRES")}
+
     def _questline_strike(self, step):
         """BESPOKE INTERIOR STRIKE dispatcher (night shift 7). Some questline targets sit behind a
         fixed dungeon RITUAL the general room-tour/GO-DEEPER can't crack — registered by the step's
@@ -9798,6 +12597,34 @@ class Campaign:
             def _giovanni():
                 from giovanni_gym import GIOVANNI_ANCHORS, run_gym
                 return run_gym, GIOVANNI_ANCHORS, ("badge",), "giovanni_probe"
+
+            def _eevee():
+                from eevee_fetch import EEVEE_ANCHORS, run_strike
+                return run_strike, EEVEE_ANCHORS, ("got_eevee",), "eevee_probe"
+
+            def _expshare():
+                from expshare_fetch import EXPSHARE_ANCHORS, run_strike
+                return run_strike, EXPSHARE_ANCHORS, ("got_expshare",), "expshare_probe"
+
+            def _icebeam():
+                from game_corner import ICEBEAM_ANCHORS, run_strike
+                return run_strike, ICEBEAM_ANCHORS, ("taught", "have_ice_beam"), "icebeam_probe"
+
+            def _zapdos():
+                from legendary_strikes import ZAPDOS_ANCHORS, run_zapdos
+                return run_zapdos, ZAPDOS_ANCHORS, ("caught", "battled"), "zapdos_probe"
+
+            def _articuno():
+                from legendary_strikes import ARTICUNO_ANCHORS, run_articuno
+                return run_articuno, ARTICUNO_ANCHORS, ("caught", "battled"), "articuno_probe"
+
+            def _moltres():
+                from legendary_strikes import MOLTRES_ANCHORS, run_moltres
+                return run_moltres, MOLTRES_ANCHORS, ("caught", "battled"), "moltres_probe"
+
+            def _mewtwo():
+                from legendary_strikes import MEWTWO_ANCHORS, run_mewtwo
+                return run_mewtwo, MEWTWO_ANCHORS, ("caught", "battled"), "mewtwo_probe"
 
             registry = {
                 ("item", 359): ("Rocket Hideout (Silph Scope)",
@@ -9847,6 +12674,53 @@ class Campaign:
                     "the Viridian Gym (Giovanni — Earth Badge, badge 8)",
                     "Giovanni's down and the Earth Badge is mine — that's all eight. Victory Road and the "
                     "Elite Four are all that's left now.", _giovanni),
+                # 2026-08-03 (OP-team pass): the Celadon gift-Eevee step derives success
+                # ('flag','FLAG_GOT_EEVEE') (0x263, set by the givemon script in every branch).
+                # Door-less flag step keyed to Celadon (from '3,6') -> fires via FIRE-FIRST while
+                # she's in town; the strike climbs the Condominiums back stairwell to the roof-room
+                # ball. Flag-gated (EEVEE_FETCH_ENABLED).
+                ("flag", "FLAG_GOT_EEVEE"): (
+                    "the Celadon Condominiums roof room (the gift Eevee)",
+                    "an EEVEE! straight off the roof of the Condominiums — one of a kind, and a "
+                    "Thunder Stone turns it into Jolteon. the team just got cuter AND scarier.", _eevee),
+                # 2026-08-03 (OP-team pass): the Route-15 Exp. Share claim derives success
+                # ('flag','FLAG_GOT_EXP_SHARE_FROM_OAKS_AIDE') (0x256, set only on a real
+                # hand-over). Door-less flag step keyed to Route 15 (from '3,33') -> fires via
+                # FIRE-FIRST on the road; the strike climbs the west gate's two floors to the
+                # aide. Flag-gated (EXPSHARE_FETCH_ENABLED); the 50-caught bar lives in the gate.
+                ("flag", "FLAG_GOT_EXP_SHARE_FROM_OAKS_AIDE"): (
+                    "the Route 15 west gate 2F (Oak's aide — the Exp. Share)",
+                    "the EXP. SHARE is mine — fifty caught and the aide pays out. the whole bench "
+                    "levels off every fight from here to the League.", _expshare),
+                # 2026-08-04 (Jonny's order): the Game-Corner TM13 buy+teach. Success is the
+                # CAPABILITY — a party mon knows move 58 (questline EXTRA_CAP_MOVE_IDS) — since
+                # the TM is consumed on teach and there's no flag. The strike is idempotent:
+                # TM already in case -> teach only; already known -> 'have_ice_beam'.
+                ("cap", "ice_beam"): (
+                    "the Celadon Game Corner (TM13 Ice Beam for the ace)",
+                    "ICE BEAM is on the team — straight off the Game Corner prize counter. grass, "
+                    "dragons, birds: everything left on this run freezes now.", _icebeam),
+                # 2026-08-04 LEGENDARY HUNTS (Jonny's order): door-less flag steps — the FOUGHT
+                # flag is set on caught OR KO'd (a flee leaves it clear -> the hunt re-arms
+                # after a ball restock). FIRE-FIRST dispatches on the hunt's anchor maps.
+                ("flag", "FLAG_FOUGHT_ZAPDOS"): (
+                    "the Power Plant (ZAPDOS — the legendary electric bird)",
+                    "ZAPDOS. an actual legendary, on MY team. Lorelei's waters and Lance's "
+                    "Gyarados just became target practice.", _zapdos),
+                ("flag", "FLAG_FOUGHT_ARTICUNO"): (
+                    "Seafoam Islands B4F (ARTICUNO — the legendary ice bird)",
+                    "ARTICUNO is ours — the frozen heart of the Seafoam Islands. Lance's "
+                    "dragons are officially a formality.", _articuno),
+                ("flag", "FLAG_FOUGHT_MOLTRES"): (
+                    "Mt. Ember summit, One Island (MOLTRES — the legendary fire bird)",
+                    "MOLTRES, caught on top of a VOLCANO on an island I sailed to with "
+                    "BILL. the bird trio is complete — and the trip home was a whole "
+                    "adventure of its own.", _moltres),
+                ("flag", "FLAG_FOUGHT_MEWTWO"): (
+                    "Cerulean Cave (MEWTWO — the final endgame project)",
+                    "MEWTWO. the strongest Pokémon in existence, caught at the bottom of "
+                    "Cerulean Cave. the victory lap is complete — there is nothing left to "
+                    "prove.", _mewtwo),
             }
             if succ not in registry:
                 return None
@@ -9858,6 +12732,16 @@ class Campaign:
                 return None                     # mansion strike flag-gated OFF -> fall through
             if succ == ("flag", "FLAG_BADGE08_GET") and not GIOVANNI_GYM_ENABLED:
                 return None                     # giovanni gym strike flag-gated OFF -> fall through
+            if succ == ("flag", "FLAG_GOT_EEVEE") and not EEVEE_FETCH_ENABLED:
+                return None                     # eevee fetch flag-gated OFF -> fall through
+            if succ == ("flag", "FLAG_GOT_EXP_SHARE_FROM_OAKS_AIDE") and not EXPSHARE_FETCH_ENABLED:
+                return None                     # exp-share fetch flag-gated OFF -> fall through
+            if succ == ("cap", "ice_beam") and not ICEBEAM_FETCH_ENABLED:
+                return None                     # ice-beam fetch flag-gated OFF -> fall through
+            if succ in (("flag", "FLAG_FOUGHT_ZAPDOS"), ("flag", "FLAG_FOUGHT_ARTICUNO"),
+                        ("flag", "FLAG_FOUGHT_MOLTRES"),
+                        ("flag", "FLAG_FOUGHT_MEWTWO")) and not LEGENDARY_HUNTS_ENABLED:
+                return None                     # legendary hunts flag-gated OFF -> fall through
             label, done_msg, importer = registry[succ]
             run_fn, anchors, good, dbg_sub = importer()
             if here not in anchors:
@@ -9866,7 +12750,42 @@ class Campaign:
             if tries_map is None:
                 tries_map = self._ql_strike_tries_map = {}
             tries = tries_map.get(succ, 0)
+            # WAR-CHEST TRUCE (2026-08-06 LIVE, pier chat-lock): mid Ultra restock on a Sevii
+            # harbor, a flaked Seagallop pick must NOT exhaust the 3-try budget into free-roam
+            # narration. Reset and keep driving the ferry until the Mart fills the pocket.
+            if tries >= 3 and succ in self._QL_FERRY_ONLY:
+                _thin = False
+                try:
+                    _thin = (int(self._balls_pocket_count(2) or 0) < HUNT_ULTRA_MIN_ENGAGE)
+                except Exception:
+                    _thin = False
+                _restock = bool(getattr(self, "_ball_restock_mode", False))
+                try:
+                    from legendary_strikes import (ONE_HARBOR, TWO_HARBOR, THREE_HARBOR,
+                                                   ONE_ISLAND, TWO_ISLAND, THREE_ISLAND,
+                                                   THREE_PORT, THREE_MART)
+                    _ferry_maps = {ONE_HARBOR, TWO_HARBOR, THREE_HARBOR, ONE_ISLAND,
+                                   TWO_ISLAND, THREE_ISLAND, THREE_PORT, THREE_MART}
+                except Exception:
+                    _ferry_maps = {(32, 4), (33, 4), (38, 0), (3, 12), (3, 13), (3, 14)}
+                if _restock or (_thin and here in _ferry_maps):
+                    log(f"   [roam] !! questline STRIKE tries exhausted BUT Ultra war-chest/"
+                        f"Sevii ferry mid-flight at {here} — RESETTING tries so she sails "
+                        f"to the Mart (LOUD)")
+                    tries_map[succ] = 0
+                    tries = 0
             if tries >= 3:
+                # FERRY-ONLY errands (2026-08-05, the Cinnabar->Route-21 surf circles): Moltres
+                # sits across BILL'S FERRY — there is NO overworld road to One Island, so the
+                # general layer's compass fallback ("heading NORTH toward One Island") can only
+                # surf circles on Route 21 forever, and it never counts a lap failure (it reads
+                # 'arrived'/'hop_ok', hiding the wedge from VICTORY_LAP_MAX_FAILS). Exhaustion
+                # here must be an HONEST bounded failure, not a fall-through.
+                if succ in self._QL_FERRY_ONLY:
+                    log(f"   [roam] questline STRIKE: 3 attempts exhausted for {label} — FERRY-ONLY "
+                        f"errand (no overworld road exists; a compass march would surf circles) -> "
+                        f"surfacing questline_strike_failed so the lap's bounded-fail law counts it")
+                    return "questline_strike_failed"
                 log(f"   [roam] questline STRIKE: 3 attempts exhausted for {label} — surfacing so "
                     f"recovery/other options carry her (not looping the strike)")
                 return None
@@ -9875,6 +12794,22 @@ class Campaign:
             dbg = os.path.join(os.environ.get("TEMP", _HERE), "longrun", dbg_sub)
             res = run_fn(self, log, dbg_dir=dbg)
             log(f"   [roam] 🎯 QUESTLINE STRIKE -> {res} (now {tv.map_id(self.b)}@{tv.coords(self.b)})")
+            # MAP-PROGRESS REFUND (2026-08-05): a multi-leg strike (sail to One Island, climb
+            # Mt. Ember) can end 'failed' while having made REAL map progress — it resumes from
+            # the new anchor next dispatch, so that attempt was not wasted. Refund the try
+            # (bounded: max 6 refunds per errand, so a ping-ponging strike still exhausts).
+            if res not in good and res != "not_here" and not str(res).startswith("in_"):
+                here_after = tuple(tv.map_id(self.b))
+                if here_after != here:
+                    refunds = getattr(self, "_ql_strike_refunds", None)
+                    if refunds is None:
+                        refunds = self._ql_strike_refunds = {}
+                    if refunds.get(succ, 0) < 6:
+                        refunds[succ] = refunds.get(succ, 0) + 1
+                        tries_map[succ] = max(0, tries_map[succ] - 1)
+                        log(f"   [roam] questline STRIKE made MAP PROGRESS ({here} -> {here_after}) "
+                            f"despite '{res}' — try refunded (refund {refunds[succ]}/6; "
+                            f"tries now {tries_map[succ]}/3)")
             if res in good:
                 # objective in bag. The deriver re-reads the flag/item next tick and the step self-
                 # clears -> questline advances. Clear the inside marker + reset this errand's tries.
@@ -10015,6 +12950,1035 @@ class Campaign:
                              "Team Rocket fell. It's a long surf north from Cinnabar past Pallet to get there.",
                        detail={"flag": "FLAG_BADGE08_GET", "gym": "Giovanni"})
 
+    def _silph_scope_gate(self):
+        """PRE-KOGA ROAD BLOCKER (2026-08-02): Fuchsia's billed road runs Celadon→R7→R8→Lavender→R12,
+        but Lavender→R12 is Snorlax-locked until the Poké Flute, and the Flute needs Silph Scope from
+        Celadon's Rocket Hideout. Without a proactive Scope gate, head_to_gym marches east into
+        Lavender while GO-HARD parks the Lavender-south Snorlax questline (gate.missing is the outer
+        FLAG_WOKE_UP_…, not flash/cut) — she paces the Lavender↔Route 8 blank line forever.
+        missing='silph_scope' resolves through frlg_gates.json to confirm_item 359 + hideout_strike.
+        Returns a Gate or None (already own Scope or Flute)."""
+        if self._key_item_owned(359) or self._key_item_owned(350):
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="silph_scope", where=tuple(CELADON),
+                       human="the Silph Scope — Team Rocket's boss keeps it in the hideout under "
+                             "Celadon's Game Corner. Without it Lavender's Tower (and the Flute that "
+                             "wakes the Route 12 Snorlax) stays locked.",
+                       detail={"confirm_item": 359, "gym": "Koga"})
+
+    def _tea_gate(self, state):
+        """POST-KOGA TEA (2026-08-03, the Route-8 UGP-hut girl loop): the moment Koga falls, the
+        war road runs to Sabrina in SAFFRON — and every Saffron gatehouse guard is parched until
+        she hands over the TEA (FLAG_GOT_TEA 0x2A6, pret-verified) from the Celadon Condominiums
+        old lady. The reactive recognizer only arms this when she physically bonks the Route-8
+        gate; by then the fly/eevee luxury gates (also badge-5) may already own the errand slot
+        and the road they route is the SAME blocked crossing. Opening Tea proactively — and FIRST —
+        makes the story unlock own the slot: tea → then fly → then Eevee, all of it Celadon.
+        Returns a Gate while badges>=5 and FLAG_GOT_TEA is unset, else None."""
+        try:
+            if (state.get("badge_count") or 0) < 5:
+                return None
+            if fm.read_flag(self.b, 0x2A6):          # FLAG_GOT_TEA — guard already waved through
+                return None
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="FLAG_GOT_TEA", where=tuple(CELADON),
+                       human="the TEA — Saffron's gate guards are dying of thirst and won't let "
+                             "anyone through. An old lady on the Celadon Condominiums ground floor "
+                             "gives it away; with it, every road into Saffron opens — and Sabrina "
+                             "is badge six.",
+                       detail={"flag": "FLAG_GOT_TEA"})
+
+    def _fly_gate(self, state):
+        """POST-KOGA FLY FETCH (2026-08-03, chat's call: 'she needs to get Fly after beating
+        Koga'). Fly never BLOCKS a road, so no gate ever demanded it and she'd have walked the
+        whole endgame — but the back half (Saffron, Cinnabar loops, heal-and-return trips) is
+        transformed by fast travel, and Fly makes the retreat-to-heal doctrine nearly free.
+        Everything else is already wired: frlg_gates.json bills the Route 16 hidden house
+        (Cut prereq), 'fly' is in OVERWORLD_SAFE_QUESTLINES, gives_cap flows to the world
+        model, and travel prefers fly-to between visited towns the moment she owns it.
+        Returns a Gate once badges>=5 with HM02 unowned and Cut in hand, else None."""
+        try:
+            if (state.get("badge_count") or 0) < 5:
+                return None
+            if fm.read_flag(self.b, 568):           # FLAG_GOT_HM02 — already own Fly
+                return None
+            if not self.world.has_cap("cut"):
+                return None                          # can't reach the house yet
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="fly", where=tuple(CELADON),
+                       human="HM Fly — the girl in the hidden house on Route 16, just west of "
+                             "Celadon behind a cuttable tree. Fast travel between every town "
+                             "I've visited: the endgame shrinks to minutes.",
+                       detail={"flag": "FLAG_GOT_HM02"})
+
+    def _eevee_gate(self, state):
+        """CELADON GIFT-EEVEE (2026-08-03, the OP-team pass — 'seeking out an OP as fuck team with
+        cute Pokémon like Eevee'). A guaranteed L25 Eevee sits in a Poké Ball in the Condominiums
+        roof room, in a city she cleared at badge 4 — the team plan's electric slot (-> Jolteon via
+        Thunder Stone) with zero RNG. Nothing story-blocks on it, so no recognizer would ever demand
+        it; this proactive gate opens the errand once Celadon is hers. Party-full is a NON-issue:
+        the FRLG script auto-transfers the gift to the PC (swap_keeper fields it later). Returns a
+        Gate while badges>=4 and FLAG_GOT_EEVEE (0x263) is unset, else None.
+
+        LIVE 2026-08-06: NEVER arm while Sevii-stranded — Celadon is a ferry + half of Kanto
+        away; opening this here made her narrate 'roof room / Eevee' while standing still on
+        One Island (ride-home must own those turns)."""
+        if not EEVEE_FETCH_ENABLED:
+            return None
+        try:
+            if self._lap_sevii_stranded():
+                return None
+            if (state.get("badge_count") or 0) < 4:
+                return None
+            if fm.read_flag(self.b, 0x263):          # FLAG_GOT_EEVEE — already claimed
+                return None
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="eevee", where=tuple(CELADON),
+                       human="the gift Eevee — a Poké Ball on a table in the Celadon Condominiums "
+                             "roof room (in through the back door, up the stairwell). One of a "
+                             "kind, and a Thunder Stone from the Dept. Store makes it Jolteon: "
+                             "the electric answer my plan wants for Lorelei and Lance.",
+                       detail={"flag": "FLAG_GOT_EEVEE"})
+
+    def _expshare_gate(self, state):
+        """ROUTE-15 EXP. SHARE (2026-08-03, 'she needs exp share with 50 species caught'). Oak's
+        aide upstairs in the Route 15 west gate pays out ITEM_EXP_SHARE (182) at >=50 CAUGHT
+        species — the bench-development engine (the holder banks XP from every fight it never
+        takes the field for), exactly what the E4's no-Center gauntlet demands. Nothing
+        story-blocks on it, so it must open proactively, same as Fly/Eevee — but ONLY once the
+        dex bar is actually met: below 50 the errand would be a wasted march (the aide refuses),
+        so the strategist brief carries the DEX PUSH doctrine instead and this returns None.
+        Returns a Gate while badges>=5, dex>=50 and FLAG 0x256 is unset, else None."""
+        if not EXPSHARE_FETCH_ENABLED:
+            return None
+        try:
+            if (state.get("badge_count") or 0) < 5:      # Fuchsia (badge 5) puts Route 15 next door
+                return None
+            if fm.read_flag(self.b, 0x256):              # FLAG_GOT_EXP_SHARE_FROM_OAKS_AIDE
+                return None
+            if (self.pokedex_count() or 0) < 50:         # the aide's bar — no early wasted march
+                return None
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="exp_share", where=(3, 33),
+                       human="the Exp. Share — fifty species caught means Oak's aide upstairs in "
+                             "the Route 15 west gate (right by Fuchsia) pays out. Whoever holds "
+                             "it levels off every fight without taking a hit: my whole bench "
+                             "grows on the road from here to the League.",
+                       detail={"flag": "FLAG_GOT_EXP_SHARE_FROM_OAKS_AIDE"})
+
+    def _icebeam_gate(self, state):
+        """CELADON GAME-CORNER ICE BEAM (2026-08-04, Jonny: 'make sure she gets blastoise ice
+        beam so he has 4 attacks and a really good one'). TM13's only pre-E4 copy is the prize
+        counter (4000 coins = 8×¥10,000 coin packs) — the single best coverage buy in the game:
+        Ice freezes exactly what's left on the road (Gary's Venusaur, Lance's dragons, the
+        birds). The errand (game_corner.IceBeamErrand) has been proven since the Erika era but
+        was never dispatched; this proactive gate arms it the moment it's actually affordable.
+        SELF-SUPPRESSES until then (the badge-4 wiring farmed grass for ¥66k — never again):
+        below budget she just keeps playing and the gate re-checks every tick as money banks up.
+        Returns a Gate while badges>=5, a compatible learner is fielded, nobody knows move 58,
+        and (TM13 in case OR the full coin budget clears the shop floor); else None."""
+        if not ICEBEAM_FETCH_ENABLED:
+            return None
+        try:
+            import game_corner as gc
+            if (state.get("badge_count") or 0) < 5:
+                return None
+            slot, why = gc.IceBeamErrand(self, log=log).pick_recipient()
+            if slot is None or why == "already":
+                return None                      # nobody to teach / already on the team
+            if gc.tm_case_qty(self.b, gc.ITEM_TM13) <= 0:
+                if gc.ice_beam_cash_shortfall(self) > 0:
+                    return None                  # not rich enough yet — no farming, just wait
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="ice_beam", where=tuple(CELADON),
+                       human="TM13 Ice Beam — the Celadon Game Corner prize counter sells the "
+                             "one move that freezes everything left on this run: Venusaur, "
+                             "Lance's dragons, the birds. The coin budget's banked; Blastoise "
+                             "gets a fourth attack worth having.",
+                       detail={"cap": "ice_beam"})
+
+    # ── LEGENDARY HUNTS (2026-08-04, Jonny: 'catching mew or mewtwo as a final endgame
+    #    project ... all cool legendaries before or after the final 4') ─────────────────────
+    def _hunt_ready(self, quarry_species, hide, fought, need_balls=6, key=None):
+        """Shared hunt preconditions: the encounter still EXISTS (not caught, not battled-away)
+        and the ball pocket can carry the fight (spendable Ultra/Great/Poké tiers; the mart
+        doctrine stocks Ultras while any hunt is pending). None = ready; else the reason.
+
+        SPENT-BUT-RETRYABLE (2026-08-05 EMERGENCY, two tiles from Moltres): fleeing/fainting a
+        static sets the fought flag — but a 'pre-<key>' checkpoint bank REWINDS that (full-RAM
+        savestate: flag clear, balls back). While that bank exists and the mon is uncaught,
+        the hunt is READY, not 'spent' — one fought-flag must never book a standing legendary
+        done and send the lap to Eevee. The ball floor is waived on that path too: the reload
+        IS the restock (the bank was taken with the full pocket)."""
+        try:
+            if ram.pokedex_owns(self.b, quarry_species) is True:
+                return "caught"
+            if fm.read_flag(self.b, hide) or fm.read_flag(self.b, fought):
+                if key and self._has_labeled_checkpoint(f"pre-{key}"):
+                    return None                    # THE FREE RETRY rewinds it — still live
+                return "spent"
+            if sum(self._balls_pocket_count(i) for i in (2, 3, 4)) < need_balls:
+                return "balls"
+        except Exception:
+            return "unreadable"
+        return None
+
+    def _zapdos_gate(self, state):
+        """POWER PLANT ZAPDOS — live the moment Surf is taught (the Route 10 water strip is the
+        only lock). The single best pre-E4 teammate the map still holds: L50 electric answers
+        Lorelei's waters and Lance's Gyarados. Returns a Gate or None."""
+        if not LEGENDARY_HUNTS_ENABLED:
+            return None
+        try:
+            if st.party_knows_move(self.b, 57, self.b.rd8(ram.GPLAYER_PARTY_CNT)) is None:
+                return None                       # no Surf, no road
+            if self._hunt_ready(145, 0x05D, 0x2BF, key="zapdos") is not None:
+                return None
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="zapdos", where=(3, 28),
+                       human="ZAPDOS — the Power Plant across Route 10's water strip holds a "
+                             "L50 legendary bird. Surf the strip, walk the plant, and catch "
+                             "the electric answer to Lorelei and Lance's Gyarados.",
+                       detail={"flag": "FLAG_FOUGHT_ZAPDOS"})
+
+    def _articuno_gate(self, state):
+        """SEAFOAM B4F ARTICUNO — only after the interior boulders are TRULY down (hide flags
+        0x046/0x047 cleared: the calm-water proof; the R21-reroute's stamped 0x2D2 does NOT
+        calm B4F). Ice/Flying L50 — Lance's dragons hate it. Returns a Gate or None."""
+        if not LEGENDARY_HUNTS_ENABLED:
+            return None
+        try:
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            if (st.party_knows_move(self.b, 57, cnt) is None
+                    or st.party_knows_move(self.b, 70, cnt) is None):
+                return None                       # needs Surf + Strength inside
+            if fm.read_flag(self.b, 0x046) or fm.read_flag(self.b, 0x047):
+                return None                       # boulders not truly down -> B4F rips
+            if self._hunt_ready(144, 0x082, 0x2BE, key="articuno") is not None:
+                return None
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="articuno", where=(3, 38),
+                       human="ARTICUNO — the Seafoam Islands' bottom floor, past the boulder "
+                             "cascade she already dropped. An ice legendary that makes "
+                             "Lance's dragons a formality.",
+                       detail={"flag": "FLAG_FOUGHT_ARTICUNO"})
+
+    def _moltres_gate(self, state):
+        """MT. EMBER MOLTRES — the Sevii strike, post-Blaine. THE RIDE OUT IS BILL: declining
+        his doorstep offer after the badge (blaine_gym B-drains it by design) parks him in
+        the Cinnabar Pokémon Center where he RE-OFFERS the trip forever (pret CinnabarIsland
+        scripts: the decline sets scene 2 + CLEARS FLAG_HIDE_CINNABAR_POKECENTER_BILL 0x0A2;
+        that flag starts SET at new game, so clear == Bill is waiting == the road is open).
+        Needs Surf (Kindle Road is a sea road) + Strength (the exterior corridor and the
+        summit are boulder puzzles). WHILE SHE'S ON THE ARCHIPELAGO the gate stays armed even
+        ball-thin — the strike must carry her HOME (the ride back is story-gated on the
+        Lostelle detour; a KO'd Moltres still ends the trip). Once she's home without the
+        bird (Bill re-hidden, off Sevii) it self-suppresses honestly — mirroring Articuno's
+        honest-skip philosophy. Returns a Gate or None."""
+        if not LEGENDARY_HUNTS_ENABLED:
+            return None
+        try:
+            from legendary_strikes import MOLTRES_ANCHORS
+            here = tuple(tv.map_id(self.b))
+            on_sevii = here in MOLTRES_ANCHORS and here not in ((3, 8), (12, 5))
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            if (st.party_knows_move(self.b, 57, cnt) is None
+                    or st.party_knows_move(self.b, 70, cnt) is None):
+                return None                   # needs Surf + Strength on the mountain
+            ready = self._hunt_ready(146, 0x052, 0x2BD, key="moltres")
+            if on_sevii:
+                if ready in ("caught", "spent"):
+                    return None               # spent mid-trip: the ride-home hook drives
+            else:
+                if ready is not None:
+                    return None
+                if fm.read_flag(self.b, 0x0A2):
+                    return None               # Bill gone from the Cinnabar PC — no ferry;
+                                              # honest skip (Sevii unreachable pre-champion)
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="moltres", where=(3, 8),
+                       human="MOLTRES — Bill is waiting in the Cinnabar Pokémon Center to "
+                             "sail her to One Island. Up Kindle Road, through Mt. Ember's "
+                             "boulder corridors, a L50 fire legendary on the summit — then "
+                             "the Lostelle detour buys the boat home.",
+                       detail={"flag": "FLAG_FOUGHT_MOLTRES"})
+
+    def _mewtwo_gate(self, state):
+        """CERULEAN CAVE MEWTWO — THE final endgame project (Jonny's order). The cave guard
+        only steps aside once she's CHAMPION (FLAG_SYS_GAME_CLEAR 0x82C), so this can only
+        arm on the victory lap. The Master Ball from Silph is reserved for exactly this seat
+        (battle_agent allow_master). Returns a Gate or None."""
+        if not LEGENDARY_HUNTS_ENABLED:
+            return None
+        try:
+            if not fm.read_flag(self.b, 0x82C):
+                return None                       # not champion — the guard won't move
+            if st.party_knows_move(self.b, 57, self.b.rd8(ram.GPLAYER_PARTY_CNT)) is None:
+                return None
+            # Master Ball in the pocket counts as ready even with a thin spendable stack
+            if (self._hunt_ready(150, 0x081, 0x2BC, need_balls=8) is not None
+                    and self._balls_pocket_count(1) <= 0):
+                return None
+        except Exception:
+            return None
+        return ql.Gate(ql.STORY_NPC, missing="mewtwo", where=(3, 3),
+                       human="MEWTWO — the Cerulean Cave guard finally steps aside for the "
+                             "CHAMPION. The strongest Pokémon in the game is at the bottom, "
+                             "and the Master Ball has been waiting for exactly this.",
+                       detail={"flag": "FLAG_FOUGHT_MEWTWO"})
+
+    def _hunt_anchor_proximate(self, key):
+        """GO-HARD HUNT-WAIVER SCOPE (2026-08-04, the parked-hunt bug): is the armed legendary
+        hunt geographically HERE or ONE MAP OVER? True when the current map is in the hunt's
+        anchor set, or when an anchor is a LIVE edge-connection of the current map (map-header
+        ground truth via _map_connections — Cinnabar's east edge IS Route 20, so the Articuno
+        return can launch from town right after the Ultra restock; ANCHOR-FIRST's live-edge
+        shortcut then walks that exact edge). One-map radius BY DESIGN: with Blastoise ace-
+        carrying every remaining gym, GO-HARD is effectively permanent, and an unscoped waiver
+        would let a trophy hunt hijack the badge march from across the map (the reason these
+        keys are NOT in ROAD_BLOCKER_KEYS). Never raises."""
+        try:
+            from legendary_strikes import (ARTICUNO_ANCHORS, MEWTWO_ANCHORS,
+                                           MOLTRES_ANCHORS, ZAPDOS_ANCHORS)
+            anchors = {"zapdos": ZAPDOS_ANCHORS, "articuno": ARTICUNO_ANCHORS,
+                       "moltres": MOLTRES_ANCHORS, "mewtwo": MEWTWO_ANCHORS}.get(key)
+            if not anchors:
+                return False
+            if tuple(tv.map_id(self.b)) in anchors:
+                return True
+            return any(tuple(m) in anchors for _d, m in self._map_connections())
+        except Exception:
+            return False
+
+    # ── THE VICTORY LAP (2026-08-04): the post-badge-8, pre-E4 checklist ────────────────────
+    # pret-verified facts the lap leans on: ITEM_TM26=314 / MOVE_EARTHQUAKE=89 (Giovanni's
+    # reward, giovanni_gym.py banks it); FLAG_GOT_EEVEE=0x263 (Celadon Condominiums roof room);
+    # FLAG_FOUGHT_{MOLTRES,ARTICUNO,ZAPDOS}=0x2BD/0x2BE/0x2BF with hide-flags 0x052/0x082/0x05D;
+    # FLAG_HIDE_CINNABAR_POKEMON_CENTER_BILL=0x0A2 (Bill gone = Sevii closed pre-champion);
+    # FLAG_HIDE_SEAFOAM_ISLANDS_B3F_BOULDER_{1,2}=0x046/0x047 (still set = B4F current live).
+    _LAP_HUNT_SPEC = {"moltres": (146, 0x052, 0x2BD), "articuno": (144, 0x082, 0x2BE),
+                      "zapdos": (145, 0x05D, 0x2BF)}          # species, hide-flag, fought-flag
+    _LAP_EQ_ITEM, _LAP_EQ_TM, _LAP_EQ_MOVE = 314, 26, 89
+    # Moves the Earthquake teach may NEVER overwrite: the field HMs travel depends on (Cut 15,
+    # Fly 19, Surf 57, Strength 70, Flash 148, Rock Smash 249, Dive 291, Waterfall 127) plus
+    # the battle staples Ice Beam 58 and Earthquake 89 itself.
+    _LAP_EQ_PROTECT = frozenset({15, 19, 57, 70, 127, 148, 249, 291, 58, 89})
+    _LAP_EQ_CHARGE = frozenset({13, 76, 91, 130, 143})   # RazorWind/SolarBeam/Dig/SkullBash/SkyAttack
+
+    def _lap_ace_slot(self):
+        """Party slot of the ACE (highest level). None when the party is unreadable/empty."""
+        try:
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            if not cnt:
+                return None
+            return max(range(min(cnt, 6)),
+                       key=lambda s: self.b.rd8(ram.GPLAYER_PARTY + s * st.PARTY_MON_SIZE + 0x54))
+        except Exception:
+            return 0
+
+    def _lap_skip(self, key, why):
+        """HONEST SKIP: latch a lap item as given-up-on, LOUD — the same self-suppression
+        philosophy the hunts use. A skipped item never blocks the League again this run."""
+        skipped = getattr(self, "_lap_skipped", None)
+        if skipped is None:
+            skipped = self._lap_skipped = set()
+        if key in skipped:
+            return
+        skipped.add(key)
+        log(f"   [lap] ⏭️ HONEST SKIP '{key}': {why} — the lap moves on (never an infinite park)")
+        try:
+            self.on_event(f"calling it on the {key} side quest — {why}. the League won't "
+                          f"wait forever.", kind="route", tier=2)
+        except Exception:
+            pass
+
+    def _lap_note_fail(self, key, why):
+        """Bounded-attempts ledger: a lap item whose dispatch keeps failing gets honestly
+        skipped after VICTORY_LAP_MAX_FAILS — the checklist can never wedge the endgame."""
+        fails = getattr(self, "_lap_fails", None)
+        if fails is None:
+            fails = self._lap_fails = {}
+        fails[key] = fails.get(key, 0) + 1
+        log(f"   [lap] '{key}' dispatch failed ({why}) — bounded attempt "
+            f"{fails[key]}/{VICTORY_LAP_MAX_FAILS}")
+        if fails[key] >= VICTORY_LAP_MAX_FAILS:
+            self._lap_skip(key, f"{fails[key]} bounded dispatch attempts spent (last: {why})")
+
+    def _lap_sevii_stranded(self):
+        """True while she stands on a Sevii map that is NOT the ride-home dock chain's mainland
+        ends — the MOLTRES RIDE-HOME hook owns those turns; mainland lap errands must not arm."""
+        try:
+            from legendary_strikes import MOLTRES_ANCHORS
+            here = tuple(tv.map_id(self.b))
+            return here in MOLTRES_ANCHORS and here not in ((3, 8), (12, 5))
+        except Exception:
+            return False
+
+    def _lap_bird_spent(self):
+        """Moltres is spent (caught / fought / hide) — ride-home owns Sevii turns after this.
+
+        LIVE 2026-08-06: used a non-existent `_dex_owned` helper, every call excepted to
+        False, so caught+party-Moltres still took the RE-ARM 'unspent' path. Dex bit,
+        party species 146, and fought/hide flags are the real truths."""
+        try:
+            if ram.pokedex_owns(self.b, 146) is True:
+                return True
+            if getattr(self, "_moltres_fought", False) or getattr(self, "_moltres_hide", False):
+                return True
+            try:
+                n = int(self.b.rd8(ram.GPLAYER_PARTY_CNT) or 0)
+            except Exception:
+                n = 6
+            for s in range(min(max(n, 0), 6)):
+                if st.read_party_species(self.b, s) == 146:
+                    return True
+            if fm.read_flag(self.b, 0x2BD) or fm.read_flag(self.b, 0x052):
+                return True
+            return False
+        except Exception:
+            return False
+
+    def _lap_drive_moltres_ride_home(self):
+        """Drive Lostelle + Meteorite + sail home while bird spent and Sevii-stranded.
+
+        Shared by victory_lap and the proactive hook. LIVE 2026-08-06: returning a no-op
+        'ok' while eevee/Celadon was parked left her narrating the roof room and not moving;
+        a 4-try hard exhaust then free-roamed forever on the archipelago. Map progress resets
+        the try counter; exhaustion never permanently softlocks — we keep driving LOUD."""
+        try:
+            from legendary_strikes import run_moltres
+            here = tuple(tv.map_id(self.b))
+            cq = self._active_questline
+            miss = getattr(getattr(cq, "gate", None), "missing", None)
+            if cq is not None and miss not in (None, "moltres"):
+                self._clear_questline(
+                    f"Sevii ride-home outranks parked '{miss}' "
+                    f"(cannot Celadon from the archipelago)")
+            last = getattr(self, "_moltres_home_last_map", None)
+            if last != here:
+                self._moltres_home_last_map = here
+                self._moltres_home_tries = 0
+            tries = int(getattr(self, "_moltres_home_tries", 0) or 0)
+            self._moltres_home_tries = tries + 1
+            if tries > 0 and tries % 8 == 0:
+                log(f"   [lap] !! MOLTRES RIDE-HOME still stranded after {tries} tries "
+                    f"on {here} — keeping the drive (never free-roam softlock)")
+            log(f"   [lap] 🔥 MOLTRES RIDE-HOME: bird spent, still on Sevii ({here}) — "
+                f"driving Lostelle detour + sail home (attempt {tries + 1})")
+            dbg = os.path.join(os.environ.get("TEMP", _HERE), "longrun", "moltres_probe")
+            mh = run_moltres(self, log, dbg_dir=dbg)
+            log(f"   [lap] 🔥 MOLTRES RIDE-HOME -> {mh} "
+                f"(now {tv.map_id(self.b)}@{tv.coords(self.b)})")
+            if mh in ("caught", "battled"):
+                self._moltres_home_tries = 0
+            return mh if mh not in (None, "") else "ok"
+        except Exception as e:
+            log(f"   [lap] moltres ride-home drive failed: {e}")
+            return "ok"
+
+    def _lap_pending(self, key):
+        """Is this checklist item still OWED? Reads the RAW truth (dex/flags/bag) — deliberately
+        NOT the gates' armed/suppressed view, so a ball-thin hunt still reads pending (the lap
+        fixes the balls itself). Structural dead-ends latch an honest skip here. Fails toward
+        NOT-pending on read errors — a RAM flake must never park the League march. Never raises."""
+        if key in getattr(self, "_lap_skipped", set()):
+            return False
+        try:
+            b = self.b
+            if key == "earthquake":
+                import hm_teach as ht
+                slot = self._lap_ace_slot()
+                if slot is None:
+                    return False
+                if self._LAP_EQ_MOVE in (st.read_party_moves(b, slot) or []):
+                    return False                              # already knows Earthquake — done
+                if ht.tm_case_row(b, self._LAP_EQ_ITEM) is None:
+                    self._lap_skip(key, "TM26 is not in the TM case (never banked or already spent)")
+                    return False
+                if not ht.tm_compatible(b, self._LAP_EQ_TM, st.read_party_species(b, slot)):
+                    self._lap_skip(key, "the ace can't learn TM26 per the ROM learnset")
+                    return False
+                return True
+            if key == "box_bench":
+                # Owed while the party lacks seats for the still-owed join-items ([box]).
+                # POKEMON_BOX_FLOW=0 (or the PCBOX master flag) removes it cleanly.
+                if not (BOX_FLOW_ENABLED and PCBOX_ENABLED):
+                    return False
+                # ONE-TRIP LATCH (2026-08-05, the Cinnabar deposit<->catch SHUTTLE): the executor
+                # completing its plan latches box_bench DONE for the session. Without it, ANY
+                # mid-lap pickup (a Route-21 tentacool off a misheard catch_now) regrew the plan,
+                # flipped this back to 'pending', and the lap marched her back into the Center —
+                # the logged door loop was the PC<->Route-21 shuttle, not the door itself. A
+                # pickup now rides in the trunk until 'repack'; the seat math still ran once.
+                if getattr(self, "_lap_bench_done", False):
+                    if self._lap_bench_plan() and not getattr(self, "_lap_bench_relatch_logged", False):
+                        self._lap_bench_relatch_logged = True
+                        log("   [box] bench already DONE this session — a mid-lap pickup regrew the "
+                            "plan but the LATCH holds (no march back to the Center; trunk until repack)")
+                    return False
+                return bool(self._lap_bench_plan())
+            if key == "repack":
+                # Owed only when THIS run actually benched someone and the party ended short
+                # of six (a skipped hunt) — the E4 gate's FULL-SIX law needs the bodies back.
+                if not (BOX_FLOW_ENABLED and PCBOX_ENABLED):
+                    return False
+                if getattr(self, "_lap_deposited", 0) <= 0:
+                    return False
+                return self.b.rd8(ram.GPLAYER_PARTY_CNT) < 6
+            if key == "eevee":
+                return EEVEE_FETCH_ENABLED and not fm.read_flag(b, 0x263)
+            spec = self._LAP_HUNT_SPEC.get(key)
+            if spec is None or not LEGENDARY_HUNTS_ENABLED:
+                return False
+            sp, hide, fought = spec
+            if ram.pokedex_owns(b, sp) is True:
+                return False                                  # caught — genuinely done
+            if fm.read_flag(b, fought) or fm.read_flag(b, hide):
+                # battled-away — but NOT done while THE FREE RETRY can rewind it (2026-08-05
+                # EMERGENCY: a flee after 5 broken balls set the fought flag, this line booked
+                # moltres DONE two tiles from the bird, and the lap left for EEVEE). A
+                # 'pre-<key>' bank restores the un-fought world, so the item stays OWED and
+                # the dispatch reloads into the encounter. Bounded by the _lap_fails ledger.
+                return self._has_labeled_checkpoint(f"pre-{key}")
+            if key == "moltres" and fm.read_flag(b, 0x0A2) and not self._lap_sevii_stranded():
+                self._lap_skip(key, "Bill is gone from the Cinnabar PC — the Sevii ferry is "
+                                    "closed pre-champion")
+                return False
+            if key == "articuno" and (fm.read_flag(b, 0x046) or fm.read_flag(b, 0x047)):
+                self._lap_skip(key, "a Seafoam B3F boulder never dropped — B4F's rip current "
+                                    "makes the bird unreachable")
+                return False
+            return True
+        except Exception as e:
+            log(f"   [lap] pending-check for '{key}' unreadable ({e}) — counting it done (LOUD)")
+            return False
+
+    _LAP_HUNT_SITE = {"moltres": (3, 12), "articuno": (3, 38), "zapdos": (3, 28)}
+
+    def _lap_anchor_sets(self):
+        """key -> anchor map-set for the hunt items (lazy import; empty dict on any fault)."""
+        try:
+            import legendary_strikes as _ls
+            return {"moltres": _ls.MOLTRES_ANCHORS, "articuno": _ls.ARTICUNO_ANCHORS,
+                    "zapdos": _ls.ZAPDOS_ANCHORS}
+        except Exception:
+            return {}
+
+    def _lap_item_cost(self, key, here):
+        """FLUID-PLAN COST (2026-08-05 EMERGENCY, Jonny: \"the plan needs to be fluid — it
+        can't be 'lets go get eevee' when we are one step away from moltres\"): a coarse
+        travel-cost estimate from her LIVE position, deliberately NOT a planner —
+          0 = standing at/inside it (hunt anchor maps, the item's own city, or an
+              in-place item like the Earthquake teach),
+          1 = same region (Kanto<->Kanto or Sevii<->Sevii walking/surfing),
+          2 = cross-region (a FERRY — the most expensive move on the board).
+        The lap picks min(cost) with the declared VICTORY_LAP_ORDER as the tiebreak, so
+        Mt. Ember summit prices moltres at 0 and eevee (Celadon, a ferry + half of Kanto
+        away) at 2 — never again the other way around."""
+        try:
+            if key in ("earthquake", "box_bench", "repack"):
+                return 0 if key == "earthquake" else 1   # teach is in-place; PC work = a Center walk
+            anch = self._lap_anchor_sets().get(key)
+            if anch and here in anch:
+                return 0
+            site = CELADON if key == "eevee" else self._LAP_HUNT_SITE.get(key)
+            if site is None:
+                return 1
+            if key == "eevee" and here == tuple(CELADON):
+                return 0
+            return 1 if map_region(here) == map_region(site) else 2
+        except Exception:
+            return 1
+
+    def _victory_lap_next(self, state=None):
+        """The next owed lap item, OPPORTUNITY-ORDERED (2026-08-05 EMERGENCY rewrite): the
+        cheapest item by live travel cost (_lap_item_cost), declared VICTORY_LAP_ORDER as the
+        tiebreak — with one absolute trump on top:
+
+        PROXIMITY OUTRANKS EVERYTHING — standing inside a legendary hunt's anchor set with
+        that legendary UNCAUGHT, the hunt IS the next item. No lap cursor, no luxury gate,
+        no force-pick preempts a legendary she is physically at (the Eevee divert, two tiles
+        from Moltres). Skip marks are always cleared while she stands on the hunt's own
+        maps (an honest skip from a thin Ultra pocket must not park the lap on articuno
+        while she's still in One Island Harbor — 2026-08-06). Fail-ledger clears stay
+        once-per-key per session so the bounded-fail law still stands — never an infinite
+        park on a wedged strike."""
+        if not VICTORY_LAP_ENABLED:
+            return None
+        here, prox = None, None
+        try:
+            here = tuple(tv.map_id(self.b))
+            for k, anch in self._lap_anchor_sets().items():
+                if here not in anch:
+                    continue
+                if ram.pokedex_owns(self.b, self._LAP_HUNT_SPEC[k][0]) is True:
+                    continue
+                # Skip marks: always discard while on the hunt's own maps. An honest skip
+                # from a thin Ultra pocket must not park the lap on articuno while she's
+                # still standing in One Island Harbor (2026-08-06 live strand). Fail-ledger
+                # clears stay once-per-key so the bounded-fail law still stands.
+                skipped = getattr(self, "_lap_skipped", None)
+                if skipped and k in skipped:
+                    skipped.discard(k)
+                    log(f"   [lap] 🦅 PROXIMITY UNSKIP '{k}': standing on the hunt's own maps — "
+                        f"honest-skip latch dropped (every visit; nothing outranks a "
+                        f"legendary she is standing next to)")
+                fails = getattr(self, "_lap_fails", None) or {}
+                if fails.get(k):
+                    cleared = getattr(self, "_lap_prox_fail_clears", None)
+                    if cleared is None:
+                        cleared = self._lap_prox_fail_clears = set()
+                    if k not in cleared:
+                        cleared.add(k)
+                        fails.pop(k, None)
+                        log(f"   [lap] 🦅 PROXIMITY FAIL-CLEAR '{k}': standing on the hunt's "
+                            f"own maps — loop-burned fail ledger dropped (once per run)")
+                if self._lap_pending(k):
+                    prox = k
+                break
+        except Exception:
+            prox = None
+        verdict = {}
+        for k in VICTORY_LAP_ORDER:
+            verdict[k] = ("pending" if self._lap_pending(k)
+                          else ("SKIPPED" if k in getattr(self, "_lap_skipped", set()) else "done"))
+        pend = [k for k in VICTORY_LAP_ORDER if verdict[k] == "pending"]
+        if prox is not None:
+            nxt = prox
+        elif pend and here is not None:
+            _order = {k: i for i, k in enumerate(VICTORY_LAP_ORDER)}
+            nxt = min(pend, key=lambda k: (self._lap_item_cost(k, here), _order[k]))
+        else:
+            nxt = pend[0] if pend else None
+        _sig = (tuple(sorted(verdict.items())), nxt, prox)
+        if _sig != getattr(self, "_lap_verdict_logged", None):
+            self._lap_verdict_logged = _sig
+            log(f"   [lap] CHECKLIST {verdict} -> next: {nxt or '— CLEAR'}"
+                + (f" (PROXIMITY TRUMP: standing at the {prox} hunt)" if prox else
+                   (f" (cost-ordered from {here})" if nxt else "")))
+            if nxt is None:
+                log("   [lap] 🏁 CHECKLIST CLEAR — the League road opens (head_to_league resumes)")
+        return nxt
+
+    def _lap_gate_for(self, key, state):
+        """The proactive gate object for a lap item (the SAME gates the forward-questline chain
+        uses — anchors, questline payloads, self-suppression all included). None = suppressed."""
+        fn = {"moltres": self._moltres_gate, "articuno": self._articuno_gate,
+              "zapdos": self._zapdos_gate, "eevee": self._eevee_gate}.get(key)
+        return fn(state) if fn else None
+
+    def _lap_eq_forget_idx(self, slot):
+        """Pick the move Earthquake replaces: Teleport-class utility first, then charge moves
+        (the battle engine never drives 2-turn moves well), then pure status, then the weakest
+        damaging chip — NEVER a protected move (Surf / Ice Beam / field HMs / EQ itself).
+        None = a free slot exists; 'no_room' = all four are protected (caller refuses)."""
+        import hm_teach as ht
+        moves = st.read_party_moves(self.b, slot) or []
+        if len([m for m in moves if m]) < 4:
+            return None
+        best = None
+        for i, m in enumerate(moves):
+            if not m or m in self._LAP_EQ_PROTECT:
+                continue
+            try:
+                _t, power = st.move_info(self.b, m)
+            except Exception:
+                _t, power = "", 0
+            tier = (0 if m in getattr(ht, "_FORGET_FIRST", set()) else
+                    1 if m in self._LAP_EQ_CHARGE else
+                    2 if (power or 0) <= 0 else 3)
+            k = (tier, power or 0, i)
+            if best is None or k < best:
+                best = k
+        return "no_room" if best is None else best[2]
+
+    def _lap_teach_earthquake(self):
+        """TM26 EARTHQUAKE -> the ace (Jonny's order; chat is asking live). Rides the PROVEN
+        overworld TeachFlow (the exact vehicle that taught Surf) with the protected forget
+        choice above. Returns 'taught' | 'no_room' | anything else = failed this attempt."""
+        import hm_teach as ht
+        b = self.b
+        slot = self._lap_ace_slot()
+        if slot is None:
+            return "failed"
+        sp = st.read_party_species(b, slot)
+        mon = st.SPECIES_NAME.get(sp, f"slot{slot}")
+        try:                                    # ROM sanity: move 89 must be Ground with power
+            rt, rp = st.move_info(b, self._LAP_EQ_MOVE)
+            if (rt or "").lower() != "ground" or not rp:
+                log(f"   [lap] !! EQ teach REFUSED: ROM reads move 89 as {rt}/{rp} — LOUD")
+                return "failed"
+        except Exception:
+            pass
+        forget = self._lap_eq_forget_idx(slot)
+        if forget == "no_room":
+            log(f"   [lap] !! EQ teach: every move on {mon} is protected (Surf/Ice Beam/HMs) — "
+                f"refusing to overwrite a staple")
+            return "no_room"
+        log(f"   [lap] 🌍 TEACHING TM26 EARTHQUAKE -> {mon} (slot {slot}, "
+            f"forget_idx {'-' if forget is None else forget})")
+        self.on_event("Giovanni's TM26 — EARTHQUAKE, straight onto my ace. chat has been "
+                      "asking for exactly this.", kind="team", tier=3)
+        r = ht.TeachFlow(self, log=log, on_event=self.on_event).teach(
+            "_tm", slot, forget, item_override=self._LAP_EQ_ITEM,
+            move_override=self._LAP_EQ_MOVE)
+        log(f"   [lap] EQ teach -> {r}")
+        if r == "taught":
+            try:
+                tp = getattr(self, "team_planner", None)
+                if tp is not None:
+                    tp.on_teach("TM26", mon)
+            except Exception:
+                pass
+            self.on_event(f"{mon} knows EARTHQUAKE now. the Elite Four is going to feel the "
+                          f"ground move.", kind="team", tier=3)
+        return r
+
+    def _lap_restock_balls(self, state, key):
+        """A hunt is owed but the pocket can't carry the catch (under _hunt_ready's 6-spendable-
+        ball floor) — the lap drives the restock itself instead of letting the gate self-suppress
+        forever: buy at THIS city's mapped mart if it shelves a ball tier, else march toward the
+        nearest mapped ball shelf. Bounded by the item's fail counter."""
+        have = sum(self._balls_pocket_count(i) for i in (2, 3, 4))
+        here = tuple(tv.map_id(self.b))
+        log(f"   [lap] '{key}' is owed but the ball pocket is thin ({have} spendable, need 6) — "
+            f"the lap restocks BEFORE the hunt")
+        door = CITY_MART_DOORS.get(here)
+        shelf = MART_STOCK.get(here, [])
+        tier = next((t for t in (2, 3, 4) if t in shelf), None)
+        if tier is not None and self.money() > SHOP_MONEY_FLOOR and (door or here == CELADON):
+            # ULTRA WAR-CHEST: the hunt tier restocks to HUNT_ULTRA_TARGET (a legendary
+            # attempt eats balls in fistfuls); the cheap tiers keep the old 8-ball top-up.
+            if tier == 2:
+                want = [(2, max(2, HUNT_ULTRA_TARGET - self._balls_pocket_count(2)))]
+            else:
+                want = [(tier, max(2, 8 - have))]
+            # CHEAP-TIER CUSHION (2026-08-05, the Kindle Road Meowth): the hunt's Ultras are
+            # now RESERVED (battle_agent HUNT_BALL_RESERVE) — ride a handful of the cheapest
+            # tier this shelf sells alongside them so any post-lap opportunistic catch has a
+            # non-reserved ball to throw.
+            cheap = next((t for t in (4, 3) if t in shelf and t != tier), None)
+            if cheap is not None and self._balls_pocket_count(cheap) < 5:
+                want.append((cheap, 5 - self._balls_pocket_count(cheap)))
+            # FIELD-HEAL STOCK RIDE-ALONG (2026-08-05, the Mt. Ember climb): the same counter
+            # tops the heal pocket up so the climb's [fieldheal] doctrine has bottles to
+            # drink (Cinnabar shelves Hyper Potion at row 2). Best-effort — a read flake
+            # never blocks the ball restock this trip exists for.
+            try:
+                pot = next((p for p in (21, 22, 13) if p in shelf), None)
+                heals = sum(self.bag_count(i) for i in (13, 22, 21, 20, 19))
+                if pot is not None and heals < 8:
+                    want.append((pot, 8 - heals))
+            except Exception as _fpx:
+                log(f"   [lap] potion ride-along skipped: {_fpx}")
+            bought = (self.buy_at_celadon_dept(want) if here == CELADON
+                      else self.buy_at_mart(door, want)) or {}
+            if bought.get(tier):
+                log(f"   [lap] restocked {bought[tier]}x ball tier {tier} at {here} — "
+                    f"the hunt re-arms next tick")
+                return "ok"
+            self._lap_note_fail(key, "mart restock bought nothing")
+            return "ok"
+        # RESTOCK MARCH (rewritten 2026-08-05, the Cinnabar↔Route-20 loop): the old fallback
+        # (a) never knew Cinnabar shelves balls and (b) blind-picked Fuchsia, whose Route-20
+        # road is SEVERED at Seafoam (pitfall 25's positional-reachability class) — the march
+        # no_path'd every tick and NOTHING counted the failure, so the lap parked forever.
+        # Now: candidates are RIDEABLE-filtered (the router's own next-step probe, CINNABAR
+        # first — it's the endgame sea corridor's shelf), and a failed march feeds the bounded
+        # fail counter -> honest skip. The lap can no longer wedge on an unreachable shop.
+        # Three Island first when stranded on Sevii (Cinnabar sail-home is Lostelle-gated).
+        tgt = next((c for c in ((3, 14), CINNABAR, FUCHSIA, SAFFRON, CELADON, CERULEAN,
+                                VERMILION)
+                    if any(t in MART_STOCK.get(c, []) for t in (2, 3, 4))
+                    and self._next_step_rideable(here, c, set()) is not None), None)
+        if tgt is None:
+            self._lap_note_fail(key, "no rideable ball shelf from here")
+            return "ok"
+        log(f"   [lap] no ball shelf here {here} — marching to {tgt} for the restock")
+        r = self._travel_to_known(f"travel:{tgt[0]},{tgt[1]}", state, hunt_on_arrival=False)
+        if r in ("no_route", "bad_travel_target") or str(r).startswith("travel:"):
+            self._lap_note_fail(key, f"restock march -> {r}")
+        return r
+
+    # ── THE BOX FLOW ([box], 2026-08-05 — the full-party postmortem): a dex-push Pidgey took
+    # party seat 6, and FRLG auto-boxes ANY catch at party-6 — so without a deposit leg every
+    # lap bird would sail straight to storage and never fight. Rides the PROVEN screenshot-
+    # calibrated deposit_mon/withdraw_mon vehicles (Tier-1 #15 / NS#39; cursor-response +
+    # screen-state driven, never blind timing); everything here is selection + sequencing.
+    # Kill switch POKEMON_BOX_FLOW=0; failures are bounded (-> honest skip: passengers ride
+    # in the trunk and _lap_order_party_for_e4 keeps them last, the pre-flow worst case). ──
+    _LAP_JOIN_SPECIES = (146, 144, 145, 133)   # Moltres, Articuno, Zapdos, Eevee (join items)
+    _LAP_JOIN_KEYS = ("moltres", "articuno", "eevee", "zapdos")
+
+    def _lap_bench_plan(self):
+        """Which party SLOTS ride the box (lowest level first): passengers (non-ace, level <=
+        BOX_BENCH_MAX_LEVEL) up to exactly the seat shortfall for the still-owed join-items,
+        never below BOX_BENCH_MIN_PARTY bodies. Empty list = nothing owed. Sized per-tick from
+        LIVE RAM so a skipped hunt shrinks the deposit and a done deposit reads complete."""
+        b = self.b
+        cnt = min(b.rd8(ram.GPLAYER_PARTY_CNT) or 0, 6)
+        if cnt <= BOX_BENCH_MIN_PARTY:
+            return []
+        joins = sum(1 for k in self._LAP_JOIN_KEYS if self._lap_pending(k))
+        need = joins - (6 - cnt)
+        if need <= 0:
+            return []
+
+        def _lv(s):
+            return b.rd8(ram.GPLAYER_PARTY + s * st.PARTY_MON_SIZE + 0x54)
+
+        ace = self._lap_ace_slot()
+        passengers = sorted((s for s in range(cnt)
+                             if s != ace and _lv(s) <= BOX_BENCH_MAX_LEVEL), key=_lv)
+        return passengers[:min(need, cnt - BOX_BENCH_MIN_PARTY)]
+
+    def _lap_pc_march(self, key, state):
+        """March toward the nearest RIDEABLE Center city for a [box] leg — CINNABAR first (the
+        endgame corridor's own Center; she's standing on or beside it after Giovanni), then the
+        mainland ring. The rideable filter is the Route-20 lesson: a flat-graph target can be
+        positionally unreachable (severed at Seafoam), and an uncounted march loops forever —
+        so unreachable = counted failure -> bounded honest skip, never an infinite park."""
+        cur = tuple(tv.map_id(self.b))
+        tgt = next((c for c in (CINNABAR, VIRIDIAN, FUCHSIA, VERMILION, CERULEAN, CELADON,
+                                SAFFRON, PEWTER)
+                    if c in CITY_PC_DOORS
+                    and self._next_step_rideable(cur, c, set()) is not None), None)
+        if tgt is None:
+            self._lap_note_fail(key, "no rideable Center city from here")
+            return "ok"
+        log(f"   [box] '{key}' needs a Center PC — marching to {self.world.name(tgt)} {tgt}")
+        r = self._travel_to_known(f"travel:{tgt[0]},{tgt[1]}", state, hunt_on_arrival=False)
+        if r in ("no_route", "bad_travel_target") or str(r).startswith("travel:"):
+            self._lap_note_fail(key, f"PC march -> {r}")
+        return r
+
+    def _lap_box_withdraw(self, pc_door, targets_only=False):
+        """Pull box occupants back into party room while seats exist: lap-target species
+        (birds/Eevee — an auto-box catch) first, then the benched passengers newest-slot-first
+        (repack). OPEN-box only — withdraw_mon aborts LOUD on wrong_box, never pulls blind.
+        Returns how many joined. Bounded; any non-'withdrawn' result stops the pull."""
+        got = 0
+        for _ in range(4):
+            try:
+                if self.b.rd8(ram.GPLAYER_PARTY_CNT) >= 6:
+                    break
+                cb, occ = self._box_scan()
+            except Exception as e:
+                log(f"   [box] box scan failed ({e}) — stopping the withdraw pull")
+                break
+            rows = [(sl, sp) for (bx, sl), sp in sorted(occ.items()) if bx == cb]
+            pick = next((sl for sl, sp in rows if sp in self._LAP_JOIN_SPECIES), None)
+            if pick is None and not targets_only and rows:
+                pick = rows[-1][0]        # highest slot ~= the most recent deposit
+            if pick is None:
+                break
+            sp = occ[(cb, pick)]
+            log(f"   [box] withdrawing {st.SPECIES_NAME.get(sp, sp)} (box {cb} slot {pick}) "
+                f"into the party")
+            r = self.withdraw_mon(cb, pick, pc_door)
+            if r != "withdrawn":
+                log(f"   [box] withdraw -> {r} (stopping the pull)")
+                break
+            got += 1
+            self._lap_deposited = max(0, getattr(self, "_lap_deposited", 0) - 1)
+        return got
+
+    def _lap_box_bench(self, state):
+        """EXECUTOR for 'box_bench': deposit the dead-weight passengers at a Center PC so every
+        owed legendary has a party seat (Jonny's E4-prep order — the dream comp needs the birds
+        ON the team, and a full party auto-boxes them). Deposits re-derive slots per iteration
+        (pitfall 39, the menu-time order law); a lap-target already in the open box joins right
+        after. All decisions log [box]; failures are bounded -> honest skip."""
+        key = "box_bench"
+        if not self._lap_bench_plan():
+            # plan already empty at dispatch = nothing owed -> LATCH (the shuttle law: this
+            # item runs at most ONE Center trip per session; see _lap_pending's latch).
+            if not getattr(self, "_lap_bench_done", False):
+                self._lap_bench_done = True
+                log("   [box] bench plan reads EMPTY — box_bench LATCHED done for this session")
+            return "ok"                                   # pending re-derives done next tick
+        cur = tuple(tv.map_id(self.b))
+        pc_door = CITY_PC_DOORS.get(cur)
+        if pc_door is None:
+            return self._lap_pc_march(key, state)
+        try:                                              # ace to slot 0: deposit_mon's slot-0
+            ace = self._lap_ace_slot()                    # guard then protects exactly the ace
+            if ace:
+                self._swap_party_slots(0, ace)
+        except Exception as e:
+            log(f"   [box] ace-to-front swap skipped ({e})")
+        did = 0
+        for _ in range(5):
+            plan = self._lap_bench_plan()                 # LIVE slots — party shifts per deposit
+            if not plan:
+                break
+            slot = plan[0]
+            sp = st.SPECIES_NAME.get(st.read_party_species(self.b, slot), f"slot{slot}")
+            lvl = self.b.rd8(ram.GPLAYER_PARTY + slot * st.PARTY_MON_SIZE + 0x54)
+            log(f"   [box] depositing {sp} L{lvl} (party slot {slot}) — freeing a seat for "
+                f"the lap's legendaries")
+            r = self.deposit_mon(slot, pc_door)
+            if r != "deposited":
+                self._lap_note_fail(key, f"deposit_mon -> {r}")
+                return "ok"
+            did += 1
+            self._lap_deposited = getattr(self, "_lap_deposited", 0) + 1
+        if did:
+            (getattr(self, "_lap_fails", None) or {}).pop(key, None)
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            log(f"   [box] ✅ bench deposited ({did} mon) — party {cnt}/6, seats open for "
+                f"the birds")
+            self.on_event(f"benched {did} of the crew at the Center PC — the legendary birds "
+                          f"get real team seats, not a storage box.", kind="roster", tier=3)
+        if not self._lap_bench_plan():
+            # the plan is CLEARED -> LATCH done for the session (the Cinnabar shuttle law):
+            # a later pickup regrowing the plan must NOT resurrect this item — one trip, then
+            # trunk-until-repack. A partial trip (deposit failed mid-plan) returns above via
+            # _lap_note_fail and does NOT latch, so the bounded-retry path is unchanged.
+            self._lap_bench_done = True
+            log("   [box] bench COMPLETE — box_bench LATCHED done for this session "
+                "(mid-lap pickups ride the trunk until 'repack')")
+        self._lap_box_withdraw(pc_door, targets_only=True)
+        return "ok"
+
+    def _lap_repack(self, state):
+        """EXECUTOR for 'repack', the lap's LAST item: the hunts are settled — if any was
+        honestly skipped the party is short of six, and the E4 readiness gate's FULL-SIX law
+        would stand down forever. Withdraw box occupants (lap birds first, then the benched
+        passengers) until the party is whole. Bounded -> honest skip like every lap item."""
+        key = "repack"
+        cur = tuple(tv.map_id(self.b))
+        pc_door = CITY_PC_DOORS.get(cur)
+        if pc_door is None:
+            return self._lap_pc_march(key, state)
+        got = self._lap_box_withdraw(pc_door, targets_only=False)
+        if got:
+            (getattr(self, "_lap_fails", None) or {}).pop(key, None)
+            log(f"   [box] ✅ repacked {got} mon — party "
+                f"{self.b.rd8(ram.GPLAYER_PARTY_CNT)}/6 for the League")
+        else:
+            self._lap_note_fail(key, "withdraw pulled nothing")
+        return "ok"
+
+    def _run_victory_lap(self, state):
+        """EXECUTOR for the 'victory_lap' pick: run the FIRST owed checklist item. Earthquake
+        teaches in place; box_bench/repack drive the Center-PC box flow ([box]); the hunts/
+        Eevee arm their own proactive gates (evicting a mismatched parked luxury errand LOUD)
+        and ride the questline machinery — FIRE-FIRST strikes on anchors, ANCHOR-FIRST travel
+        everywhere else. Ball-thin hunts run the restock leg first. Every decision logs under
+        [lap]; failures are bounded per item (-> honest skip), so the checklist can never
+        wedge the endgame."""
+        key = self._victory_lap_next(state)
+        if key is None:
+            return "lap_done"
+        # Sevii ownership: ride-home only owns the turn AFTER the bird is spent. An honest
+        # skip from a thin Ultra pocket must NOT park the lap on articuno while she's still
+        # on One Island with no boat home armed (2026-08-06 live strand — 200+ RED ticks).
+        if self._lap_sevii_stranded():
+            bird_spent = self._lap_bird_spent()
+            if bird_spent:
+                # ALWAYS drive home once the bird is spent — even if the checklist key is
+                # still 'moltres' (gate-caught / SKIPPED / articuno). LIVE 2026-08-06: the
+                # old `key != "moltres"` guard fell through into questline dispatch which
+                # self-suppressed (caught) and she stood still narrating Celadon in Celio's
+                # Network Center / on the summit.
+                log(f"   [lap] '{key}' deferred — Moltres spent, still on Sevii; "
+                    f"DRIVING Lostelle ride-home NOW (Articuno/Eevee wait on Cinnabar)")
+                return self._lap_drive_moltres_ride_home()
+            skipped = getattr(self, "_lap_skipped", None)
+            if skipped and "moltres" in skipped:
+                skipped.discard("moltres")
+                fails = getattr(self, "_lap_fails", None) or {}
+                fails.pop("moltres", None)
+                log("   [lap] ♻️ RE-ARM 'moltres': Sevii-stranded after honest skip, "
+                    "bird unspent — war-chest / summit still owns the archipelago "
+                    "(ride-home is post-catch only)")
+            if key != "moltres":
+                log(f"   [lap] '{key}' deferred — still on Sevii with Moltres unspent; "
+                    f"forcing moltres questline")
+                key = "moltres"
+        if key == "earthquake":
+            r = self._lap_teach_earthquake()
+            if r == "taught":
+                (getattr(self, "_lap_fails", None) or {}).pop(key, None)
+            elif r == "no_room":
+                self._lap_skip(key, "no sacrificable move slot on the ace")
+            else:
+                self._lap_note_fail(key, f"TeachFlow -> {r}")
+            return "ok"
+        if key == "box_bench":
+            return self._lap_box_bench(state)
+        if key == "repack":
+            return self._lap_repack(state)
+        gate = self._lap_gate_for(key, state)
+        if gate is None:
+            # Owed by raw truth but the gate self-suppresses. Ball-thin is OURS to fix; any
+            # other suppression counts a bounded failure (the pending test already latched
+            # the structural dead-ends as honest skips).
+            reason = None
+            try:
+                spec = self._LAP_HUNT_SPEC.get(key)
+                if spec is not None:
+                    reason = self._hunt_ready(*spec)
+            except Exception:
+                reason = "unreadable"
+            if reason == "balls":
+                return self._lap_restock_balls(state, key)
+            self._lap_note_fail(key, f"gate self-suppressed ({reason or 'condition'})")
+            return "ok"
+        cur = self._active_questline
+        if cur is not None and getattr(cur.gate, "missing", None) != gate.missing:
+            self._clear_questline(f"the victory lap's '{key}' outranks the parked "
+                                  f"'{getattr(cur.gate, 'missing', '?')}' errand")
+            cur = None
+        if cur is None and not self._open_questline(gate, state):
+            self._lap_note_fail(key, "questline would not open")
+            return "ok"
+        r = self._run_questline_step(state)
+        log(f"   [lap] '{key}' questline step -> {r}")
+        if not self._lap_pending(key):
+            (getattr(self, "_lap_fails", None) or {}).pop(key, None)
+            log(f"   [lap] ✅ '{key}' DONE — the checklist re-derives next tick")
+        elif r in ("questline_unresolved", "questline_abandoned", "no_questline",
+                   "questline_strike_failed", "stuck", "failed"):
+            self._lap_note_fail(key, r)
+        return r
+
+    def _lap_order_party_for_e4(self):
+        """DELIBERATE E4 party order (2026-08-04): ace first, then every fighter by level
+        descending, the low-level passengers LAST — a lead faint falls through to bodies that
+        fight, not to L18 chaff (e4_strike's answer_lead still retunes the lead per seat).
+        The lap's box_bench normally deposits the passengers ([box], 2026-08-05); this sort is
+        the honest-skip fallback — if boxing failed, the trunk riders still go last.
+        Overworld-only, save-safe (_swap_party_slots); no-op mid-battle or on read error."""
+        try:
+            if st.in_battle(self.b):
+                return
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            if cnt < 3:
+                return
+
+            def _lv(s):
+                return self.b.rd8(ram.GPLAYER_PARTY + s * st.PARTY_MON_SIZE + 0x54)
+
+            for pos in range(cnt - 1):                    # selection sort by level, descending
+                best = max(range(pos, cnt), key=_lv)
+                if best != pos:
+                    self._swap_party_slots(pos, best)
+            order = [f"{st.SPECIES_NAME.get(st.read_party_species(self.b, s), '?')} L{_lv(s)}"
+                     for s in range(cnt)]
+            log(f"   [lap] E4 PARTY ORDER (ace first, passengers last): {order}")
+        except Exception as e:
+            log(f"   [lap] E4 party ordering skipped ({e}) — standing order goes in (LOUD)")
+
     def _head_to_league(self, state):
         """ENDGAME (NS#15): all 8 badges, not yet at Indigo — dispatch the Victory Road strike. It drives its
         OWN road (Viridian -> Route 22 [Gary] -> the gate -> Route 23 -> the VR boulder floors -> the Indigo
@@ -10049,6 +14013,10 @@ class Campaign:
                     log(f"   !! VR-GRIND pre-gauntlet errored ({e}) — proceeding to the E4 (LOUD)")
             import e4_strike
             dbg = os.path.join(os.environ.get("TEMP", _HERE), "longrun", "e4_probe")
+            # DELIBERATE E4 PARTY ORDER (2026-08-04, the victory lap's last act): ace lead, the
+            # fighters (birds/Lapras) by level behind, the low-level passengers LAST — set ONCE
+            # at the League door; e4_strike's answer_lead still retunes the lead per seat.
+            self._lap_order_party_for_e4()
             self.on_event("the Indigo Plateau. the Elite Four are right through those doors. "
                           "everything's led to this — okay. let's go.", kind="gym", tier=2)
             r = e4_strike.run_strike(self, log, dbg_dir=dbg)
@@ -10278,7 +14246,13 @@ class Campaign:
         at the blocking obstacle — Vermilion's cut tree IS the chokepoint), then run the HM-obstacle
         recognizer AT HER FEET. This was the missing wire: recognize() was only ever called with
         blocked_dir (exit gates), so the adjacency-based HM_OBSTACLE gate was dead code from the
-        roam loop. Returns a Gate or None."""
+        roam loop.
+
+        Returns:
+          "cut_cleared" — Cut just dropped the gym-door tree THIS call (caller must re-enter NOW)
+          a Gate        — only cut/strength door obstacles (never water/surf)
+          None          — no actionable gym-door gate; caller stays / retries
+        """
         try:
             grid = tv.Grid(self.b)
             cur = tuple(tv.coords(self.b))
@@ -10292,8 +14266,11 @@ class Campaign:
             # a SURF/Safari questline (runs 5-6). A tree/boulder near the door IS the gate: walk
             # adjacent to the OBJECT and recognize there (obstacles outrank water in the recognizer).
             import field_moves as _fm
+            _mid = tuple(tv.map_id(self.b))
+            _saw_door_tree = False
 
             def _obstacle_probe():
+                nonlocal _saw_door_tree
                 g2 = tv.Grid(self.b)
                 here2 = tuple(tv.coords(self.b))
                 # DIAGNOSTIC (2026-07-10 NIGHT SHIFT 16): the Surge gym-door Cut never actuates even on the
@@ -10311,6 +14288,7 @@ class Campaign:
                         # far away (Vermilion (29,18), ~16 tiles off) where scan_field_objects loads
                         # NOTHING — the cache lets phase B walk straight back to it.
                         self._gym_cut_cache[tuple(tv.map_id(self.b))] = (ox, oy)
+                        _saw_door_tree = True
                     for stand in ((ox, oy - 1), (ox, oy + 1), (ox - 1, oy), (ox + 1, oy)):
                         _reach = bool(tv.bfs(g2, here2, lambda t, s=stand: t == s, walkable=g2.walkable))
                         log(f"   [roam] 🔎 tree@{ob['coord']} gfx={ob.get('gfx')} stand={stand} bfs_reachable={_reach}")
@@ -10346,7 +14324,10 @@ class Campaign:
 
             found = _obstacle_probe()
             if found == "cleared":
-                return None      # tree is DOWN — no gate; the next tick's door leg walks through
+                # Distinct signal so head_to_gym re-enters THIS tick (None used to fall through to
+                # beach water recognize on the NEXT stuck and exile her to Route 6 / UGP).
+                log("   [roam] 🪓 GYM-GATE: Cut CLEARED the door tree — signaling cut_cleared for immediate re-enter")
+                return "cut_cleared"
             if not found:
                 # phase B — reposition so the gate tree LOADS into scan range, then rescan.
                 grid2 = tv.Grid(self.b)
@@ -10391,12 +14372,40 @@ class Campaign:
                                              max_steps=200, max_seconds=60)
                             break
                 if _obstacle_probe() == "cleared":
-                    return None
+                    log("   [roam] 🪓 GYM-GATE: Cut CLEARED (phase B) — signaling cut_cleared for immediate re-enter")
+                    return "cut_cleared"
+            # Door-tree still present (or Cut usable + cached) — NEVER fall through to beach water.
+            # Live 2026-08-01: post-Cut / near-beach recognize() armed missing='surf' → Fuchsia
+            # questline → discovery walked her NORTH onto Route 6 / UGP forever.
+            _cut_ok = False
+            try:
+                _cut_ok = bool(_fm.can_use(self.b, "cut", self.b.rd8(ram.GPLAYER_PARTY_CNT)))
+            except Exception:
+                _cut_ok = False
+            _cached_tree = self._gym_cut_cache.get(_mid)
+            if found is True or _saw_door_tree or (_cached_tree and _cut_ok):
+                log(f"   [roam] !! GYM-GATE: door cut-tree path owns this stuck "
+                    f"(found={found!r} saw_tree={_saw_door_tree} cached={_cached_tree} "
+                    f"cut_ok={_cut_ok}) — REFUSING water/recognize fallthrough")
+                return None
             here = tv.coords(self.b)
             gate = self._gate_recognizer.recognize(tuple(tv.map_id(self.b)),
                                                    player_xy=tuple(here) if here else None,
                                                    grid=tv.Grid(self.b))
             if gate:
+                _miss = getattr(gate, "missing", None)
+                _kind = (getattr(gate, "detail", None) or {}).get("kind")
+                # HARD RULE: gym-door probe never returns water/surf (beach near Vermilion gym).
+                if _miss == "surf" or _kind == "water" or (
+                        isinstance(_miss, str) and _miss.startswith("badge:surf")):
+                    log(f"   [roam] !! GYM-GATE: DISCARDING water/surf gate at gym door "
+                        f"({gate}) — door is HERE, not a sea errand")
+                    return None
+                # Only cut/strength are legitimate gym-door HM obstacles; Safari/story noise → ignore.
+                if _miss not in ("cut", "strength"):
+                    log(f"   [roam] !! GYM-GATE: IGNORING non-door-tree gate at gym city "
+                        f"({gate}) — not opening a Safari/surf/story errand from the door probe")
+                    return None
                 try:
                     log(f"   [roam] [!] GYM-GATE PROBE: {gate}")
                 except Exception:
@@ -10405,6 +14414,34 @@ class Campaign:
         except Exception as _e:
             log(f"   [roam] gym-gate probe skipped: {_e}")
             return None
+
+    def _retry_gym_door_enter(self, gym, tries=2):
+        """After Cut clears the door tree: walk to a stand tile adjacent to gym.door and enter_warp.
+        Bounded retries. Returns 'warped' on success, else the last enter_warp result / 'stuck'."""
+        door = tuple(gym.door)
+        last = "stuck"
+        for i in range(max(1, int(tries))):
+            try:
+                here = tuple(tv.coords(self.b) or ())
+                grid = tv.Grid(self.b)
+                stands = ((door[0], door[1] + 1), (door[0], door[1] - 1),
+                          (door[0] - 1, door[1]), (door[0] + 1, door[1]))
+                # Prefer the south stand (Vermilion gym door faces south into the street).
+                for stand in stands:
+                    if tv.bfs(grid, here, lambda t, s=stand: t == s, walkable=grid.walkable):
+                        log(f"   [roam] 🚪 post-Cut door approach try {i + 1}/{tries}: "
+                            f"walk stand {stand} → enter {door}")
+                        self.trav.travel(target_map=None, arrive_coord=stand,
+                                         max_steps=200, max_seconds=60)
+                        break
+                last = self.enter_warp(pick=door)
+                log(f"   [roam] 🚪 post-Cut enter_warp({door}) try {i + 1}/{tries} -> {last}")
+                if last == "warped":
+                    return "warped"
+            except Exception as _ee:
+                log(f"   [roam] post-Cut door re-enter try {i + 1} errored: {_ee}")
+                last = "stuck"
+        return last
 
     def _ensure_forward_questline(self, state):
         """PROACTIVE forward drive (ROOT FIX for the backward-grind). Recognise the gate on the FORWARD
@@ -10424,6 +14461,51 @@ class Campaign:
             return
         try:
             cur_map = tuple(state["map"])
+            # BORDER PING-PONG HOLD (2026-08-04): while the breaker's hold covers this map, do NOT
+            # re-open proactive errands from here — a re-opened errand is exactly the controller
+            # that restarts the boundary rhythm. Gates re-arm the moment she's off the thrashed
+            # maps (or the window expires); nothing is forgotten, only deferred.
+            if (time.time() < getattr(self, "_bpp_hold_until", 0)
+                    and cur_map in getattr(self, "_bpp_maps", set())):
+                return
+            # THE VICTORY LAP OWNS THE ERRAND SLOT (2026-08-04): at 8 badges the gym-keyed chain
+            # below is dead (next_gym=None) and the luxury order (tea→bike→flute→fly…) let a
+            # parked FLY errand hog the ONE questline slot from badge 5 all the way to the League
+            # — exactly how the Eevee fetch starved without ever firing. While a lap item is
+            # owed, ITS gate is the errand: arm it here (evicting a mismatched parked luxury,
+            # LOUD) so FIRE-FIRST anchors + ANCHOR-FIRST routing serve the checklist. Earthquake
+            # needs no errand (it teaches in place via the victory_lap pick), and mainland
+            # errands never arm while she's mid-archipelago (the ride-home hook owns those turns).
+            if (VICTORY_LAP_ENABLED and int(state.get("badge_count") or 0) >= 8
+                    and not state.get("post_game")):
+                _lk = self._victory_lap_next(state)
+                # SEVII RIDE-HOME OWNS THE SLOT (2026-08-06 LIVE): bird spent + stranded —
+                # evict Celadon luxuries (eevee/fly/tea…) that stole the ONE questline slot
+                # and early-return so those gates cannot re-arm below. victory_lap drives
+                # _lap_drive_moltres_ride_home (Lostelle + sail); do NOT arm articuno/eevee.
+                if self._lap_sevii_stranded() and self._lap_bird_spent():
+                    _cq = self._active_questline
+                    _miss = getattr(getattr(_cq, "gate", None), "missing", None)
+                    if _cq is not None and _miss not in (None, "moltres"):
+                        self._clear_questline(
+                            f"Sevii ride-home outranks parked '{_miss}' "
+                            f"(cannot Celadon from the archipelago)")
+                    return
+                # earthquake/box_bench/repack need no errand gate — they run in place via the
+                # victory_lap pick (TeachFlow / the Center-PC box flow).
+                if (_lk is not None and _lk not in ("earthquake", "box_bench", "repack")
+                        and not (_lk != "moltres" and self._lap_sevii_stranded())):
+                    _lg = self._lap_gate_for(_lk, state)
+                    _cq = self._active_questline
+                    _cur_miss = getattr(getattr(_cq, "gate", None), "missing", None)
+                    if _lg is not None and _cur_miss != _lg.missing:
+                        if _cq is not None:
+                            self._clear_questline(f"victory lap '{_lk}' outranks the parked "
+                                                  f"'{_cur_miss}' errand")
+                        if self._open_questline(_lg, state):
+                            log(f"   [lap] 🏁 VICTORY LAP arms '{_lk}' — the pre-E4 checklist "
+                                f"owns the errand slot (order: "
+                                f"{' → '.join(VICTORY_LAP_ORDER)})")
             # Already on an errand → re-derive against LIVE RAM so a just-completed step advances or the
             # whole questline self-clears (the gate opened). Keeps the ctx + action-set honest WITHOUT
             # walking a step here (the executor walks it when she picks head_to_gym).
@@ -10434,6 +14516,22 @@ class Campaign:
                 else:
                     self._active_questline = q
                 return
+            # PROACTIVE SILPH LIBERATION — IN-TOWER RESUME (2026-08-04 LIVE, the walk-out Jonny
+            # watched): a crash mid-silph_strike relaunches with her STANDING INSIDE the tower,
+            # but the liberation gate only ever armed at Sabrina's DOOR (beat_gym-stuck ->
+            # eviction), so the resume re-opened the FLY luxury instead and GO-HARD marched her
+            # OUT of Silph, down every climbed floor, to bonk the Rocket-guarded door and re-arm
+            # what she was already holding. If she's inside the tower and Saffron is still
+            # Rocket-held, the strike IS the road — re-arm it right where she stands.
+            if cur_map in {(1, 47 + _i) for _i in range(12)}:
+                _sab = GYMS.get("Sabrina")
+                if _sab is not None:
+                    _pg = self._gym_prereq_gate(_sab)
+                    if _pg is not None and self._open_questline(_pg, state):
+                        log("   [roam] 🏢 PROACTIVE SILPH LIBERATION: resumed INSIDE Silph Co. with "
+                            "Saffron still Rocket-held — re-arming the strike in place (no walk-out, "
+                            "no door bonk, no re-climb from the street)")
+                        return
             # PROACTIVE HM-PREREQ (NS#11, the Blaine/Cinnabar Surf sea-gate): a gym gated behind an HM she must
             # ACQUIRE, where the at-the-door prereq (_gym_prereq_gate via beat_gym-stuck) can NEVER fire — she
             # can't even reach the gym (Cinnabar is across open water she can't yet Surf). Recognize it HERE,
@@ -10503,6 +14601,87 @@ class Campaign:
                         log("   [roam] ⛰️ PROACTIVE EARTH-BADGE: badge 7 done — Giovanni's gym is a sea road "
                             "north; opening the Viridian Gym errand (its own crossing bypasses the nav gap)")
                         return
+            # PROACTIVE SILPH-SCOPE (2026-08-02): next gym is Koga but she has no Scope/Flute —
+            # Fuchsia's road past Lavender is Snorlax-locked. Open the Hideout errand HERE so
+            # head_to_gym drives WEST to Celadon Game Corner instead of pacing Lavender↔Route 8.
+            ng = state.get("next_gym")
+            if ng and ng.get("leader") == "Koga":
+                sg = self._silph_scope_gate()
+                if sg is not None and self._open_questline(sg, state):
+                    log("   [roam] 🔭 PROACTIVE SILPH-SCOPE: no Scope yet — Rocket Hideout under "
+                        "Celadon Game Corner FIRST (Lavender/Route 8 eastbound is a dead loop)")
+                    return
+            # PROACTIVE TEA (2026-08-03, the UGP-hut loop): the badge-6 WAR ROAD unlock — Saffron's
+            # thirsty guards want the Celadon Tea. Fires BEFORE fly/eevee: a story gate on the
+            # forward road outranks luxury detours (and all three share the Celadon anchor anyway,
+            # so tea-first costs zero extra walking).
+            tg = self._tea_gate(state)
+            if tg is not None and self._open_questline(tg, state):
+                log("   [roam] 🍵 PROACTIVE TEA: Koga is done and Saffron's guards are parched — "
+                    "fetching the Celadon old lady's Tea before anything else")
+                return
+            # PROACTIVE FLY-FETCH (2026-08-03): badge 5 banked, HM02 unowned, Cut in hand —
+            # detour to the Route 16 hidden house before the Saffron push. Fly collapses the
+            # endgame's walking (and makes heal-retreats nearly free), so a real player grabs
+            # it the moment Koga falls.
+            fg = self._fly_gate(state)
+            if fg is not None and self._open_questline(fg, state):
+                log("   [roam] 🕊️ PROACTIVE FLY-FETCH: Koga is done and HM02 is a short Celadon "
+                    "detour away — grabbing Fly before the Saffron push")
+                return
+            # PROACTIVE EEVEE-FETCH (2026-08-03, the OP-team pass): badge 4+ and the Condominiums
+            # roof-room gift ball unclaimed — a GUARANTEED Eevee (the team plan's electric slot via
+            # Thunder Stone) in a city she already owns. No story gate ever demands it, so it must
+            # be opened proactively, same as Fly. Fires AFTER the scope/fly blocks: war errands and
+            # endgame mobility outrank a (spectacular) luxury detour.
+            eg = self._eevee_gate(state)
+            if eg is not None and self._open_questline(eg, state):
+                log("   [roam] 🦊 PROACTIVE EEVEE-FETCH: the Celadon Condominiums gift Eevee is "
+                    "unclaimed — climbing the back stairwell for the roof-room ball")
+                return
+            # PROACTIVE EXP-SHARE (2026-08-03): the dex just crossed 50 caught and the Route 15
+            # aide's Exp. Share is unclaimed — the single biggest bench-development item in the
+            # game, a two-floor gatehouse detour from Fuchsia. Gate self-suppresses below the
+            # 50-caught bar (the DEX PUSH strategist doctrine builds toward it instead).
+            xg = self._expshare_gate(state)
+            if xg is not None and self._open_questline(xg, state):
+                log("   [roam] 📈 PROACTIVE EXP-SHARE: 50+ caught and the Route 15 aide is "
+                    "holding my Exp. Share — climbing the west-gate stairs to collect")
+                return
+            # PROACTIVE ICE BEAM (2026-08-04, Jonny's order — 'blastoise ice beam so he has 4
+            # attacks and a really good one'): the moment the full Game-Corner coin budget is
+            # banked (the gate self-suppresses below it — never a farm), detour to Celadon for
+            # TM13 and teach the ace. Fires LAST among the luxuries: war errands, mobility and
+            # the bench engine all outrank a (spectacular) coverage buy.
+            ig = self._icebeam_gate(state)
+            if ig is not None and self._open_questline(ig, state):
+                log("   [roam] ❄️ PROACTIVE ICE BEAM: the coin budget is banked — Celadon Game "
+                    "Corner for TM13, then the ace learns the endgame's best fourth attack")
+                return
+            # MOLTRES RIDE-HOME (2026-08-04 / 2026-08-06): belt for non-lap paths — bird
+            # spent + Sevii-stranded. Victory-lap owns this at 8 badges (early-return above
+            # + _run_victory_lap -> _lap_drive_moltres_ride_home); this catches any other
+            # tick that still reaches here. Never hard-exhaust into free-roam softlock.
+            if (LEGENDARY_HUNTS_ENABLED and self._lap_sevii_stranded()
+                    and self._lap_bird_spent()):
+                self._lap_drive_moltres_ride_home()
+                return
+            # PROACTIVE LEGENDARY HUNTS (2026-08-04, Jonny's order — 'catching mew or mewtwo
+            # as a final endgame project ... all cool legendaries so she mops the floor').
+            # Each gate self-suppresses until its road is open and the balls are stocked;
+            # dead-last among the luxuries — story war errands always outrank a trophy hunt.
+            # Moltres slots between the birds: it arms the tick the Volcano Badge lands
+            # (Bill parked in the Cinnabar PC by blaine_gym's decline) — the natural moment,
+            # Ultras already stocked at the Cinnabar mart.
+            for _hg, _htag in ((self._zapdos_gate, "⚡ ZAPDOS (Power Plant)"),
+                               (self._articuno_gate, "🧊 ARTICUNO (Seafoam B4F)"),
+                               (self._moltres_gate, "🔥 MOLTRES (Mt. Ember, Sevii)"),
+                               (self._mewtwo_gate, "🧬 MEWTWO (Cerulean Cave)")):
+                hg = _hg(state)
+                if hg is not None and self._open_questline(hg, state):
+                    log(f"   [roam] 🏆 PROACTIVE LEGENDARY HUNT: {_htag} is live — "
+                        f"routing the hunt")
+                    return
             # No active errand → is the FORWARD exit a story/HM gate she can't pass yet (the Cerulean
             # Slowbro / S.S.-Ticket story-block, read LIVE)? Recognise it and open the unlock questline so
             # head_to_gym drives THAT and the action-set reframes around it.
@@ -10553,15 +14732,79 @@ class Campaign:
         # walking out of a Mart with an empty ball pocket. Never leave with fewer than 2.
         keeper_due = bool(state) and self._keeper_due(state)
         ball_target = SHOP_BALL_KEEPER_TARGET if keeper_due else SHOP_BALL_TARGET
-        if (self._thin_team() or self._ball_count() < 2 or keeper_due) and self._ball_count() < ball_target:
-            sl.append((ITEM_POKE_BALL, ball_target - self._ball_count()))
-        for status in sorted(self._afflict_seen):
-            cure = STATUS_CURE.get(status)
-            if not cure:
+        # DEX PUSH BALL FLOOR (2026-08-04, the 13/50 Exp. Share bar): the battle engine now
+        # diverts EVERY unowned wild species to a catch (battle_agent dex_push divert), and it
+        # reserves the last ball for shiny/legendary moments — so a 5-ball pocket runs dry in
+        # a couple of grass crossings. While the push is live (badges>=5, aide unpaid, <50
+        # owned), every Mart trip keeps the pocket at 10.
+        _dex_push = False
+        try:
+            _dex_push = ((state or {}).get("badge_count", 0) >= 5
+                         and not fm.read_flag(self.b, 0x256)
+                         and (self.pokedex_count() or 99) < 50)
+        except Exception:
+            pass
+        if _dex_push:
+            ball_target = max(ball_target, 10)
+        # BALL-TIER SHELF FALLBACK (2026-08-04 LIVE, the Fuchsia zero-ball trip): Fuchsia's Mart
+        # sells Ultra(2)/Great(3) but NO plain Poké Ball(4) — the list billed (4, n), buy_at_mart
+        # logged "Poké Ball not sold here — skipping" then "shopping done — {}", and she walked
+        # out with ZERO balls mid dex-push. Mirror _best_potion_for_sale: buy the cheapest ball
+        # tier ON THIS SHELF (Poké > Great > Ultra; any tier throws fine — _item_count is already
+        # balls-pocket-aware for ids 1-12, so the per-unit bag-delta verify holds). "Have" counts
+        # ALL throwable tiers (2/3/4 — Master Ball 1 excluded, it's the reserved legendary shot),
+        # same reasoning as the all-tier potion count above; otherwise a Great-Ball restock is
+        # invisible to the id-4-only _ball_count and every future trip re-buys the full target.
+        _balls_have = sum(self._balls_pocket_count(i) for i in (2, 3, 4))
+        if (self._thin_team() or _balls_have < 2 or keeper_due or _dex_push) \
+                and _balls_have < ball_target:
+            _shelf = MART_STOCK.get(tv.map_id(self.b), [])
+            _ball_id = next((i for i in (4, 3, 2) if i in _shelf), ITEM_POKE_BALL)
+            sl.append((_ball_id, ball_target - _balls_have))
+        # LEGENDARY ULTRA STOCK (2026-08-04, Jonny's order — 'all cool legendaries so she mops
+        # the floor'): while any hunt is still PENDING (encounter alive + its road plausibly
+        # open), keep 8+ ULTRA Balls specifically — catch rate 3 makes plain Poké Balls theater
+        # (a 2x Ultra is the difference between a catch and a drained pocket). Only where the
+        # shelf actually sells them (Ultras appear in the badge-5+ marts she's shopping anyway).
+        if LEGENDARY_HUNTS_ENABLED:
+            try:
+                _pc = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+                _hunt_pending = (
+                    st.party_knows_move(self.b, 57, _pc) is not None    # Surf = a road is open
+                    and any(ram.pokedex_owns(self.b, sp) is not True
+                            and not fm.read_flag(self.b, fought)
+                            for sp, fought in ((145, 0x2BF), (144, 0x2BE),
+                                               (146, 0x2BD), (150, 0x2BC))))
+                _ultras = self._balls_pocket_count(2)
+                if (_hunt_pending and _ultras < HUNT_ULTRA_TARGET
+                        and 2 in MART_STOCK.get(tv.map_id(self.b), [])):
+                    sl.append((2, HUNT_ULTRA_TARGET - _ultras))
+            except Exception:
+                pass
+        # Afflictions she's felt on the road + KB foresight for the NEXT gym (Surge Parlyz
+        # Heal before Thunder Wave ever lands — 2026-08-02 Bulbapedia kit). Prefer the
+        # specific cure on this Mart's shelf; Full Heal if that's all they sell.
+        _want = set(self._afflict_seen)
+        _kb_cures = set()
+        try:
+            _ng = (state or {}).get("next_gym") if state else None
+            if _ng and _ng.get("leader"):
+                _kb_cures = set(self._kb_bring_cures(_ng["leader"]))
+                _want |= _kb_cures
+        except Exception:
+            pass
+        _city = tv.map_id(self.b)
+        for status in sorted(_want):
+            if status not in STATUS_CURE:
                 continue
-            need = SHOP_CURE_QTY - self.bag_count(cure[0])
-            if need > 0:
-                sl.append((cure[0], need))
+            target = GYM_CURE_TARGET if status in _kb_cures else SHOP_CURE_QTY
+            have = self._status_cure_have(status)
+            if have >= target:
+                continue
+            iid = self._cure_item_on_shelf(status, _city)
+            if iid is None:
+                continue
+            sl.append((iid, target - have))
         return sl
 
     def _best_potion_for_sale(self):
@@ -10589,8 +14832,26 @@ class Campaign:
         pick reads as learning from the road ('paralysis cost me that fight — grabbing Parlyz Heals').
         FORESIGHT (Phase 2): when she's walled, lead with 'stock up BEFORE you push that wall'."""
         target = SHOP_POTION_FORESIGHT if foresight else SHOP_POTION_TARGET
-        cures = [STATUS_CURE[s][1] for s in sorted(self._afflict_seen) if s in STATUS_CURE
-                 and self.bag_count(STATUS_CURE[s][0]) < SHOP_CURE_QTY]
+        _want_shop = set(self._afflict_seen)
+        _ng_note = None
+        try:
+            _ng_note = (state or {}).get("next_gym") if state else None
+            if _ng_note and _ng_note.get("leader"):
+                _want_shop |= set(self._kb_bring_cures(_ng_note["leader"]))
+        except Exception:
+            pass
+        cures = []
+        for s in sorted(_want_shop):
+            if s not in STATUS_CURE:
+                continue
+            if self._status_cure_have(s) >= (
+                    GYM_CURE_TARGET if _ng_note and s in set(
+                        self._kb_bring_cures(_ng_note.get("leader") or ""))
+                    else SHOP_CURE_QTY):
+                continue
+            if self._cure_item_on_shelf(s) is None:
+                continue
+            cures.append(STATUS_CURE[s][1])
         bits = []
         if sum(self.bag_count(i) for i in (ITEM_POTION, 22, 21, 20, 19)) < target:
             bits.append("you're low on Potions" if not foresight
@@ -10604,8 +14865,19 @@ class Campaign:
                         "teammate your plan wants" if keeper_due else
                         "you're light on Poké Balls — grab some so you can actually catch a teammate out there")
         if cures:
-            afflicts = ", ".join(sorted(self._afflict_seen & set(STATUS_CURE)))
-            bits.append(f"{afflicts} has been hurting you — {', '.join(cures)} would help")
+            _kb = set()
+            try:
+                if _ng_note and _ng_note.get("leader"):
+                    _kb = set(self._kb_bring_cures(_ng_note["leader"]))
+            except Exception:
+                pass
+            if _kb & _want_shop:
+                bits.append(
+                    f"{_ng_note['leader']} locks people with status — grab "
+                    f"{', '.join(cures)} before you walk into that gym")
+            else:
+                afflicts = ", ".join(sorted(self._afflict_seen & set(STATUS_CURE)))
+                bits.append(f"{afflicts} has been hurting you — {', '.join(cures)} would help")
         if not bits:
             return ""
         head = ("There's a Mart right here, and you've got the money. " if foresight
@@ -10743,12 +15015,24 @@ class Campaign:
             try:
                 nm = self._soul_choose("name", {}, {"place":
                     f"you just caught a {name}" + (f" {where}" if where else "") + "! a brand-new member "
-                    f"of your team — a teammate, family. give this {name} a name, just the name."})
+                    f"of your team — a teammate, family. give this {name} a name, just the name "
+                    f"(ten letters or fewer)."})
                 if nm:
-                    nick = nm.strip().split("\n")[0][:12] or name
+                    # cap at 10 = the Gen-3 in-game nickname limit, so her mental name and the name
+                    # ON THE CARTRIDGE are the same string (2026-07-30, Jonny live report: she'd
+                    # announce 'Noodle' while the game kept SPEAROW)
+                    nick = nm.strip().split("\n")[0][:10] or name
             except Exception as _e:
                 log(f"   [soul] catch-naming skipped: {_e}")
             log(f"   [soul] note_caught FIRE -> species={name} nickname={nick} where={where}")
+            if nick.lower() != name.lower():
+                # MAKE IT REAL: write the nickname into the new mon's party struct (plaintext header
+                # field, decode-verified) so the HUD, battle text, and her commentary all agree.
+                committed = self._write_nickname(cnt - 1, nick)
+                if committed:
+                    nick = committed
+                else:
+                    log(f"   [soul] nickname {nick!r} did not commit in-game — bond keeps it mentally")
             self.soul.note_caught(name, nick, where)        # records bond (name + opinion) + emits via seam
             if nick.lower() != name.lower():
                 self.on_event(f"welcome to the family, {nick}. you're one of us now.", kind="roster", tier=3)
@@ -10812,7 +15096,12 @@ class Campaign:
         if self._oracle_choose is None:
             log("   [soul] ORACLE unwired (headless/no bot) -> None")
             return None
-        pick = self._oracle_choose(kind, options, ctx)
+        # THE REFLEX/BRAIN FIREWALL (2026-07-30): every oracle call runs inside a watchdog hold —
+        # "thinking" is a declared state, so a 3-12s LLM round-trip can never read as "wedged"
+        # (the false-self-heal / false-wedge-mark / aborted-conversation cascade). ONE chokepoint:
+        # every decision kind (action/want/name/catch_judgment/move_drop/...) flows through here.
+        with self.watchdog_hold(f"oracle:{kind}"):
+            pick = self._oracle_choose(kind, options, ctx)
         if pick and kind != "want" and opts and pick not in opts:
             log(f"   [soul] ORACLE pick {pick!r} NOT in offered options {opts} -> REJECTED (fall back)")
             return None
@@ -10968,7 +15257,8 @@ class Campaign:
         def gated(m):
             return self.strat.is_gated(m, pcount, plevel)
         dead = (getattr(self, "_grind_dead", set())        # maps grind() proved grassless/strand-only
-                | getattr(self, "_grind_inadequate_set", set()))   # + level-aware inadequate (empty if flag off)
+                | getattr(self, "_grind_inadequate_set", set())   # + level-aware inadequate (empty if flag off)
+                | getattr(self, "_seam_nogo", set()))      # + seam-breaker session bans (border war)
         def has_grass(m):
             return ((m in self._grass_maps or self._is_route_map(m))
                     and m != cur and tuple(m) not in dead)
@@ -10991,12 +15281,36 @@ class Campaign:
                 seen.add(nbr); q.append((nbr, first_edge))
         return None
 
+    def _forward_objective_map(self, state):
+        """The map FORWARD progress currently points at: the active questline step's anchor (the
+        errand IS the road — Bill before the S.S. Anne) else the next gym's city. None when neither
+        resolves (post-game / no data) — callers treat that as 'no forward read', never a wall."""
+        try:
+            q = getattr(self, "_active_questline", None)
+            if q is not None and q.actionable is not None:
+                step = q.actionable
+                if getattr(step, "from_map", None):
+                    return tuple(int(x) for x in str(step.from_map).split(","))
+                w = tuple(q.gate.where or ())
+                if w:
+                    return w
+        except Exception:
+            pass
+        try:
+            return self._next_gym_city_map(state.get("next_gym"))
+        except Exception:
+            return None
+
     def _grass_target(self, state):
         """Where she can HONESTLY hunt: ('here', tile) if reachable on this map, else ('route', (g,n),
         edge) for grass she can reach WITHOUT crossing the gated wall — an ungated adjacent route first,
         else (Phase 2) the nearest grass BEHIND her via the learned graph, else the gated route as a last
         resort (so _route_action surfaces the wall rather than silently offering a phantom hunt).
-        catch_one re-verifies grass on arrival (no_grass backstop) so a wrong guess never freezes."""
+        catch_one re-verifies grass on arrival (no_grass backstop) so a wrong guess never freezes.
+        FORWARD-GRASS BIAS (2026-07-31, Jonny debrief — the post-Misty Route-4 park): candidates that
+        also get her CLOSER to the next objective (live questline anchor, else the next gym city) are
+        tried FIRST; backward/cleared grass stays as the FALLBACK only (anti-park: the only reachable
+        grass is never abandoned)."""
         tile = self._reachable_grass()
         # GRIND-SPOT LEVEL AWARENESS (NS#5 lever a): if grind() marked THIS map grind-inadequate (only
         # done when a reachable higher-level spot exists), don't short-circuit on grass-underfoot — fall
@@ -11011,24 +15325,81 @@ class Campaign:
         # walks back to Route 4 / Mt Moon that she's already cleared, instead of blindly routing onto
         # the unvisited route across Gary's bridge (which the old live-connection scan below would pick).
         unreach = getattr(self, "_grass_unreach", set())   # koga_run3: (from-map, target) travel fails
+        # FORWARD-GRASS BIAS scaffolding: the objective + her own distance to it, computed once.
+        # _grass_fwd(dst) = grinding at dst is ALSO progress (dst is strictly closer to the objective).
+        _obj = self._forward_objective_map(state)
+        _cur_d = None
+        try:
+            if _obj:
+                _r0 = self.world.route(tuple(state["map"]), _obj, self._wall_avoid(state))
+                _cur_d = (len(_r0) - 1) if _r0 else None
+        except Exception:
+            _cur_d = None
+        # BILLED-ROAD FALLBACK (2026-07-31, the LIVE post-Misty Route-4 relapse): the strictly-closer
+        # read above needs the LEARNED graph to route all the way to the objective — but the next gym
+        # city is usually UNVISITED (that's why it's next), so _cur_d is None, every candidate ties as
+        # "not forward", and nearest-first quietly returns the backward map again. When distances can't
+        # be computed, forwardness = membership in the KB's billed road to the next gym (+ the objective
+        # itself): grinding ON the road forward is march-training; everything off it is backward.
+        _fwd_set = set()
+        try:
+            for _leg in (self._gym_road(state.get("next_gym")) or []):
+                _fwd_set.add(tuple(_leg["map"]))
+            _gc = self._next_gym_city_map(state.get("next_gym"))
+            if _gc:
+                _fwd_set.add(tuple(_gc))
+        except Exception:
+            pass
+        if _obj:
+            _fwd_set.add(tuple(_obj))
+        _fwd_set.discard(tuple(state.get("map") or ()))    # "here" is not a forward TARGET
+
+        def _grass_fwd(dst):
+            if _cur_d is None:
+                return tuple(dst) in _fwd_set
+            try:
+                _r = self.world.route(tuple(dst), _obj, self._wall_avoid(state))
+                if _r:
+                    return (len(_r) - 1) < _cur_d
+            except Exception:
+                pass
+            return tuple(dst) in _fwd_set
+        # SURGE CITY STAY (2026-08-01 live): at Vermilion with next gym Lt. Surge, Route 6 and the
+        # Underground Path are BEHIND her for this objective — never offer them as grass/FORWARD
+        # grind targets (they fed the cut→surf-questline→Route-6 exile loop).
+        _surge_city_stay = (
+            tuple(state.get("map") or ()) == VERMILION
+            and (state.get("next_gym") or {}).get("leader") == "Lt. Surge")
+        _SURGE_BACK_GRASS = {(3, 24)} | {(1, n) for n in range(30, 36)}  # Route 6 + UGP
         try:
             cur = tuple(state["map"])
             avoid = self._wall_avoid(state)
             known = self.world.reachable_with_trait(cur, "has_grass", avoid)
             _dead = (getattr(self, "_grind_dead", set())   # maps grind() proved grassless/strand-only
-                     | getattr(self, "_grind_inadequate_set", set()))  # + inadequate (empty if flag off)
-            for _entry in (known or []):                   # try EVERY known grass, not just the nearest
+                     | getattr(self, "_grind_inadequate_set", set())  # + inadequate (empty if flag off)
+                     | getattr(self, "_seam_nogo", set()))  # + seam-breaker session bans (border war)
+            # FORWARD FIRST (stable: within each class the trait scan's own nearest-first order holds):
+            # the post-Misty pick becomes Route 5/24 (toward Vermilion / Bill), NOT the cleared Route 4.
+            for _entry in sorted(known or [], key=lambda e: 0 if _grass_fwd(e[0]) else 1):
                 dst = _entry[0]                            # entries are (dst, ...) — width varies
                 if tuple(dst) in _dead:
                     continue                               # visited trait says grass; grind says dead
+                if _surge_city_stay and tuple(dst) in _SURGE_BACK_GRASS:
+                    continue
                 hop = self.world.next_hop(cur, dst, avoid)
                 if not hop:
                     continue
                 nxt, edge = hop
                 if (cur, tuple(nxt)) in unreach:
                     continue                               # this hop already failed from here — next
+                if _surge_city_stay and (tuple(nxt) in _SURGE_BACK_GRASS
+                                         or tuple(dst) in _SURGE_BACK_GRASS):
+                    log(f"   [roam] !! SURGE-STAY: refusing grass hop {nxt}->{dst} "
+                        f"(Route 6/UGP are behind — gym door is HERE)")
+                    continue
                 log(f"   [roam] grass she KNOWS: routing {edge} -> {nxt} toward {self.world.name(dst)} "
-                    f"(visited grass, avoiding any wall)")
+                    f"({'FORWARD — on the road to the objective' if _grass_fwd(dst) else 'backward — no forward grass reachable'}, "
+                    f"visited grass, avoiding any wall)")
                 return ("route", nxt, edge)
         except Exception as _gt:
             log(f"   [roam] world grass-target skipped: {_gt}")
@@ -11038,9 +15409,13 @@ class Campaign:
         # wall. Adjacent ungated route wins (this already includes grass directly behind her).
         cur = tuple(state["map"])
         _dead = (getattr(self, "_grind_dead", set())       # proven-grassless maps aren't candidates
-                 | getattr(self, "_grind_inadequate_set", set()))  # + inadequate (empty if flag off)
+                 | getattr(self, "_grind_inadequate_set", set())  # + inadequate (empty if flag off)
+                 | getattr(self, "_seam_nogo", set()))     # + seam-breaker session bans (border war)
         non_gated = [(d, m) for d, m in routes if not self.strat.is_gated(m, pcount, plevel)
-                     and (cur, tuple(m)) not in unreach and tuple(m) not in _dead]
+                     and (cur, tuple(m)) not in unreach and tuple(m) not in _dead
+                     and not (_surge_city_stay and tuple(m) in _SURGE_BACK_GRASS)]
+        # FORWARD FIRST here too (the adjacent-route sibling of the known-grass loop above).
+        non_gated.sort(key=lambda dm: 0 if _grass_fwd(dm[1]) else 1)
         if non_gated:
             d, m = non_gated[0]
             return ("route", m, self._EDGE[d])
@@ -11049,14 +15424,19 @@ class Campaign:
         hop = self._grass_via_graph(state)
         if hop is not None:
             nxt, edge = hop
-            log(f"   [roam] grass-behind-the-wall: routing one hop {edge} -> {nxt} toward known/likely grass "
-                f"(avoiding the gated route)")
-            return ("route", nxt, edge)
+            if _surge_city_stay and tuple(nxt) in _SURGE_BACK_GRASS:
+                log(f"   [roam] !! SURGE-STAY: refusing grass-behind hop {nxt} "
+                    f"(Route 6/UGP are behind — gym door is HERE)")
+            else:
+                log(f"   [roam] grass-behind-the-wall: routing one hop {edge} -> {nxt} toward known/likely grass "
+                    f"(avoiding the gated route)")
+                return ("route", nxt, edge)
         # Truly only the gated route exists -> surface it; _route_action's gate tells her it's blocked.
         # (koga_run5: the last resort must ALSO honor the fail/dead memories — returning a proven
         # no-route hop here re-created the exact spin the memories exist to kill.)
         _last = [(d, m) for d, m in routes
-                 if (cur, tuple(m)) not in unreach and tuple(m) not in _dead]
+                 if (cur, tuple(m)) not in unreach and tuple(m) not in _dead
+                 and not (_surge_city_stay and tuple(m) in _SURGE_BACK_GRASS)]
         if _last:
             d, m = _last[0]
             return ("route", m, self._EDGE[d])
@@ -11125,6 +15505,87 @@ class Campaign:
             return "arrived"
         return "hop_ok"
 
+    def _border_pingpong_tick(self, fp):
+        """BORDER PING-PONG BREAKER (2026-08-04 deep dive — 'this is the last time I'm gonna ask').
+        The loop CLASS behind the Route-8/UGP saga (and Route 12↔Lavender before it): two steering
+        layers disagree at a map boundary and she crosses the same borders forever, each crossing
+        reading as 'progress' (MOVED) to every per-tick guard. The tell is unfakeable at the MACRO
+        level: many border crossings among FEW maps with ZERO world change — no XP, no money, no
+        item, no flag, no HP delta. No legitimate play looks like that: real treks cross DISTINCT
+        maps; grinding/shopping/healing all move the world signature (which RESETS the window).
+
+        Detection: sample the tick-top map; count transitions while the non-position world
+        signature (badges/money/party/bag) holds still. 12 transitions among <=5 maps with any map
+        revisited 3+ times -> latch. Response (bounded, escalating): clear the errand (fresh
+        re-derive), forget the thrashed maps' 'proven' connectors + passthrough history (stale
+        connector memory is a known poison), and HOLD head_to_gym/head_to_league off the menu on
+        those maps (2 min; 5 min on a repeat strike within 15 min) — the never-empty floor
+        guarantees regroup, so the rhythm breaks instead of restarting. The F-1 tripwire can't
+        bypass the hold (it only forces picks still IN the offered set)."""
+        if fp is None:
+            return
+        try:
+            wsig = (fp.badges, fp.money,
+                    zlib.crc32(repr(fp.party).encode()) & 0xFFFFFFFF,
+                    zlib.crc32(repr(fp.bag).encode()) & 0xFFFFFFFF)
+        except Exception:
+            return
+        if wsig != getattr(self, "_bpp_wsig", None):
+            self._bpp_wsig = wsig
+            self._bpp_hist = []
+            return
+        hist = getattr(self, "_bpp_hist", None)
+        if hist is None:
+            hist = self._bpp_hist = []
+        m = tuple(fp.map_id)
+        if hist and hist[-1] == m:
+            return                                   # same map as last sample — no transition
+        hist.append(m)
+        if len(hist) > 12:
+            del hist[0]
+        if len(hist) < 12:
+            return
+        distinct = set(hist)
+        if len(distinct) > 5 or max(hist.count(x) for x in distinct) < 3:
+            return
+        now = time.time()
+        self._bpp_strikes = (getattr(self, "_bpp_strikes", 0) + 1
+                             if now < getattr(self, "_bpp_strike_until", 0) else 1)
+        self._bpp_strike_until = now + 900
+        hold = 300 if self._bpp_strikes >= 2 else 120
+        self._bpp_hold_until = now + hold
+        self._bpp_maps = set(distinct)
+        self._bpp_hist = []
+        log(f"   [roam] !!!! BORDER PING-PONG BREAKER (strike {self._bpp_strikes}): 12 border "
+            f"crossings among {sorted(distinct)} with ZERO world progress — clearing the errand, "
+            f"forgetting 'proven' connectors on these maps, holding head_to_gym off them for "
+            f"{hold}s LOUD")
+        self.on_event("okay, stop — I've been pacing the same doors like a lost tourist. deep "
+                      "breath. new plan from the top.", kind="route", tier=2)
+        # ROAD-BLOCKER ERRANDS SURVIVE THE BREAKER (2026-08-04 LIVE, the Route 19 surf wedge):
+        # clearing a road-blocker questline here is self-defeating — the proactive recognizer
+        # re-opens it next tick (the gate flag is still unset), so "clear -> re-open -> park ->
+        # thrash -> breaker clears again" was half of the 30-min Fuchsia<->Route19 loop. The
+        # breaker's real levers (connector amnesia + the head_to_gym HOLD) still fire below;
+        # only the errand slot is spared, and only for the ON-ROAD class GO-HARD waives anyway.
+        try:
+            _ql = self._active_questline
+            _rb = _ql is not None and (
+                getattr(_ql.gate, "missing", None) in ROAD_BLOCKER_KEYS
+                or getattr(getattr(_ql, "actionable", None), "missing", None)
+                in ROAD_BLOCKER_KEYS)
+            if _rb:
+                log("   [roam] BPP: active errand is a ROAD-BLOCKER "
+                    f"('{getattr(_ql.gate, 'missing', None)}') — KEEPING it (clearing just "
+                    "re-opens it next tick; the hold + connector amnesia still apply)")
+            else:
+                self._clear_questline("border ping-pong breaker")
+        except Exception:
+            pass
+        for _m in distinct:
+            getattr(self, "_pt_known", {}).pop(_m, None)
+            getattr(self, "_pt_tried", {}).pop(_m, None)
+
     def _available_actions(self, state):
         """HONEST per-tick action set — only actions that actually DO something here (no phantom/no-op).
         head_to_gym always (progress exists); heal only if hurt; wander_catch/battle only if huntable
@@ -11169,7 +15630,22 @@ class Campaign:
         # endgame-aware chooser) rides it because its ctx names the League as the one thing left.
         elif int(state.get("badge_count", 0)) >= 8 and not state.get("post_game"):
             _emp = tuple(state.get("map") or ())
-            if _emp != ENDGAME_INDIGO and VICTORY_ROAD_ENABLED:
+            # THE VICTORY LAP HOLDS THE LEAGUE DOOR (2026-08-04): while a pre-E4 checklist item
+            # is owed (Earthquake → Moltres → Articuno → Eevee → Zapdos, each done-or-honestly-
+            # skipped), head_to_league/enter_league are OFF the menu and 'victory_lap' is the
+            # endgame action — the lap's order lives in code, not in the oracle's mood.
+            _lap_key = self._victory_lap_next(state)
+            if _lap_key is not None:
+                a["victory_lap"] = (
+                    f"the VICTORY LAP — all 8 badges are banked and the League can wait one "
+                    f"beat: '{_lap_key}' is next on the pre-E4 checklist (Earthquake on the ace, "
+                    f"bench the low-level passengers at the PC so the birds get party seats, "
+                    f"then Moltres, Articuno, the promised Eevee, Zapdos, repack the party — "
+                    f"in that order). Finish the lap, THEN storm the Elite Four with the team "
+                    f"of a lifetime.")
+                log(f"   [lap] checklist owes '{_lap_key}' — victory_lap is the endgame action "
+                    f"(head_to_league/enter_league held until the lap clears)")
+            elif _emp != ENDGAME_INDIGO and VICTORY_ROAD_ENABLED:
                 a["head_to_league"] = ("all 8 badges are yours — no gyms left. The road to the Pokémon League "
                                        "is open: through Viridian, past your rival on Route 22, up Route 23 and "
                                        "the Victory Road cave to the Indigo Plateau. THIS is the way forward now.")
@@ -11201,6 +15677,15 @@ class Campaign:
         _heal_dead = tuple(state.get("map") or ()) in getattr(self, "_heal_dead_maps", set())
         if (self.needs_heal() or sev == "hurt") and not _heal_dead:
             a["heal"] = "go to a Pokemon Center and heal the team up"
+        # BAG-TM TEACH offer: a useful single-use TM in the case + a neediest compatible mon
+        # (Abra with only Teleport, plan teach targets). She picks it like a human opening the case.
+        if BAG_TM_TEACH_ENABLED:
+            try:
+                if self._plan_bag_tm_teach() is not None:
+                    a["teach_tm"] = ("teach a TM from your case onto a teammate who needs it — "
+                                     "empty offense or a coverage hole you've been sitting on")
+            except Exception as _pte:
+                log(f"   [roam] bag-TM plan skipped: {_pte}")
         # PP DEPLETION (Phase 4) — a Center restores PP, not just HP. When the lead can barely act
         # (≤1 move with PP left) she can neither weaken-to-catch nor fight safely — the depleted spiral
         # that froze her vs Mankey + burned her balls. Offer heal even at full HP so she tops up first.
@@ -11235,6 +15720,41 @@ class Campaign:
             # reasoning to her decision/voice ctx — fixing the half-wire where the display said "train the
             # team" but the action trained the ace. Fires on the FIRST loss already (foe level is known).
             prep_t = self._prep_team_target(state)
+            # CREATOR ORDER (2026-07-31, LAW): Jonny spoke a direct order — every strengthen-first
+            # instinct stands down so the ordered action wins the menu. Chat never sets this.
+            if prep_t is not None and self._creator_order(state):
+                log("   [roam] !! CREATOR ORDER (LAW): the strengthen-first prep stands down — "
+                    "Jonny said go, so she goes")
+                prep_t = None
+            # GYM-DOMINANT STAND-DOWN (2026-07-31 human-pacing tune, Jonny: 'she just caught an L8
+            # Caterpie and now she's parking to grind the whole bench to 14 before a gym her L27
+            # Wartortle flattens'). While the top mon clearly overpowers the next gym, the PARKED
+            # prep (this framing + the lopsided-bench march prune downstream, both keyed on prep_t)
+            # steps aside; the bench still levels on the MARCH via road-bench-XP (which reads
+            # _prep_team_target independently). A real player trains the bench en route, not in a
+            # stationary montage in front of a gym they can already beat.
+            if prep_t is not None and self._gym_dominant(state):
+                if getattr(self, "_dom_standdown_logged", None) != state.get("badge_count"):
+                    self._dom_standdown_logged = state.get("badge_count")
+                    log(f"   [roam] GYM-DOMINANT: prep-to-L{prep_t} stands down — the ace overpowers "
+                        f"the next gym; the bench levels on the march (road-bench-XP), not parked")
+                    self.on_event("the little ones are a bit behind, but honestly? my ace can carry "
+                                  "this next gym. they'll train on the way — we're not stopping.",
+                                  kind="grind", tier=1)
+                prep_t = None
+            # ACE-CARRIES STAND-DOWN (2026-08-02 Celadon chalk): Blastoise already at/above Erika's
+            # level bar but paper bench blocks "dominant" — same park as Misty chalk. Mute STRENGTHEN
+            # FIRST framing; pin stays live for road-bench-XP on the Celadon march. GO HARD below
+            # also forces head_to_gym + prunes battle.
+            if prep_t is not None and self._ace_carries_next_gym(state):
+                if getattr(self, "_ace_carry_standdown_logged", None) != state.get("badge_count"):
+                    self._ace_carry_standdown_logged = state.get("badge_count")
+                    log(f"   [roam] ACE-CARRIES: prep-to-L{prep_t} stands down — ace clears the next "
+                        f"gym's level bar; MARCH (bench XP on the road), not parked Route grass")
+                    self.on_event("bench is thin, but my ace already clears the next gym's level — "
+                                  "we're marching; they'll catch XP on the road.",
+                                  kind="grind", tier=1)
+                prep_t = None
             if prep_t is not None:
                 if not battle_agent.GRIND_SWITCH_ENABLED:
                     # ACE-OVERPOWER framing — level the strong lead to bulldoze the wall.
@@ -11292,9 +15812,35 @@ class Campaign:
             # voltorb hunt would have wandered ball-less forever). Mart-first when the pocket is empty.
             _traits = (("has_mart", "has_grass") if self._ball_count() == 0
                        else ("has_grass", "has_mart"))
+            # XP-AWARE GRASS OFFERS (2026-07-29, the Route-3 baby-grass farm): never OFFER travel to
+            # grass already proven grind-dead/inadequate (she'd ride there, stand down, and bounce),
+            # and when a genuinely stronger reachable spot exists, name it with the XP framing so
+            # "train where it counts" beats "grind the weak grass I'm standing near". Distance-ranked
+            # options otherwise unchanged; she still chooses.
+            _skip_grass = (getattr(self, "_grind_dead", set())
+                           | getattr(self, "_grind_inadequate_set", set())
+                           | getattr(self, "_seam_nogo", set()))  # seam-breaker bans: never OFFER the
+            #                                                       backward side of a broken border
             for mid, nm, why in self.world.travel_targets(cur, avoid=tavoid, want_traits=_traits)[:4]:
+                if tuple(mid) in _skip_grass:
+                    continue
                 verb = "fly to" if (can_fly and self.world.is_town(mid)) else "head back to"
                 a[f"travel:{mid[0]},{mid[1]}"] = f"{verb} {nm} — {why}"
+            if GRIND_SPOT_LEVELAWARE:
+                try:
+                    _bc = state.get("badge_count", 0)
+                    self.team_planner.ensure_plan(state.get("party") or [], _bc)
+                    _mtarget = self.team_planner._next_milestone(_bc, bool(state.get("post_game")))[1]
+                    if _mtarget and self._grind_inadequate(cur, _mtarget):
+                        _best = self._better_grind_spot(state, _mtarget)
+                        if _best and f"travel:{_best[0]},{_best[1]}" not in a:
+                            _hi = self._grind_wild_band(tuple(_best))[1]
+                            a[f"travel:{_best[0]},{_best[1]}"] = (
+                                f"TRAIN WHERE IT COUNTS — the wild Pokémon around "
+                                f"{self.world.name(tuple(_best))} run ~L{_hi}; the grass here is too "
+                                f"weak to level you toward L{_mtarget}. Real XP is a short walk away.")
+                except Exception as _gx:
+                    log(f"   [roam] xp-aware grass offer skipped: {_gx}")
         except Exception as _ta:
             log(f"   [roam] travel-options skipped: {_ta}")
         # ── STRATEGIC-STUCK FLOOR (the Gary death-loop killer) — the TEETH ─────────────────────────
@@ -11329,6 +15875,147 @@ class Campaign:
                             f"strengthen options only: {strengthen}")
             except Exception as _ss:
                 log(f"   [roam] strategic-stuck pruning skipped: {_ss}")
+            # ── GYM-READINESS FLOOR (2026-07-29, the Misty solo-Wartortle wall) ──────────────────
+            # PROACTIVE teeth: readiness is knowable BEFORE the wall — the KB says what the gym
+            # demands (party size + level band). Hard-unready (team too thin OR top level under the
+            # bar) + a real strengthen path here -> prune head_to_gym, exactly like strategic-stuck
+            # (she still CHOOSES how to strengthen). The type-answer measure stays SOFT
+            # (prep_for_gym's job at the door) so a fresh low-level catch never hard-locks the gym
+            # behind an answer-grind. If NO strengthen option is reachable, head_to_gym is KEPT
+            # (never dead-end her). Runs BEFORE the READINESS→GO reframe: once she crosses the bar,
+            # this block passes and the forward pull takes over as before.
+            # POST-BADGE BEAT window (armed by the badge branch of _route_action, 2026-07-31 Jonny
+            # debrief): right after a win the beat is heal + stock + MARCH — never park in grass.
+            # The badge raised the milestone, which re-arms the bench pin and lets the NEW gym's
+            # readiness floor prune head_to_gym on the very next tick — that's exactly what sent
+            # her backward to Route 4 after Misty. While the window is live: grass-parking picks
+            # are pruned, head_to_gym is reframed as the move-on pull, and the floor below SPARES
+            # it. Self-clears in a few builds or the moment she leaves the conquered city; the
+            # road-bench-XP march + the forward-grass bias in _grass_target own training after.
+            _pb_live = False
+            try:
+                _pb = getattr(self, "_post_badge_ticks", 0)
+                if _pb > 0:
+                    if tuple(state.get("map") or ()) != getattr(self, "_post_badge_city", None):
+                        self._post_badge_ticks = 0        # she's marching — the beat did its job
+                        log("   [roam] 🏁 POST-BADGE BEAT released (left the conquered city — "
+                            "the march owns training now)")
+                    else:
+                        self._post_badge_ticks = _pb - 1
+                        _pb_live = True
+                        _prn_pb = [k for k in ("wander_catch", "battle") if a.pop(k, None) is not None]
+                        _ngb = state.get("next_gym") or {}
+                        if "head_to_gym" in a:
+                            a["head_to_gym"] = (
+                                f"BADGE WON — the beat now is: heal up if you're hurt, stock up at "
+                                f"the Mart if supplies are thin, and MOVE ON toward "
+                                f"{_ngb.get('city', 'the next objective')}. The team trains on the "
+                                f"road forward, never in grass you've already cleared.")
+                        log(f"   [roam] 🏁 POST-BADGE BEAT ({self._post_badge_ticks} builds left): "
+                            f"pruned grass-parking {_prn_pb}; heal/stock/march only")
+            except Exception as _pbx:
+                log(f"   [roam] post-badge beat skipped: {_pbx}")
+            # ── SEAM-COMMIT window (2026-07-31): the seam-thrash breaker fired — for the next few
+            # builds head_to_gym is the FORCED pick and every grass/detour option is off the menu,
+            # so the two feuding choosers physically cannot re-open the ping-pong. DECISION
+            # HYSTERESIS in its bluntest form: the commitment persists across builds, it is not
+            # re-evaluated at the border every tick.
+            _seam_live = False
+            try:
+                _sc = getattr(self, "_seam_commit_ticks", 0)
+                if _sc > 0:
+                    self._seam_commit_ticks = _sc - 1
+                    _seam_live = True
+                    _prn_sc = [k for k in list(a)
+                               if k in ("wander_catch", "battle", "fetch_keeper")
+                               or k.startswith("travel:")]
+                    for k in _prn_sc:
+                        a.pop(k, None)
+                    _ngsc = state.get("next_gym") or {}
+                    a["head_to_gym"] = (
+                        f"COMMIT — you were pacing the same border back and forth. The move is "
+                        f"FORWARD, one direction, no second-guessing: toward "
+                        f"{_ngsc.get('city', 'the next objective')} and the "
+                        f"{_ngsc.get('leader', 'next')} badge.")
+                    self._force_gym_pick = True
+                    log(f"   [roam] !! SEAM-COMMIT ({self._seam_commit_ticks} builds left): forced "
+                        f"head_to_gym, pruned {sorted(_prn_sc)} — the border war is OVER")
+            except Exception as _scx:
+                log(f"   [roam] seam-commit skipped: {_scx}")
+            if GYM_READINESS_FLOOR_ENABLED and "head_to_gym" in a and state.get("next_gym"):
+                try:
+                    _ngf = state["next_gym"]
+                    # QUESTLINE SPARE (2026-07-30, Jonny live report: post-Nugget-Bridge dither between
+                    # Misty and 'continue north'). While a questline is ACTIONABLE, head_to_gym is
+                    # HIJACKED to drive the unlock errand (_route_action -> _run_questline_step: Bill's
+                    # S.S. Ticket up Route 24/25) — it is NOT walking into Misty's door. The readiness
+                    # floor pruning it here starved the errand every tick: goals said Misty, the
+                    # questline said Bill, and the ONE action that executes Bill kept vanishing from
+                    # the menu — so she flip-flopped between grinding and vague northbound travel.
+                    # Canon order is Bill FIRST anyway (free Route 24/25 trainer XP en route = the
+                    # strengthening this floor wants). Readiness re-applies the moment the errand
+                    # clears and head_to_gym points at the actual gym again.
+                    _ql = getattr(self, "_active_questline", None)
+                    _ql_spare = _ql is not None and getattr(_ql, "actionable", None) is not None
+                    # CREATOR ORDER (2026-07-31, LAW): Jonny ordered the gym fight out loud — the
+                    # readiness floor may not prune the one action that obeys him.
+                    # catch_now is NOT a gym order (2026-08-02): sparing head_to_gym under
+                    # "catch Snorlax" just forced the Route-12 no_path thrash.
+                    _co_rf = self._creator_order(state)
+                    if _co_rf and _co_rf.get("order") not in ("catch_now", "get_flash"):
+                        log("   [roam] GYM-READINESS FLOOR: SPARED head_to_gym — CREATOR ORDER (LAW)")
+                        rf = None
+                    elif _pb_live:
+                        # POST-BADGE BEAT: the new milestone's floor must not park her in the city
+                        # she just conquered — heal/stock/march; the bench trains on the road.
+                        log("   [roam] GYM-READINESS FLOOR: SPARED head_to_gym — POST-BADGE BEAT "
+                            "(heal/stock/march; train on the road forward)")
+                        rf = None
+                    elif self._momentum_live(state) and not self._gym_go_hard_blocked(state):
+                        # MOMENTUM (2026-07-31): last gym fell decisively — the floor stands DOWN
+                        # for this whole gym; the road's trainers are the training. Survives
+                        # relaunch (disk latch) — the exact hole the live Route-4 loop came from.
+                        # 2026-08-01: NOT when Surge prep / mid-evo Blastoise bar blocks GO HARD.
+                        log(f"   [roam] GYM-READINESS FLOOR: SPARED head_to_gym — 🔥 MOMENTUM "
+                            f"(decisive last win; march at {_ngf['leader']}, train on the road)")
+                        rf = None
+                    elif _seam_live:
+                        # SEAM-COMMIT: the breaker just forced the forward march — the floor may
+                        # not re-open the border war it exists to end.
+                        log("   [roam] GYM-READINESS FLOOR: SPARED head_to_gym — SEAM-COMMIT "
+                            "(the breaker owns the next builds)")
+                        rf = None
+                    elif _ql_spare:
+                        log(f"   [roam] GYM-READINESS FLOOR: SPARED head_to_gym — it drives the "
+                            f"'{_ql.actionable.missing}' errand, not {_ngf['leader']}'s door "
+                            f"(the errand route IS the strengthening)")
+                        rf = None
+                    else:
+                        _bumpf = getattr(self, "_gym_prep_bump", {}).get(_ngf["leader"], 0)
+                        rf = self.planner.gym_readiness(_ngf["leader"], state.get("party") or [],
+                                                        party_target=GYM_PARTY_TARGET, loss_bump=_bumpf)
+                    if rf and (rf["thin"] or rf["underleveled"]):
+                        strengthen = [k for k in a if k in ("wander_catch", "battle", "stock_up")
+                                      or k.startswith("travel:")]
+                        if strengthen:
+                            a.pop("head_to_gym", None)
+                            need = []
+                            if rf["thin"]:
+                                need.append(f"a real team ({rf['party_size']}/{rf['target_size']} mons)")
+                            if rf["underleveled"]:
+                                need.append(f"levels (top {rf['top_level']} vs bar {rf['level_target']})")
+                            _needs = " and ".join(need)
+                            if "wander_catch" in a:
+                                a["wander_catch"] = (f"BUILD THE TEAM FIRST — {_ngf['leader']} demands "
+                                                     f"{_needs}; catch a teammate in the grass before "
+                                                     f"you walk into that gym")
+                            if "battle" in a:
+                                a["battle"] = (f"TRAIN FIRST — {_ngf['leader']} demands {_needs}; "
+                                               f"level up in the grass before you walk into that gym")
+                            log(f"   [roam] !! GYM-READINESS FLOOR: not ready for {_ngf['leader']} "
+                                f"({', '.join(need)}) — pruned head_to_gym; strengthen: {strengthen}")
+                except Exception as _grf:
+                    log(f"   [roam] gym-readiness floor skipped: {_grf}")
             # PHASE 2 — READINESS → GO: once she's crossed the readiness bar, make the RETURN the
             # ATTRACTIVE option (not merely un-pruned). Reframing head_to_gym's description IS the weight
             # in this oracle architecture — so the return reads as a strong positive pull, not a bland
@@ -11388,6 +16075,220 @@ class Campaign:
                            else "") + "; the move is to travel to the gym")
             except Exception as _rr:
                 log(f"   [roam] readiness reframe skipped: {_rr}")
+            # DOMINANT→GO / CREATOR→GO (2026-07-31 HARD): watched live — stand-down only muted the
+            # STRENGTHEN framing; battle/wander_catch/travel stayed on the menu and the oracle kept
+            # picking grass ("grind caterpie… to ~L14") for an hour while L28 Wartortle sat ready for
+            # Misty. Soft reframes are not enough. When dominant OR Jonny ordered the fight:
+            #   (1) restore head_to_gym if an earlier floor pruned it
+            #   (2) prune EVERY grind/detour option (battle, wander_catch, travel:*, fetch_keeper)
+            #   (3) reframe head_to_gym as the ONLY forward pick
+            #   (4) latch _force_gym_pick so free_roam SKIPS the oracle and executes head_to_gym
+            # Questline deferral DROPS here too: Bill-before-Misty is correct early, but once she's
+            # dominant (or ordered) the badge IS the next beat — farming Route 24/25 "for Misty"
+            # while the gym is in the same city is the pacing bug Jonny is watching.
+            try:
+                _ng3 = state.get("next_gym")
+                _ord3_raw = self._creator_order(state) if _ng3 else None
+                # catch_now / get_flash are NOT gym marches (2026-08-02 LIVE): forcing
+                # head_to_gym under "catch Snorlax" made her no_path thrash into the sleeping
+                # body at Route 12 (9,88) forever. Only fight-style orders arm GO HARD.
+                _ord3 = (_ord3_raw if (_ord3_raw and _ord3_raw.get("order")
+                                       not in ("catch_now", "get_flash"))
+                         else None)
+                if _ord3_raw and _ord3 is None:
+                    log(f"   [roam] !! CREATOR ORDER '{_ord3_raw.get('order')}' is NOT a gym "
+                        f"march — refusing GO HARD / force head_to_gym (would thrash the blocker)")
+                _dom3 = self._gym_dominant(state) if _ng3 else False
+                # MOMENTUM (2026-07-31): a decisive last win is a third GO trigger — same prune +
+                # force as dominance, but the QUESTLINE HIJACK stays LIVE for it (_route_action's
+                # skip keys off creator/dominant only): the errand (Bill's ticket -> S.S. Anne ->
+                # Cut) IS the road to the next gym, and its trainers ARE the training.
+                _mom3 = self._momentum_live(state) if _ng3 else False
+                # ACE-CARRIES MARCH (2026-08-02 Celadon chalk): ace at/above next gym's level bar
+                # → same GO HARD as dominance (prune grass, force head_to_gym). Bench XP on the road.
+                _ace3 = self._ace_carries_next_gym(state) if _ng3 else False
+                # SURGE / MID-EVO PREP GATE (2026-08-01): dominance + momentum must NOT force the
+                # gym while Wartortle < Blastoise or a live loss bump says not ready. Creator
+                # order still overrides (LAW). Mid-evo/paper-bench gates also zero _gym_dominant.
+                # Ace-carries clears the block inside _gym_go_hard_blocked (level bar already met).
+                if _ng3 and not _ord3 and self._gym_go_hard_blocked(state):
+                    if _dom3 or _mom3 or _ace3:
+                        log(f"   [roam] !! GO-HARD BLOCKED for {_ng3['leader']} — mid-evo / prep "
+                            f"bump says not ready (no DOMINANT/MOMENTUM force; grind to Blastoise "
+                            f"+ bench first)")
+                    _dom3 = False
+                    _mom3 = False
+                    _ace3 = False
+                # ROUTE-12 SNORLAX (2026-08-02 LIVE): while the body still sleeps, ACE-CARRIES /
+                # DOMINANT GO HARD only no_paths into it. Stand those down; the wake strike owns
+                # the tile. (catch_now already refused GO HARD above.)
+                try:
+                    import field_moves as _fm_sx
+                    if (tuple(state.get("map") or ()) == (3, 30)
+                            and not _fm_sx.read_flag(self.b, 0x253)):
+                        if _dom3 or _mom3 or _ace3:
+                            log("   [roam] !! Route 12 Snorlax still sleeping — standing down "
+                                "ACE/DOMINANT/MOMENTUM GO HARD (wake it; don't thrash the body)")
+                        _dom3 = False
+                        _mom3 = False
+                        _ace3 = False
+                        self._force_gym_pick = False
+                except Exception:
+                    pass
+                # GO-HARD RETRY CAP (2026-07-31, the live Misty loop): beat_gym stuck 5+ ticks in a
+                # row on this leader means the interior genuinely has her beat — stop re-forcing the
+                # pick (which would override the structural park forever) and let the normal
+                # watchdog/escape machinery own it. The streak clears on ANY non-stuck gym outcome.
+                # EXCEPTION: Surge trash-can gate still open — keep forcing head_to_gym so
+                # TrashCanPuzzle re-arms (parking/escape left her thrashing cans manually).
+                _gh_capped = (_ng3 is not None
+                              and getattr(self, "_gym_stuck_streak", {}).get(_ng3["leader"], 0) >= 5)
+                if _gh_capped and _ng3 and _ng3.get("leader") == "Lt. Surge":
+                    try:
+                        import env_puzzle as _ep2
+                        from field_moves import read_flag as _rf2
+                        if not _rf2(self.b, _ep2.FLAG_BOTH_SWITCHES):
+                            _gh_capped = False
+                            log("   [roam] !! GO-HARD cap WAIVED — Surge trash-can FLAG_BOTH unset; "
+                                "keeping force-pick so the puzzle solver re-arms")
+                    except Exception:
+                        pass
+                # Ice Beam is optional polish now (Water ace carries Erika). Never stand down
+                # GO-HARD for a Game Corner cash farm — that parked her in Celadon tourism.
+                self._ice_beam_cash_needed = 0
+                # CELADON → ERIKA LOCK (2026-08-02): in Celadon city / gym / any Celadon interior,
+                # force the gym. Random mansion/dept leave_building tourism is banned while the
+                # Rainbow Badge is the open job.
+                _cel_lock = False
+                if _ng3 and _ng3.get("leader") == "Erika":
+                    _cm = tuple(state.get("map") or ())
+                    if _cm == tuple(CELADON) or _cm == CELADON_GYM_INTERIOR or (
+                            len(_cm) == 2 and _cm[0] == CELADON_GYM_INTERIOR[0]):
+                        _cel_lock = True
+                        if "head_to_gym" not in a:
+                            a["head_to_gym"] = "Erika's gym — Rainbow Badge NOW"
+                        for _k in ("leave_building", "talk_npc", "wander_catch", "explore",
+                                   "battle", "regroup"):
+                            a.pop(_k, None)
+                        # UNPARK: Ice Beam cash-farm marked head_to_gym dead / no-move on Celadon
+                        # (need_cash_for_tm ×N). Clear so FORCE GYM can fire again.
+                        self._dead_moves.discard("head_to_gym")
+                        self._nomove_streak = 0
+                        try:
+                            self._dead_moves_structural.get(tuple(CELADON), set()).discard("head_to_gym")
+                            self._dead_moves_structural.get(_cm, set()).discard("head_to_gym")
+                        except Exception:
+                            pass
+                        # Prep-grind false stucks must not exhaust the GO-HARD cap / park the gym.
+                        try:
+                            self._gym_stuck_streak.pop("Erika", None)
+                        except Exception:
+                            pass
+                        try:
+                            self._stuck_request = None
+                            if self._stuckwatch is not None:
+                                self._stuckwatch.reset()
+                        except Exception:
+                            pass
+                        # Prep/watchdog false stucks exhausted the GO-HARD cap; clear it THIS tick
+                        # so force-pick + travel-prune still fire (not just the flag alone).
+                        _gh_capped = False
+                        self._force_gym_pick = True
+                        log("   [roam] !! CELADON→ERIKA LOCK: force head_to_gym; unpark dead routes; "
+                            f"prune grass/tourism (map={_cm})")
+                # LAVENDER↔ROUTE 8 PRE-SCOPE LOCK (2026-08-02): without Silph Scope the Tower/
+                # Flute chain is locked. Fuchsia-road eastbound + Scope errand westbound paced
+                # the blank line forever. Open the Scope questline, force head_to_gym (which
+                # WAIVES GO-HARD park for silph_scope — see _ROAD_BLOCKERS), ban Lavender tourism.
+                _scope_lock = False
+                try:
+                    _cm_s = tuple(state.get("map") or ())
+                    _ROUTE8 = (3, 26)
+                    if ((_ng3 and _ng3.get("leader") == "Koga")
+                            and not self._key_item_owned(359)
+                            and not self._key_item_owned(350)
+                            and _cm_s in (tuple(LAVENDER), _ROUTE8, (3, 25), tuple(CELADON))):
+                        _scope_lock = True
+                        _sg = self._silph_scope_gate()
+                        if _sg is not None:
+                            self._open_questline(_sg, state)
+                        if "head_to_gym" not in a:
+                            a["head_to_gym"] = ("Celadon Rocket Hideout — Silph Scope FIRST "
+                                                "(Lavender Tower is locked without it)")
+                        for _k in list(a):
+                            if _k.startswith("travel:"):
+                                try:
+                                    _tg = tuple(int(x) for x in _k.split(":", 1)[1].split(","))
+                                except Exception:
+                                    _tg = ()
+                                if _tg == tuple(LAVENDER) or _tg == _ROUTE8:
+                                    a.pop(_k, None)
+                        for _k in ("wander_catch", "explore", "battle", "leave_building"):
+                            a.pop(_k, None)
+                        self._dead_moves.discard("head_to_gym")
+                        self._nomove_streak = 0
+                        self._seam_nogo = getattr(self, "_seam_nogo", set()) | {tuple(LAVENDER)}
+                        self._force_gym_pick = True
+                        _gh_capped = False
+                        log(f"   [roam] !! PRE-SCOPE LOCK: no Silph Scope — Celadon Hideout NOW; "
+                            f"Lavender is NO-GO (map={_cm_s})")
+                        self.on_event("Lavender's a dead end without the Silph Scope — back to "
+                                      "Celadon, Rocket Hideout under the Game Corner. THEN the tower.",
+                                      kind="route", tier=2)
+                except Exception as _psx:
+                    log(f"   [roam] pre-scope lock skipped: {_psx}")
+                if _ng3 and (_ord3 or _dom3 or _mom3 or _ace3) and _gh_capped and not _cel_lock and not _scope_lock:
+                    log(f"   [roam] !! GO-HARD: force-pick STANDS DOWN — beat_gym stuck x5+ on "
+                        f"{_ng3['leader']}; escape machinery owns the wedge now")
+                if _ng3 and (_ord3 or _dom3 or _mom3 or _ace3 or _cel_lock or _scope_lock) and not _gh_capped:
+                    if "head_to_gym" not in a:
+                        a["head_to_gym"] = f"go fight {_ng3['leader']} in {_ng3['city']} NOW"
+                        log("   [roam] !! restoring head_to_gym (was pruned earlier) — gym is GO")
+                    if _ord3:
+                        a["head_to_gym"] = (
+                            f"⚡ JONNY'S ORDER (LAW): march to {_ng3['city']}'s gym and fight "
+                            f"{_ng3['leader']} RIGHT NOW — he said "
+                            f"\"{(_ord3.get('raw') or '')[:80]}\". No grinding. GO.")
+                    elif _dom3:
+                        a["head_to_gym"] = (
+                            f"YOU'RE READY — STOP GRINDING AND GO. Your strongest OVERPOWERS "
+                            f"{_ng3['leader']}. Walk into {_ng3['city']}'s gym and take the "
+                            f"badge NOW. Parking in grass is wasted stream time.")
+                    elif _ace3:
+                        a["head_to_gym"] = (
+                            f"MARCH — your ace already clears {_ng3['leader']}'s level bar. "
+                            f"Walk to {_ng3['city']} and take the badge. Train the bench on "
+                            f"the road (trainers + wilds en route) — NEVER park Route grass "
+                            f"to level everyone before you leave. Credits are the goal.")
+                    else:
+                        _mbt = getattr(self, "_momentum_beat", "the last gym leader")
+                        _mbc = getattr(self, "_momentum_badges", None)
+                        _mflav = (f"you CRUSHED {_mbt}" if getattr(self, "_momentum_decisive", True)
+                                  else f"you beat {_mbt}")
+                        a["head_to_gym"] = (
+                            f"🔥 RIDE THE MOMENTUM — {_mflav}"
+                            + (f" (badge #{_mbc}, your {_mbc} badges total)" if _mbc else "")
+                            + f". {_ng3['leader']} in {_ng3['city']} is NEXT — you have NOT "
+                            f"fought {_ng3['leader']} yet. March STRAIGHT there: heal "
+                            f"if hurt, stock up if thin, then GO. The trainers on the road are "
+                            f"your training — never park in grass you've already cleared.")
+                    _prn = [k for k in list(a)
+                            if k in ("battle", "wander_catch", "fetch_keeper")
+                            or k.startswith("travel:")]
+                    for k in _prn:
+                        a.pop(k, None)
+                    self._force_gym_pick = True
+                    # Retire the parked bench pin so short-goal / rationale stop saying 'grind to L14'
+                    if getattr(self, "_bench_pin", None) is not None:
+                        log(f"   [roam] !! retiring bench pin L{self._bench_pin} — gym is GO now")
+                        self._bench_pin = None
+                    _go_tag = ("CREATOR ORDER" if _ord3 else
+                               ("DOMINANT" if _dom3 else
+                                ("ACE-CARRIES" if _ace3 else "MOMENTUM")))
+                    log(f"   [roam] !! {_go_tag} → GO HARD: forced head_to_gym ({_ng3['leader']}); "
+                        f"pruned {sorted(_prn)}; oracle SKIPPED this tick")
+            except Exception as _dg:
+                log(f"   [roam] dominant-go reframe skipped: {_dg}")
         # ── CROSS-MAP KEEPER ROUTER (PASS 3 NEW#2) ───────────────────────────────────────────────────
         # Offer a BOUNDED detour to fetch a plan keeper that lives on a nearby reachable map (party has
         # room, keeper NOT on this map, within KEEPER_ROUTER_MAX_HOPS). Offered ALONGSIDE head_to_gym (the
@@ -11399,7 +16300,10 @@ class Campaign:
         # (esp. a cave, via the static connection) and spin re-entering it catching nothing (the 3-ball
         # cave3 soft-livelock). Zero balls -> the offer drops, _ball_note tells the oracle a Mart run comes
         # first, and she falls to head_to_gym/stock_up instead. Re-offered once she has balls again.
-        if KEEPER_ROUTER_ENABLED and self._ball_count() > 0:
+        # Skip when GO-HARD latched — fetch_keeper was just pruned; re-offering it would put a
+        # detour back on the menu opposite a forced Misty march.
+        if (KEEPER_ROUTER_ENABLED and not getattr(self, "_force_gym_pick", False)
+                and self._ball_count() > 0):
             _kr = self._keeper_route_target(state)
             if _kr:
                 # HEAL-GATE (NS#39: don't start a detour on a dinged team) with an NS#41 SAFE-HOP relaxation:
@@ -11470,7 +16374,21 @@ class Campaign:
             if _plan_build:
                 log("   [roam] TEAM-BRAIN PRE-BUILD: team dangerously thin + a keeper/bench-build is DUE — "
                     "NOT pruning catch/grind to forward-drive (assemble the squad before the gauntlet)")
-            if not stuck and prep_t is None and not _plan_build:
+            # QUESTLINE OVERRIDES THE PREP STAND-DOWN (2026-07-30, Jonny live report: 'she keeps
+            # fighting in the WRONG grass' — Route 4 behind her instead of Route 24/25 north where
+            # the Bill errand goes AND the plan's Abra lives). The prep stand-down (prep_t armed)
+            # exists so a deliberate strengthen-grind isn't pruned as backward drift — but while an
+            # unlock errand is live, the errand road IS the strengthen-grind (mandatory trainer
+            # fights + fresh grass en route pay better than re-farming cleared grass), so standing
+            # down anchored her prep to whatever tile she happened to be on. Let the questline
+            # branch of forward-drive fire anyway; its reframe explicitly says grind ON THE WAY.
+            _ql_live = (QUESTLINE_ENABLED and self._active_questline is not None
+                        and self._active_questline.actionable is not None
+                        and getattr(self._active_questline, "derivable", True))
+            if _ql_live and prep_t is not None:
+                log("   [roam] FORWARD-DRIVE: prep grind armed BUT a questline errand is live — "
+                    "the errand road is the training ground; driving forward instead of parking")
+            if not stuck and not _plan_build and (prep_t is None or _ql_live):
                 try:
                     cur = tuple(state["map"])
                     avoid = self._wall_avoid(state)
@@ -11501,10 +16419,11 @@ class Campaign:
                             q = self._active_questline
                             a["head_to_gym"] = (
                                 f"PUSH FORWARD — the way ahead is blocked ({q.gate.human}), and the move "
-                                f"that opens it is to {q.actionable.human}. Go DO that now: it's the road "
-                                f"FORWARD toward the next badge. Grind the trainers and grass ON THE WAY if "
-                                f"you want, but keep heading to the objective — never backward into "
-                                f"somewhere you've already cleared.")
+                                f"that opens it is to {q.actionable.human}. Go DO that now: that errand "
+                                f"IS the road FORWARD toward the next badge (Diglett's Cave → Route 2 "
+                                f"for Flash is FORWARD for Celadon — Rock Tunnel stays dark without it; "
+                                f"it is NOT Pewter nostalgia). Grind trainers ON THE WAY if you want, "
+                                f"but finish the errand — don't sit at a Center narrating Celadon.")
                         else:
                             aname = self.world.name(anchor)
                             a["head_to_gym"] = (
@@ -11533,13 +16452,28 @@ class Campaign:
                                     keep = False
                             if not keep:
                                 a.pop(k, None); pruned.append(k)
+                        # KEEPER-ON-THIS-MAP SPARE (2026-07-30, the wrong-grass report): if the team
+                        # plan's DUE catch target can actually appear in THIS map's grass (she has
+                        # reached Abra territory), wander_catch is FORWARD work, not backward drift —
+                        # keep it on the menu so she can hunt the keeper right here.
+                        _kp_here = None
+                        try:
+                            _kp_here = self._plan_keeper_target(state)
+                        except Exception:
+                            _kp_here = None
                         for g in ("battle", "wander_catch"):
+                            if g == "wander_catch" and _kp_here:
+                                a[g] = (f"HUNT {_kp_here.upper()} HERE — your plan's target lives in "
+                                        f"THIS grass. Work these tiles until you've caught it, then "
+                                        f"push on with the errand.")
+                                continue
                             if a.pop(g, None) is not None:
                                 pruned.append(g)
                         if pruned:
                             why = "questline" if ql_open else f"off-branch->{self.world.name(anchor)}"
                             log(f"   [roam] !! FORWARD-DRIVE ({why}): head_to_gym reframed as the dominant "
-                                f"forward pull, pruned backward-grind {sorted(pruned)}")
+                                f"forward pull, pruned backward-grind {sorted(pruned)}"
+                                + (f" (spared wander_catch — {_kp_here} lives on this map)" if _kp_here else ""))
                 except Exception as _fd:
                     log(f"   [roam] forward-drive skipped: {_fd}")
             # TEAM-BRAIN PRE-BUILD DOMINANCE (rule 2 — the load-bearing half): keeping catch/grind on the
@@ -11671,6 +16605,20 @@ class Campaign:
             a.pop("talk_npc", None)
             log("   [roam] !! INTERIOR-WEDGE ESCAPE: wedged in a dead-end interior with the walk-out "
                 "armed — suppressing talk_npc so leave_building dominates (get out of the wrong building)")
+        # BORDER PING-PONG HOLD (2026-08-04, the breaker's enforcement half): while the hold is
+        # live and she stands on one of the thrashed maps, the forward-drive picks are OFF THE
+        # MENU — the two-controller rhythm cannot restart from here until the window expires.
+        # regroup/grind/talk/heal stay offered (and the never-empty floor below guarantees
+        # regroup), so she relocates and re-derives instead of re-crossing. The F-1 tripwire
+        # honors this automatically (it only forces an action still in the offered set).
+        if (time.time() < getattr(self, "_bpp_hold_until", 0)
+                and tuple(state.get("map") or ()) in getattr(self, "_bpp_maps", set())):
+            _dropped = [k for k in ("head_to_gym", "head_to_league", "victory_lap")
+                        if a.pop(k, None) is not None]
+            if _dropped:
+                log(f"   [roam] !! BORDER PING-PONG HOLD: {_dropped} off the menu on this thrashed "
+                    f"map ({int(getattr(self, '_bpp_hold_until', 0) - time.time())}s left) — "
+                    f"the breaker owns the rhythm")
         # NEVER-EMPTY FLOOR (2026-07-08 soak finding): an EMPTY set ends free roam — on a live watch
         # that stops her cold mid-show (hit on the post-game victory lap at an unfamiliar strip: no
         # grass target, no known travel routes, no gym objective). There is always ONE honest move:
@@ -11743,18 +16691,116 @@ class Campaign:
     # the blocker she's bumping. 1=south/down 2=north/up 3=west/left 4=east/right.
     _FACE_DELTA = {1: (0, 1), 2: (0, -1), 3: (-1, 0), 4: (1, 0)}
 
+    @contextmanager
+    def watchdog_hold(self, reason=""):
+        """THINKING IS A FIRST-CLASS STATE (2026-07-30, the false-self-heal fix): wrap any span where
+        she is DELIBERATELY still — an oracle (LLM) decision in flight, a voice savor-hold, a
+        reading-pace dialogue hold — so the wall-clock StuckWatch can neither trip during it nor
+        count its duration afterwards (release() restarts the 8s clock). Without this, every oracle
+        call >8s tripped the watchdog on the first feed after it returned: false wedge marks at
+        innocent tiles (persisted!), healthy conversations B-closed mid-drive, and whole actuators
+        instabailed on the stale latch. Nestable; no-op when the watch isn't armed."""
+        w = self._stuckwatch          # captured so hold/release always pair on the SAME object
+        if w is not None:
+            w.hold(reason)
+        try:
+            yield
+        finally:
+            if w is not None:
+                w.release()
+
+    def _stuck_latched(self):
+        """Travel's cooperative-cancel check (polled every step) — WITH A TTL SELF-HEAL (2026-07-30,
+        the Route-4 instabail storm that looked like a crash). The latch is designed to be cleared at
+        the TOP OF THE ROAM LOOP, but when the trip fires inside a deep sub-loop (grind's grass-
+        waypoint pacing), that layer can keep consuming the bail — every leg starts, reads the latch,
+        instabails, and the loop just fires the next leg for its whole wall-clock budget. Hundreds of
+        bailed legs, zero play, nothing ever clears the latch. A latch older than the TTL means
+        NOTHING above is honoring it: self-heal in place (clear + reset the watch, LOUD) so play
+        resumes. Safe: a genuine wedge just re-trips 8s later and the normal top-level recovery gets
+        another shot; travel's own stall guards still catch a truly frozen world."""
+        req = self._stuck_request
+        if req is None:
+            self._latch_bails = 0
+            return False
+        age = time.time() - (req.get("ts") or time.time())
+        if age > WATCHDOG_LATCH_TTL_S:
+            log(f"   [roam] !! WATCHDOG latch STALE ({age:.0f}s > {WATCHDOG_LATCH_TTL_S:.0f}s TTL) — "
+                f"no layer unwound to the roam top to run recovery (a sub-loop kept consuming the "
+                f"bail). Self-healing IN PLACE: latch cleared, watch reset, play resumes; a real "
+                f"wedge will re-trip and get the full recovery.")
+            self._stuck_request = None
+            if self._stuckwatch is not None:
+                self._stuckwatch.reset()
+            self._latch_bails = 0
+            return False
+        # INSTABAIL STORM BREAKER (2026-07-31, the Center-exit bail storm — live 14:15 log: 45+
+        # consecutive '[travel] bailing this leg LOUD' while she stood still in the Cerulean
+        # Center, and the 45s TTL above never even fired). One latch is meant to bail ONE leg so
+        # the wedge unwinds to the roam top; when a sub-loop (Center exit door candidates, a
+        # multi-leg road march) instead keeps launching fresh legs, every one dies at step 0 and
+        # she stands frozen — which keeps the screen static and re-trips the watch, self-
+        # sustaining. Three consecutive bailed legs on the SAME latch = nothing above is
+        # unwinding: self-heal NOW (clear + reset, LOUD), not at the 45s TTL. Safe: a real wedge
+        # re-trips 8s later and a properly-unwinding executor still reaches the roam-top recovery
+        # on its first bail.
+        self._latch_bails = getattr(self, "_latch_bails", 0) + 1
+        if self._latch_bails >= 3:
+            log(f"   [roam] !! WATCHDOG latch STORM ({self._latch_bails} legs bailed on one latch) — "
+                f"a sub-loop is consuming bails without unwinding. Self-healing NOW: latch cleared, "
+                f"watch reset, play resumes; a real wedge re-trips in 8s.")
+            self._stuck_request = None
+            if self._stuckwatch is not None:
+                self._stuckwatch.reset()
+            self._latch_bails = 0
+            return False
+        return True
+
     def feed_watchdog(self, text="", now=None):
         """LAYER B — fed every live frame (throttled) from play_live's render hook. Reads the world
         fingerprint + the on-screen dialogue text and feeds the wall-clock StuckWatch; on a TRIP it
         latches `_stuck_request` (honored at the top of the roam loop + cooperatively by travel's
         stuck_check). No-op headless (no watchdog created) or before free_roam. Pure backstop — it
-        never drives a normal decision, only catches a wedge no sub-layer surfaced."""
+        never drives a normal decision, only catches a wedge no sub-layer surfaced.
+        HELD (thinking/holding) feeds reset instead of accumulate — see watchdog_hold."""
         if self._stuckwatch is None or now is None:
             return
         try:
             fp = wf.fingerprint(self.b)
         except Exception:
             return
+        # SCENE-CB2 GATE (2026-07-30, the Route-4 farming trip): an EVOLUTION scene (also naming /
+        # dex / hall-of-fame) runs OUTSIDE battle with the overworld fingerprint frozen solid for
+        # 15-30s — map, coords, text all static — so it read as "frozen_world" and tripped the 8s
+        # watch mid-grind (then the latch storm instabailed every travel leg). gMain.callback2 is
+        # ground truth: when a non-overworld/non-battle callback owns the screen, the game is
+        # legitimately mid-scene — deliberate stillness, never a wedge.
+        if fp is not None and not fp.battle_active:
+            try:
+                if not ram.battle_cb2_dead(self.b):
+                    # SCENE-GATE HOLE (2026-08-03, the Route-13 dock loop): the overworld BAG /
+                    # PARTY menus ALSO run a non-overworld callback2, so a stuck open bag read as
+                    # a legit "scene" and PARKED the watch forever while the potion loop churned.
+                    # A stray menu is NEVER deliberate stillness — let the watch run so the trip
+                    # reaches the roam-top recovery (whose sweep B-closes it).
+                    if self._stray_menu_kind() is not None:
+                        if not getattr(self, "_wd_menu", False):
+                            self._wd_menu = True
+                            log("   [roam] watchdog: non-overworld callback is a stray BAG/PARTY "
+                                "menu — NOT a scene; the watch keeps counting (anti potion-loop)")
+                    else:
+                        self._wd_menu = False
+                        if not getattr(self, "_wd_scene", False):
+                            self._wd_scene = True
+                            log("   [roam] watchdog: SCENE callback owns the screen (evolution/naming/"
+                                "cutscene) — deliberate stillness, watch resets until the world returns")
+                        self._stuckwatch.feed(fp, now, text=text or "", progressed=True)
+                        return
+                else:
+                    self._wd_scene = False
+                    self._wd_menu = False
+            except Exception:
+                pass
         if self._stuckwatch.feed(fp, now, text=text or "") and self._stuck_request is None:
             self._stuck_request = {
                 "reason": self._stuckwatch.reason,
@@ -11762,7 +16808,9 @@ class Campaign:
                 "coords": tv.coords(self.b),
                 "facing": (fp.facing if fp else None),
                 "secs": round(self._stuckwatch.seconds_stuck(now), 1),
+                "ts": now,                           # latch birth time — the TTL self-heal keys on this
             }
+            self._latch_bails = 0                    # fresh latch -> fresh storm-breaker count
             log(f"   [roam] !!!! WATCHDOG TRIPPED ({self._stuck_request['reason']}): nothing on screen "
                 f"has meaningfully changed for {self._stuck_request['secs']}s at "
                 f"{self._stuck_request['map']}@{self._stuck_request['coords']} — latching a top-level "
@@ -11825,8 +16873,363 @@ class Campaign:
             self._looped_spots.add((mp, cur))   # talk guard: don't re-initiate from this stand tile
             log(f"   [roam] wedge spot: blocking {body} on {mp} (route around it) + marking {cur} a "
                 f"resolved talk-spot — unified block memory now {len(self._blocked_npcs)} tile(s)")
+            self._save_wedge_memory()           # persist immediately — a wedge mark must survive a restart
         except Exception as _e:
             log(f"   [roam] mark wedge spot skipped: {_e}")
+
+    def _release_recent_wedge_marks(self, req, window_s=900):
+        """WEDGE-MARK HYGIENE (2026-08-05, the Mt. Ember bag wedge): marks banked while a
+        leaked menu had the world PAUSED are PHANTOMS — coords/facing were frozen, so the
+        'blocker' was whatever tile she happened to face (a facing-south trip would block the
+        TRUE route tile, e.g. (15,34) on the 1F path). On a successful menu-close recovery,
+        drop every mark on the CURRENT map younger than the frozen window and persist.
+        Over-release is harmless: a REAL trap re-marks itself on the next 8s watchdog trip."""
+        try:
+            mp = tuple(req.get("map") or tv.map_id(self.b))
+            now = time.time()
+            ts_map = getattr(self, "_wedge_mem_ts", None) or {}
+            dropped = []
+            for kind, target in (("blocked_npcs", self._blocked_npcs),
+                                 ("looped_spots", self._looped_spots)):
+                for key in [k for k in target if tuple(k[0]) == mp]:
+                    ts = ts_map.get((kind, mp, tuple(key[1])), now)   # unstamped = this session = fresh
+                    if now - ts <= window_s:
+                        target.discard(key)
+                        ts_map.pop((kind, mp, tuple(key[1])), None)
+                        dropped.append((kind, tuple(key[1])))
+            if dropped:
+                log(f"   [roam] wedge-mark RELEASE: dropped {len(dropped)} phantom mark(s) on {mp} "
+                    f"banked during the menu-frozen window: {dropped}")
+                self._save_wedge_memory()
+        except Exception as _e:
+            log(f"   [roam] wedge-mark release skipped: {_e}")
+
+    def _release_wedge_marks_on(self, maps, why):
+        """SCOPED WEDGE-MARK RELEASE (2026-08-05 #3, the Mt. Ember loop): a strike about to
+        work a known map set drops EVERY banked mark on those maps regardless of age — today's
+        marks were banked during menu-frozen windows (coords/facing frozen = the 'blocker' was
+        a lie) and a poisoned mark re-routes the climb for its whole 12h TTL. Scoped to the
+        given maps only, never the global memory; a REAL trap re-marks itself in 8s."""
+        try:
+            mset = {tuple(m) for m in maps}
+            ts_map = getattr(self, "_wedge_mem_ts", None) or {}
+            dropped = 0
+            for kind, target in (("blocked_npcs", self._blocked_npcs),
+                                 ("looped_spots", self._looped_spots)):
+                for key in [k for k in target if tuple(k[0]) in mset]:
+                    target.discard(key)
+                    ts_map.pop((kind, tuple(key[0]), tuple(key[1])), None)
+                    dropped += 1
+            if dropped:
+                self._save_wedge_memory()
+                log(f"   [roam] wedge-mark RELEASE ({why}): {dropped} mark(s) dropped across "
+                    f"{len(mset)} strike map(s) — the climb routes on live truth")
+        except Exception as _e:
+            log(f"   [roam] scoped wedge release skipped: {_e}")
+
+    def _bank_milestone(self, reason):
+        """MILESTONE BANK (2026-08-05 addendum — 'respawn right where she is'): one call banks
+        the on-disk auto-checkpoint AND refreshes the in-memory recent-good, so BOTH reload
+        rungs (escape hatch -> _last_good_state; region-local disk fallback -> newest
+        same-region checkpoint dir) land SECONDS back, ON THIS MAP. Emulator savestates capture
+        full RAM, so pushed boulders SURVIVE a reload — unlike in-game map re-entry, which
+        resets them; that makes a milestone after every verified push the durability layer that
+        kills the 'five minutes back + puzzle reset' spiral. Returns True always (composable
+        inside all() chains); never raises."""
+        try:
+            if st.in_battle(self.b):
+                return True                    # mid-battle RAM is not a resumable overworld moment
+            self._save_campaign(reason)
+            self._continuity_save()
+            self._auto_checkpoint(reason)
+            self._last_ckpt_t = time.time()
+            self._last_good_state = self.b.save_state()
+            self._last_good_gain = self._gain_sig()
+            self._last_good_map = tuple(tv.map_id(self.b))
+            log(f"   [ckpt] MILESTONE '{reason}' banked — any recovery now resumes right here")
+        except Exception as _e:
+            log(f"   [ckpt] milestone '{reason}' skipped: {_e} (LOUD)")
+        return True
+
+    def _disengage_step1(self, req):
+        """First rung of the WATCHDOG DISENGAGE (extracted 2026-08-05 so the menu path is
+        recon-testable). Order matters: (1) an open DIALOGUE box -> B + step-away + sticky-mark
+        the NPC (the classic loop); (2) a stray BAG/PARTY MENU -> close it (bounded B, pixel +
+        cb2 readback) and RELEASE the phantom marks this frozen window banked — with a menu up
+        the world is paused, so the tile was NEVER the problem and wedge-marking it poisons the
+        router; (3) NO classifier matched -> the universal B-FIRST probe (drift-calibrated
+        screen-change readback) catches menus we haven't met yet (the START wedge); (4) only
+        a genuinely frozen WORLD wedge-marks the facing tile as before.
+        Returns the rung taken: 'npc' | 'menu' | 'menu_stuck' | 'bfirst' | 'mark'."""
+        from dialogue_drive import box_open as _bx
+        if req.get("reason") == "frozen_box" or _bx(self.b):
+            self.on_event("this NPC's just looping the same lines and going nowhere — I'm "
+                          "closing it and walking away.", kind="recover", tier=2)
+            self._disengage_overworld_npc(req)      # B-to-close + step away + sticky mark
+            return "npc"
+        sw = self._sweep_stray_menus(reason=f"watchdog {req.get('reason')}")
+        if sw == "closed":
+            self._release_recent_wedge_marks(req)
+            self.on_event("oops — the bag was still open and eating my inputs. closed it; "
+                          "moving again.", kind="recover", tier=2)
+            return "menu"
+        if sw == "stuck":
+            log("   [roam] !! stray menu would NOT close — NOT wedge-marking (the marks would "
+                "be phantoms of a paused world); the escalation ladder continues LOUD")
+            return "menu_stuck"
+        # UNIVERSAL B-FIRST RUNG (2026-08-05 #2, the START wedge): even when NO classifier
+        # matches, an unknown menu may own the input — B is safe in the overworld (a no-op
+        # outside menus/dialogue; the box case was already handled above). If a B visibly
+        # changes the screen (beyond ambient tile-animation drift), the wedge WAS a menu:
+        # release + resume, never wedge-mark the phantom.
+        if self._b_first_probe():
+            self._release_recent_wedge_marks(req)
+            self.on_event("something was quietly eating my buttons — cleared it, "
+                          "moving again.", kind="recover", tier=2)
+            return "bfirst"
+        self._mark_wedge_spot(req)
+        self.on_event("I've been stuck on the same spot going nowhere — backing off and "
+                      "trying something different.", kind="recover", tier=2)
+        return "mark"
+
+    # sparse whole-screen sample for the B-first probe: 6x6 grid clear of the outer border
+    _SIG_PTS = tuple((x, y) for y in (12, 40, 68, 100, 128, 150)
+                     for x in (20, 60, 100, 140, 180, 220))
+
+    def _screen_sig(self):
+        p = self.b.frame_rgb().load()
+        return [p[x, y][:3] for x, y in self._SIG_PTS]
+
+    @staticmethod
+    def _sig_diff(a, b):
+        return sum(1 for c0, c1 in zip(a, b)
+                   if abs(c0[0] - c1[0]) + abs(c0[1] - c1[1]) + abs(c0[2] - c1[2]) > 40)
+
+    def _b_first_probe(self, presses=2):
+        """The catch-all for menus no classifier knows yet (the START wedge shape: cb2 reads
+        overworld, no bag/party pixels — yet a window is eating every input). DRIFT-CALIBRATED:
+        sample the 36-point signature, let the scene animate untouched to measure ambient
+        drift (water/flower tiles), then press B (bounded) and only count a change well beyond
+        that drift as 'a menu closed'. Returns True iff a B visibly changed the screen —
+        the caller then skips wedge-marking (the tile was never the problem)."""
+        try:
+            s0 = self._screen_sig()
+            for _ in range(20):
+                self.b.run_frame(); self.render()
+            s1 = self._screen_sig()
+            drift = self._sig_diff(s0, s1)
+            for i in range(presses):
+                self.b.press("B", 8, 12, self.render, owner="agent")
+                for _ in range(24):
+                    self.b.run_frame(); self.render()
+                s2 = self._screen_sig()
+                changed = self._sig_diff(s1, s2)
+                if changed > max(2 * drift, drift + 6):
+                    log(f"   [roam] B-FIRST rung: press {i + 1} changed the screen "
+                        f"({changed} pts vs drift {drift}) — an UNCLASSIFIED menu owned the "
+                        f"input; resuming WITHOUT wedge-marking")
+                    return True
+                s1 = s2
+            return False
+        except Exception as _e:
+            log(f"   [roam] B-first probe skipped: {_e}")
+            return False
+
+    def _load_wedge_memory(self):
+        """Restore _blocked_npcs/_looped_spots from the campaign sidecar, dropping entries older than
+        WEDGE_MEM_TTL_S. Best-effort — a missing/corrupt file just means a fresh (empty) memory."""
+        self._wedge_mem_ts = {}
+        self._wedge_mem_saved_at = 0.0
+        import json as _json
+        try:
+            if not os.path.exists(WEDGE_MEM_JSON):
+                return
+            with open(WEDGE_MEM_JSON, encoding="utf-8") as f:
+                data = _json.load(f) or {}
+            # SCHEMA GATE: pre-thinking-gate marks are poisoned (false watchdog trips during LLM
+            # decisions persisted innocent tiles as traps). Discard the whole file, loud.
+            if int(data.get("v") or 1) < WEDGE_MEM_SCHEMA:
+                n = sum(len(data.get(k) or []) for k in ("blocked_npcs", "looped_spots"))
+                log(f"   [roam] wedge memory PURGED: {n} pre-gate mark(s) discarded (schema v1 < "
+                    f"v{WEDGE_MEM_SCHEMA} — recorded before the thinking-gate fix, so false trips "
+                    f"during normal LLM decisions may have marked innocent tiles as traps)")
+                try:
+                    os.remove(WEDGE_MEM_JSON)
+                except Exception:
+                    pass
+                return
+            now = time.time()
+            for kind, target in (("blocked_npcs", self._blocked_npcs),
+                                 ("looped_spots", self._looped_spots)):
+                for rec in data.get(kind) or []:
+                    try:
+                        mp, tile, ts = tuple(rec[0]), tuple(rec[1]), float(rec[2])
+                    except Exception:
+                        continue
+                    if now - ts > WEDGE_MEM_TTL_S:
+                        continue
+                    target.add((mp, tile))
+                    self._wedge_mem_ts[(kind, mp, tile)] = ts
+            if self._blocked_npcs or self._looped_spots:
+                log(f"   [roam] wedge memory restored: {len(self._blocked_npcs)} blocked tile(s), "
+                    f"{len(self._looped_spots)} resolved talk-spot(s) — she REMEMBERS her traps "
+                    f"(TTL {WEDGE_MEM_TTL_S / 3600:.0f}h)")
+        except Exception as _e:
+            log(f"   [roam] wedge memory load skipped: {_e}")
+
+    def _save_wedge_memory(self):
+        """Write the current block memory to the campaign sidecar (atomic). Entries keep their first-seen
+        timestamp so the TTL measures trap AGE, not last-save time. Never blocks or raises."""
+        import json as _json
+        try:
+            now = time.time()
+            ts_map = getattr(self, "_wedge_mem_ts", None)
+            if ts_map is None:
+                ts_map = self._wedge_mem_ts = {}
+            data = {"v": WEDGE_MEM_SCHEMA}
+            for kind, src in (("blocked_npcs", self._blocked_npcs),
+                              ("looped_spots", self._looped_spots)):
+                rows = []
+                for mp, tile in src:
+                    ts = ts_map.setdefault((kind, mp, tile), now)
+                    rows.append([list(mp) if isinstance(mp, (tuple, list)) else mp,
+                                 list(tile) if isinstance(tile, (tuple, list)) else tile, ts])
+                data[kind] = rows
+            tmp = WEDGE_MEM_JSON + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(data, f)
+            os.replace(tmp, WEDGE_MEM_JSON)
+            self._wedge_mem_saved_at = now
+        except Exception as _e:
+            log(f"   [roam] wedge memory save skipped: {_e}")
+
+    def pp_restore_latched(self, key):
+        """ONE-SHOT PP-RESTORE LATCH, read side (2026-08-05 LIVE, the doorstep turn-around at
+        Moltres: the restore leg's once-guard was per-instance in-memory, so every restart's
+        boot rewind landed her AT the bird with the thin bank and re-armed the trip — she
+        turned around and walked away from the encounter, forever). True when the descend-
+        heal-re-climb leg has ALREADY fired for this quarry THIS CAMPAIGN. Persisted sidecar:
+        savestate rewinds restore RAM, never this file, so the latch survives every restart
+        and reload. Unreadable -> False (never blocks an honest first trip)."""
+        import json as _json
+        try:
+            with open(PP_RESTORE_JSON, encoding="utf-8") as f:
+                return bool((_json.load(f) or {}).get(str(key).lower()))
+        except Exception:
+            return False
+
+    def pp_restore_latch(self, key):
+        """Burn the one-shot: recorded the moment the leg ARMS — success or bounded failure,
+        it ran once and never runs again; from then on she engages with whatever PP she has
+        (the b235cb0 ladder is the net). Atomic write; never raises."""
+        import json as _json
+        try:
+            data = {}
+            try:
+                with open(PP_RESTORE_JSON, encoding="utf-8") as f:
+                    data = _json.load(f) or {}
+            except Exception:
+                pass
+            data[str(key).lower()] = time.time()
+            tmp = PP_RESTORE_JSON + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(data, f)
+            os.replace(tmp, PP_RESTORE_JSON)
+        except Exception as _e:
+            log(f"   [hunt] pp-restore latch save skipped: {_e}")
+
+    def pp_restore_unlatch(self, key):
+        """Clear the one-shot latch for `key` (2026-08-06 LIVE, soak 082259: latch burned
+        with Bite at 0 PP → she engaged Skull-Bash-only → froze/fled the bird in a loop).
+        EMPTY ACE TANK outranks the latch — a Center trip must be allowed again. Never raises."""
+        import json as _json
+        try:
+            data = {}
+            try:
+                with open(PP_RESTORE_JSON, encoding="utf-8") as f:
+                    data = _json.load(f) or {}
+            except Exception:
+                pass
+            k = str(key).lower()
+            if k not in data:
+                return
+            data.pop(k, None)
+            tmp = PP_RESTORE_JSON + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                _json.dump(data, f)
+            os.replace(tmp, PP_RESTORE_JSON)
+            log(f"   [hunt] !! pp-restore latch CLEARED for '{k}' — empty ace tank overrides "
+                f"the one-shot (Center trip allowed again) (LOUD)")
+        except Exception as _e:
+            log(f"   [hunt] pp-restore unlatch skipped: {_e}")
+
+    def _stray_menu_kind(self):
+        """Which stray menu owns the screen right now — 'start' (gTasks readback: the START
+        menu runs UNDER CB2_Overworld, so neither cb2 truth nor the bag/party pixel probes
+        can see it — the 2026-08-05 Mt. Ember EXIT-cursor wedge, arrows scrolling
+        POKeDEX..EXIT forever) / 'party' (teal panels) / 'bag'/'case' (pale-yellow list,
+        pixel truth per TeachFlow._classify probes, native 240x160) — or None. Read-only."""
+        try:
+            if ram.start_menu_open(self.b):
+                return "start"
+        except Exception:
+            pass
+        p = self.b.frame_rgb().load()
+        teal_hits = sum(1 for x, y in ((30, 110), (60, 115), (20, 90), (70, 108))
+                        if p[x, y][0] < 100 and p[x, y][1] > 120 and p[x, y][2] > 120
+                        and abs(p[x, y][1] - p[x, y][2]) < 40)
+        if teal_hits >= 3:
+            return "party"
+        yellow_hits = sum(1 for x, y in ((160, 30), (200, 60), (120, 10))
+                          if p[x, y][0] > 240 and p[x, y][1] > 240 and 180 < p[x, y][2] < 230)
+        if yellow_hits >= 2:
+            # CONFIRMATION STRIPS (2026-08-05, the One-Island frozen_box misfire): 3 spot-probes
+            # matched the cream walls/counters of the Sevii PC interiors DURING the Bill/Celio
+            # scene — the watchdog then counted a 'stray menu' through a legit cutscene and B-
+            # mashed into it. The REAL bag/case list is a near-uniform pale-cream sheet across
+            # the right 2/3; tile art never is. Tightens only — a genuinely open bag still trips.
+            total = hits = 0
+            for sy in (12, 44, 76):
+                for sx in range(116, 236, 6):
+                    total += 1
+                    r, g, bl = p[sx, sy][:3]
+                    if r > 230 and g > 230 and 170 < bl < 240:
+                        hits += 1
+            # 0.60: text glyphs eat ~30-40% of a heavy list row; tile art lands far below this
+            if hits >= int(total * 0.60):
+                return "bag/case"
+        return None
+
+    def _sweep_stray_menus(self, max_b=10, reason="tick top"):
+        """2026-08-03 NUCLEAR (the overworld Super-Potion loop): at a point where NO flow should
+        own the screen, close any stray bag/party/case menu with B (never A — A is what walked the
+        bag onto a potion and the party onto a mon forever). Bounded, re-checked between presses.
+        2026-08-05 (the Mt. Ember bag wedge): close-confirm now ALSO requires gMain.callback2
+        back in the world (ram.battle_cb2_dead — the watchdog scene gate's own read); pixels
+        clearing mid-fade is not 'closed'. Returns 'closed' (was open, confirmed shut) |
+        'stuck' (open, would NOT close — LOUD) | None (no stray menu; nothing done)."""
+        if st.in_battle(self.b):
+            return None
+        kind = self._stray_menu_kind()
+        if not kind:
+            return None
+        log(f"   [roam] !! STRAY MENU at {reason}: {kind} screen open with no flow active — "
+            f"B-closing it (the world is PAUSED under it: movement eaten, NPC coords frozen)")
+        for i in range(max_b):
+            self.b.press("B", 4, 12, self.render, owner="agent")
+            for _f in range(10):
+                self.b.run_frame(); self.render()
+            if self._stray_menu_kind():
+                continue
+            try:
+                if not ram.battle_cb2_dead(self.b):
+                    continue                    # pixels clear but callback still menu/fade — keep B'ing
+            except Exception:
+                pass                            # unreadable cb2 -> pixel truth alone (old semantics)
+            log(f"   [roam] stray menu CLOSED after {i + 1} B(s) — world callback restored")
+            return "closed"
+        log(f"   [roam] !! stray {kind} menu would NOT close after {max_b} B's (LOUD)")
+        return "stuck"
 
     def _wait_overworld(self, max_frames=900):
         """Settle to overworld-idle (not in battle, no open dialogue box) before reading state / acting."""
@@ -11907,6 +17310,30 @@ class Campaign:
             nbr = self.world.edge_neighbor(legs[i]["map"], go)
             if nbr:
                 legs[i + 1]["map"] = nbr
+        # PRE-SCOPE FUCHSIA ROAD CAP (2026-08-02): billed Fuchsia road is
+        # Celadon→R7→R8→Lavender→R12… but Lavender→R12 is Snorlax-locked until Flute, and Flute
+        # needs Silph Scope from Celadon's Rocket Hideout. Marching past Celadon without Scope
+        # makes head_to_gym pull EAST into Lavender while the Scope errand pulls WEST — she paces
+        # the Lavender↔Route 8 blank line forever. Cap the road at Celadon until Scope/Flute.
+        if (ng.get("city") == "Fuchsia City"
+                and not self._key_item_owned(359)
+                and not self._key_item_owned(350)):
+            capped = []
+            for leg in legs:
+                capped.append(dict(leg))
+                if tuple(leg["map"]) == tuple(CELADON):
+                    capped[-1]["go"] = None              # destination, not a hop east
+                    log("   [roam] ROAD to Fuchsia: CAPPED at Celadon — no Silph Scope yet "
+                        "(Hideout first; Lavender/Route 8 eastbound is a dead loop)")
+                    return capped
+            # Road list didn't include Celadon (weird) — still drop Lavender+east legs.
+            capped = [dict(l) for l in legs
+                      if tuple(l["map"]) not in (tuple(LAVENDER), (3, 30), (3, 31), (3, 32),
+                                                   (3, 33), (3, 34))]
+            if capped:
+                capped[-1] = {**capped[-1], "go": None}
+                log("   [roam] ROAD to Fuchsia: CAPPED (dropped Lavender+coast; no Silph Scope)")
+                return capped
         return legs
 
     # ── ROAD-ANCHOR PARKING (2026-07-08 night shift 6, the banked_SCOPE twedge=271 class) ────────
@@ -11978,6 +17405,28 @@ class Campaign:
         if _target_city != SAFFRON:
             avoid = avoid | {SAFFRON}
         city = (state.get("next_gym") or {}).get("city", "the next gym")
+        # SAFFRON LAST-MILE (2026-08-04 LIVE, the post-Tea orbit): marching on Saffron while
+        # standing on a map with a DIRECT gatehouse door into it (Route 7 and Route 8 both
+        # flank the city), the graph steer is pure noise — the old timeline's learned path
+        # rides the tunnel AWAY first (Route 7's only learned Saffron path runs east through
+        # the UGP to Route 8's gate), undoing the crossing every tick. Tea in the bag means
+        # the gate IS the road: cross it NOW, before any on-road/off-road routing runs.
+        if (_target_city == SAFFRON and cur != SAFFRON
+                and cur not in self._SAFFRON_GATE_MAPS
+                and not self._saffron_gate_dead_ends()):
+            try:
+                _gate_here = any(tuple(wd) in self._SAFFRON_GATE_MAPS
+                                 for _wt, wd, _wi in tv.read_warps(self.b))
+            except Exception:
+                _gate_here = False
+            if _gate_here:
+                log(f"   [roam] 🏛️ SAFFRON LAST-MILE: {self.world.name(cur)} has a live gatehouse "
+                    f"door into Saffron and the Tea is in the bag — crossing the gate, not the graph")
+                pt = self._door_passthrough(want_map=SAFFRON)
+                if pt == "need_heal":
+                    return "need_heal"
+                if pt == "crossed":
+                    return "arrived" if tuple(tv.map_id(self.b)) == SAFFRON else "road_passthrough"
         for i in range(len(road) - 1, -1, -1):
             leg = road[i]
             if leg["map"] != cur or not leg.get("go"):
@@ -12022,7 +17471,24 @@ class Campaign:
                         return "arrived"
                     if r == "road_passthrough":
                         return "road_passthrough"
-                    # need_flash / None -> fall through (door_passthrough/edge; defensive only)
+                    # need_flash / fail: NEVER fall through to edge (that IS the R9↔R10
+                    # ping-pong — east to the dark mouth, bounce, west, repeat).
+                    if r == "need_flash":
+                        try:
+                            gate = self._gate_recognizer.recognize(cur, blocked_dir=leg["go"])
+                            if gate and QUESTLINE_ENABLED and self._open_questline(gate, state):
+                                log("   [roam] ROAD: tunnel needs Flash — opening unlock errand "
+                                    "(no edge fallthrough)")
+                                return self._run_questline_step(state)
+                        except Exception as _fx:
+                            log(f"   [roam] Flash re-open after need_flash skipped: {_fx}")
+                        self.on_event("pitch black ahead — I need Flash before I walk in there.",
+                                      kind="route", tier=2)
+                        return "road_gated"
+                    if r is None:
+                        log("   [roam] ROAD: tunnel leg unresolved — not edge-oscillating; "
+                            "surfacing road_gated")
+                        return "road_gated"
                 pt = self._door_passthrough(want_map=tuple(nxt) if nxt else None)
                 if pt == "need_heal":
                     return "need_heal"
@@ -12076,6 +17542,12 @@ class Campaign:
         """Route an oracle ACTION pick to its wired handler; return the handler's outcome string."""
         # HUD now-state label (BATTLE is detected live via in_battle() at publish time).
         self._now_state = {"heal": "HEALING", "stock_up": "SHOPPING"}.get(pick, "EXPLORING")
+        if pick == "teach_tm":
+            try:
+                return self.teach_bag_tms(max_teaches=BAG_TM_TEACH_MAX)
+            except Exception as e:
+                log(f"   [roam] teach_tm crashed ({e}) (LOUD)")
+                return "failed"
         if pick == "heal":
             _hp0 = (tuple(tv.map_id(self.b)), tuple(tv.coords(self.b) or ()))
             _hr = self.heal_nearest()
@@ -12168,6 +17640,11 @@ class Campaign:
         # bench grind (weak ones solo the reachable wilds, ace earns no XP) toward the floor target, then
         # re-ticks; a non-converging team stands down LOUD. GREEN → falls through to the strike. Flag-gated
         # (E4_GATE_ENABLED default ON) so POKEMON_E4_READINESS_GATE=0 reverts to the un-gated dispatch.
+        # THE VICTORY LAP (2026-08-04): runs BEFORE the E4 readiness gate on purpose — the lap
+        # IS part of getting ready (Earthquake + birds raise the team the gate measures), and
+        # its own executor is bounded per item, so it can never park the League forever.
+        if pick == "victory_lap":
+            return self._run_victory_lap(state)
         if E4_GATE_ENABLED and pick in ("head_to_league", "enter_league"):
             _gate = self._e4_readiness_gate(state, pick)
             if _gate is not None:
@@ -12185,18 +17662,122 @@ class Campaign:
             # the unlock errand — so while a questline is active, head_to_gym drives THAT (e.g. north to
             # Bill for the S.S. Ticket) instead of the gated wall. Self-clears the instant the success flag
             # reads satisfied LIVE, then normal gym-routing resumes.
+            # GO-HARD OVERRIDE (2026-07-31, the LIVE gym↔Bill oscillation Jonny watched): when
+            # DOMINANT→GO / CREATOR→GO forces head_to_gym, this hijack sent the "forced gym march"
+            # up Route 24/25 to Bill instead — gym → errand walk-out → back → repeat, forever.
+            # Under GO-HARD the badge IS the next beat (same doctrine as the menu prune that forced
+            # the pick), so the questline hijack STANDS DOWN and head_to_gym drives THE ACTUAL GYM.
+            # The questline itself stays alive/untouched — normal (non-GO-HARD) ticks still run it.
+            # ROAD-BLOCKER EXCEPTION (2026-08-02, Route 9↔10 Celadon chalk): Flash (and Cut) are
+            # ON the billed road to the next gym — parking them under GO-HARD makes head_to_gym
+            # drive east into Rock Tunnel while the Flash errand walks west → border ping-pong
+            # forever (motives flip every seam). Bill-before-Misty was a DETOUR; Flash is the road.
+            _go_hard_now = False
+            try:
+                _co_gh = self._creator_order(state)
+                _co_gym = bool(_co_gh and _co_gh.get("order") not in ("catch_now", "get_flash"))
+                _go_hard_now = bool(_co_gym or self._gym_dominant(state)
+                                    or self._ace_carries_next_gym(state)
+                                    or getattr(self, "_force_gym_pick", False))
+            except Exception:
+                _go_hard_now = False
+            # ROUTE-12 SNORLAX UNBLOCK (2026-08-02 LIVE): wake BEFORE any south march. Without
+            # this, head_to_gym / heal both no_path into the sleeping body forever.
+            _wake = self._try_wake_route12_snorlax(state)
+            if _wake is not None:
+                return _wake
             if QUESTLINE_ENABLED and self._active_questline is not None:
-                return self._run_questline_step(state)
+                _ql_miss = getattr(self._active_questline.gate, "missing", None)
+                _ql_step = getattr(getattr(self._active_questline, "actionable", None),
+                                   "missing", None)
+                # ON-ROAD blockers (not detours): Flash/Cut on the billed spine, AND the whole
+                # pre-Koga Scope→Flute→Snorlax chain. GO-HARD must NOT park these — PRE-SCOPE LOCK
+                # sets _force_gym_pick, and parking FLAG_WOKE_UP_ROUTE_12_SNORLAX (or silph_scope)
+                # was the Lavender↔Route 8 blank-line thrash (2026-08-02). Check BOTH gate.missing
+                # (outer gate) and actionable.missing (current prereq step).
+                # SAFFRON PAIR (2026-08-03 LIVE, the Route-8 hut in/out loop Jonny watched): the
+                # badge-6 road is DOUBLE-gated — the gate guard wants the TEA, then Sabrina's own
+                # door is Rocket-blocked until Silph falls. Neither was listed here, so GO-HARD
+                # (ace-carries latched on L54 Blastoise) IGNORED the tea errand and drove "THE GYM
+                # DOOR" — which pre-Tea is a wall — while the errand's ANCHOR-FIRST walked her back
+                # into the UGP hut. One controller in, one controller out, every tick, forever.
+                # Tea/Silph are Flash-class (the road itself), not Bill-class (a detour).
+                # (set hoisted to module-level ROAD_BLOCKER_KEYS 2026-08-04 — shared with the
+                # team-build breather so roster surgery yields to story liberation.)
+                _road_blocker = (_ql_miss in ROAD_BLOCKER_KEYS) or (_ql_step in ROAD_BLOCKER_KEYS)
+                # LEGENDARY-HUNT PROXIMITY WAIVER (2026-08-04, the parked-hunt bug): the hunt
+                # gates (_zapdos/_articuno/_mewtwo_gate) arm dead-last among the luxuries, but
+                # with the L57 Blastoise ace-carrying every remaining gym GO-HARD is effectively
+                # PERMANENT — an armed hunt parked here would stay parked all the way to the E4,
+                # defeating its purpose (Jonny wants Zapdos/Articuno as pre-E4 E4-answers).
+                # NOT road-blocker class (a trophy hunt must never hijack the badge march from
+                # across the map): the park is waived ONLY when the hunt is here or one live
+                # edge away (_hunt_anchor_proximate — anchors from legendary_strikes, plus the
+                # map-header connections so the Articuno return launches from Cinnabar itself).
+                _hunt_key = (_ql_miss if _ql_miss in LEGENDARY_HUNT_KEYS
+                             else (_ql_step if _ql_step in LEGENDARY_HUNT_KEYS else None))
+                _hunt_here = _hunt_key is not None and self._hunt_anchor_proximate(_hunt_key)
+                if _go_hard_now and not _road_blocker and not _hunt_here:
+                    log("   [roam] !! GO-HARD: head_to_gym IGNORES the questline hijack "
+                        f"('{_ql_miss}'/step={_ql_step} errand parked, not cleared) — driving "
+                        f"THE GYM DOOR, not the errand")
+                else:
+                    if _go_hard_now and _road_blocker:
+                        log(f"   [roam] !! GO-HARD WAIVES questline park — "
+                            f"'{_ql_miss}'/step={_ql_step} is ON the billed road "
+                            f"(not a detour); running the unlock errand")
+                    elif _go_hard_now and _hunt_here:
+                        log(f"   [roam] !! GO-HARD WAIVES questline park — LEGENDARY HUNT "
+                            f"'{_hunt_key}' anchors HERE or one map over (proximity waiver); "
+                            f"running the hunt, the march resumes right after")
+                    return self._run_questline_step(state)
             # BATCH 6 PHASE 1 — SHE ACTUALLY CLIMBS. The loop's whole point: when she's AT the next gym's
             # city, don't just mill around — ENTER the gym, clear its junior trainers, beat the leader,
             # earn the badge, advance to the next base camp. beat_gym is the general, data-driven handler
             # (reserve -> enter -> juniors -> leader -> award -> badge); a loss propagates as battle_loss
             # (free_roam's blackout-recovery retries), a nav fail as 'stuck' (surfaces to the oracle —
             # never a freeze). She still CHOSE head_to_gym this tick (capability-not-script).
+            # ALSO when already INSIDE the target gym (Surge trash-can mid-hunt): call beat_gym again —
+            # do NOT warp-route OUT to the city (that left her thrashing cans / parking head_to_gym).
             ng = state.get("next_gym")
             gym = GYMS.get(ng["leader"]) if ng else None
-            if gym is not None and state["map"] == gym.city:
-                log(f"   [roam] ⛰️  AT {ng['leader']}'s city {gym.city} — ENTERING the gym to take the badge")
+            _here_mid = tuple(state["map"])
+            _in_target_gym = bool(
+                ng and gym and _here_mid == GYM_INTERIORS.get(ng.get("leader")))
+            # Wrong Celadon building while Erika is next (mansion/dept/Game Corner tourism):
+            # eject to the street so the next beat is the gym door, not leave_building wander.
+            if (ng and ng.get("leader") == "Erika" and gym is not None
+                    and _here_mid[0] == CELADON_GYM_INTERIOR[0]
+                    and not _in_target_gym and _here_mid[0] != 3):
+                log(f"   [roam] !! CELADON TOURISM at {_here_mid} — Erika's gym is the job; "
+                    f"exiting building to the street (NOT exploring random rooms)")
+                self.on_event("wrong building — Erika's gym is the one. back to the street.",
+                              kind="gym", tier=1)
+                self._ql_inside_target = False
+                self._exit_to_overworld()
+                self._wait_overworld()
+                state = self.read_live_state()
+                _here_mid = tuple(state["map"])
+                _in_target_gym = False
+            if gym is not None and (_here_mid == tuple(gym.city) or _in_target_gym):
+                if _in_target_gym:
+                    log(f"   [roam] ⛰️  ALREADY INSIDE {ng['leader']}'s gym {_here_mid} — "
+                        f"re-entering beat_gym (juniors / Cut trees / leader), NOT exiting")
+                    self._ql_inside_target = True
+                    self._ql_inside_map = _here_mid
+                else:
+                    log(f"   [roam] ⛰️  AT {ng['leader']}'s city {gym.city} — ENTERING the gym to take the badge")
+                # SURF-POISON CLEAR (2026-08-01 live): a beach water gate near Vermilion gym armed a
+                # parked `surf` questline (anchor Fuchsia). GO-HARD ignores the hijack but leaves it
+                # parked — next non-GO tick / discovery exile walks her onto Route 6 / UGP. When the
+                # next gym's door is HERE in this city, discard that poison immediately.
+                if (ng.get("leader") == "Lt. Surge"
+                        and (_here_mid == tuple(VERMILION) or _in_target_gym)
+                        and self._active_questline is not None
+                        and getattr(getattr(self._active_questline, "gate", None), "missing", None)
+                        == "surf"):
+                    self._clear_questline(
+                        "surf poison at Vermilion — Lt. Surge door is HERE, not a sea errand")
                 # PHASE 6 — DREAD: a gym is a hard challenge; name the nerves BEFORE the fight so the
                 # payoff has something to land against (earned relief requires prior worry). Tier-2
                 # anticipation; her core voice colors the actual nerves. Sharper if she's walled here.
@@ -12220,18 +17801,83 @@ class Campaign:
                 # actually use (can_use('cut') inside), so cutting the tree is idempotent + safe even
                 # mid-questline. Only OPEN a NEW gate errand when nothing's already in flight (preserve
                 # the original guard against competing questlines).
+                #
+                # CUT→RE-ENTER SAME TICK (2026-08-01 live Vermilion exile): after TIMBER the probe
+                # used to return None → stuck → next tick beach recognize armed `surf` → questline
+                # discovery marched her to Route 6 / UGP. On cut_cleared: immediate door re-enter
+                # (bounded) + beat_gym again; NEVER open a questline that leaves gym.city.
                 if out == "stuck" and QUESTLINE_ENABLED:
+                    _cut_cleared_this_tick = False
                     # STORY-PREREQ FIRST (2026-07-10 night shift 2, the Sabrina/Silph wall): a gym whose
                     # DOOR is Rocket/story-blocked has no tree for the HM probe to find — check the gym's
                     # story-prereq gate and arm the liberation errand (Silph Co.) BEFORE the HM probe
-                    # walks her around hunting a non-existent obstacle. Only when nothing's in flight.
-                    if self._active_questline is None:
-                        pgate = self._gym_prereq_gate(gym)
-                        if pgate and self._open_questline(pgate, state):
-                            return self._run_questline_step(state)
-                    gate = self._gym_gate_probe(gym)
-                    if gate and self._active_questline is None and self._open_questline(gate, state):
+                    # walks her around hunting a non-existent obstacle.
+                    # HARD RULE: at the gym city itself, NEVER open/pursue a surf/water questline from
+                    # this path — the door is HERE (Vermilion beach water is poison, not the gate).
+                    pgate = self._gym_prereq_gate(gym)
+                    if pgate is not None:
+                        _pm = getattr(pgate, "missing", None)
+                        if (_pm == "surf" or (isinstance(_pm, str) and "surf" in _pm)
+                                or (getattr(pgate, "detail", None) or {}).get("kind") == "water"):
+                            log(f"   [roam] !! AT-CITY: DISCARDING water/surf prereq gate "
+                                f"({pgate}) while standing in {gym.city} — door is HERE")
+                            pgate = None
+                    # STORY-PREREQ EVICTION (2026-08-04 LIVE, the Sabrina door-guard orbit Jonny watched):
+                    # this arm used to be gated behind `_active_questline is None` — but the parked FLY
+                    # errand (a luxury GO-HARD rightly ignores: "'fly'/step=fly errand parked, not
+                    # cleared") NEVER releases the one questline slot, so the Silph liberation gate
+                    # could not arm and she bonked the Rocket guard at (46,13) forever ("Don't get
+                    # defiant!"). Reaching THIS stuck path with an errand in flight is only possible
+                    # when GO-HARD parked a NON-road errand (road-blocker errands are waived + run
+                    # upstream and never reach beat_gym) — so a story-critical liberation
+                    # (GYM_PREREQS → _ROAD_BLOCKERS class) EVICTS the parked luxury, takes the slot,
+                    # and next tick GO-HARD's road-blocker waiver drives the errand, not the door.
+                    if pgate is not None and self._active_questline is not None:
+                        _cur_miss = getattr(self._active_questline.gate, "missing", None)
+                        if _cur_miss != getattr(pgate, "missing", None):
+                            self._clear_questline(
+                                f"story-prereq '{getattr(pgate, 'missing', '?')}' outranks the "
+                                f"parked '{_cur_miss}' errand — the gym door itself is story-walled")
+                    if (pgate is not None and self._active_questline is None
+                            and self._open_questline(pgate, state)):
                         return self._run_questline_step(state)
+                    gate = self._gym_gate_probe(gym)
+                    if gate == "cut_cleared":
+                        _cut_cleared_this_tick = True
+                        log(f"   [roam] 🪓 AT-CITY: cut_cleared at {gym.city} — immediate door "
+                            f"re-enter (no questline, no leave-city)")
+                        if self._retry_gym_door_enter(gym, tries=2) == "warped":
+                            out = self.beat_gym(ng["leader"])
+                            log(f"   [roam] 🪓 AT-CITY: post-Cut beat_gym re-call -> {out}")
+                        else:
+                            log(f"   [roam] !! AT-CITY: post-Cut enter still stuck at "
+                                f"{gym.door} — STAYING in {gym.city} (no surf/questline exile)")
+                            return "stuck"
+                    elif gate:
+                        _gm = getattr(gate, "missing", None)
+                        _gk = (getattr(gate, "detail", None) or {}).get("kind")
+                        # HARD RULE: at gym city / Surge interior — never open surf/water from probe.
+                        if (_gm == "surf" or _gk == "water"
+                                or (isinstance(_gm, str) and _gm.startswith("badge:surf"))):
+                            log(f"   [roam] !! AT-CITY: DISCARDING water/surf gym-gate "
+                                f"({gate}) — no-surf-questline while door is in {gym.city}")
+                            gate = None
+                        elif _gm not in ("cut", "strength"):
+                            log(f"   [roam] !! AT-CITY: IGNORING non-cut/strength gym-gate "
+                                f"({gate}) — not opening a Safari/surf errand from the door")
+                            gate = None
+                    if (gate and gate != "cut_cleared" and self._active_questline is None
+                            and self._open_questline(gate, state)):
+                        # Still stuck AFTER a successful cut this tick → stay; never leave gym.city.
+                        if _cut_cleared_this_tick:
+                            log(f"   [roam] !! AT-CITY: cut cleared but still stuck — "
+                                f"REFUSING questline step that would leave {gym.city}")
+                            return "stuck"
+                        return self._run_questline_step(state)
+                    if _cut_cleared_this_tick and out == "stuck":
+                        log(f"   [roam] !! AT-CITY: post-Cut still stuck — STAY in {gym.city}, "
+                            f"no questline exile to Route 6/UGP")
+                        return "stuck"
                 # GYM-INTERIOR PING-PONG BREAKER (descent re-grade 2026-07-08, the banked_SILPH
                 # Saffron loop): beat_gym 'stuck' can end with her INSIDE an interior she can't
                 # cross (Sabrina's teleport pads — strike-solved, not general yet); the next tick's
@@ -12244,16 +17890,86 @@ class Campaign:
                 if out == "stuck":
                     n = self._gym_stuck_streak.get(ng["leader"], 0) + 1
                     self._gym_stuck_streak[ng["leader"]] = n
-                    if n >= 2:
+                    # GO-HARD STAY (2026-07-31, the live Misty loop): while dominant / creator-ordered
+                    # (or riding MOMENTUM), a single wedged leg must NOT park the gym and send her
+                    # wandering out of the city — she re-enters beat_gym next tick (the force latch
+                    # re-arms every menu build). Bounded: after 5 consecutive stucks even GO-HARD
+                    # parks (watchdog/escape owns it).
+                    try:
+                        _stay_hard = _go_hard_now or self._momentum_live(state)
+                    except Exception:
+                        _stay_hard = _go_hard_now
+                    _park_at = 5 if _stay_hard else 2
+                    # SURGE TRASH-CAN GATE: never structurally park head_to_gym while FLAG_BOTH (0x264)
+                    # is unset — a stuck here is a puzzle-round failure, not a permanent layout wall.
+                    # Parking left her thrashing cans in free-roam without calling TrashCanPuzzle again.
+                    _surge_puzzle_open = False
+                    if ng.get("leader") == "Lt. Surge":
+                        try:
+                            import env_puzzle as _ep
+                            from field_moves import read_flag as _rf
+                            _surge_puzzle_open = not _rf(self.b, _ep.FLAG_BOTH_SWITCHES)
+                        except Exception as _spe:
+                            log(f"   [roam] surge puzzle-open check skipped: {_spe}")
+                    if _surge_puzzle_open:
+                        log(f"   [roam] !! SURGE PUZZLE STILL OPEN: beat_gym stuck x{n} — NOT parking "
+                            f"head_to_gym; TrashCanPuzzle re-arms next tick (inside gym or city)")
+                        # Clear a prior park on the city so a mid-puzzle stuck can't strand her.
+                        try:
+                            self._dead_moves_structural.get(tuple(gym.city), set()).discard("head_to_gym")
+                        except Exception:
+                            pass
+                    elif _stay_hard and n < _park_at:
+                        log(f"   [roam] !! GO-HARD: beat_gym stuck x{n} on {ng['leader']} — NOT parking, "
+                            f"NOT leaving {gym.city}; re-entering the gym next tick (cap {_park_at})")
+                    elif n >= _park_at:
                         self._dead_moves_structural.setdefault(tuple(gym.city), set()).add("head_to_gym")
                         self.on_event(f"okay, {ng['leader']}'s gym has me beat for the moment — that layout "
                                       f"is a puzzle and I keep bouncing off it. I'll regroup and come back "
                                       f"at it fresh.", kind="gym", tier=2)
                         log(f"   [roam] !! GYM-INTERIOR WALL: beat_gym stuck x{n} on {ng['leader']} — "
-                            f"head_to_gym structurally parked on {gym.city} until she leaves the map")
+                            f"head_to_gym structurally parked on {gym.city} until she leaves the map"
+                            + (" (GO-HARD retry cap exhausted)" if _go_hard_now else ""))
                 else:
                     self._gym_stuck_streak.pop(ng["leader"], None)
                 if out == "badge":
+                    # POST-BADGE BEAT (2026-07-31, Jonny debrief — the post-Misty Route-4 park): the
+                    # human rhythm after a badge is heal → stock up → MOVE ON; training happens on
+                    # the road forward (road-bench-XP arms on the march), never parked in cleared
+                    # grass behind. Latch a short window: the menu builder spares head_to_gym from
+                    # the new milestone's readiness floor + prunes grass-parking while it's live;
+                    # self-clears in a few ticks or the moment she leaves this city (march begun).
+                    self._post_badge_ticks = 6
+                    self._post_badge_city = tuple(gym.city)
+                    log(f"   [roam] 🏁 POST-BADGE BEAT armed at {gym.city}: heal/stock/march window — "
+                        f"grass parking OFF, forward march ON")
+                    # MOMENTUM LATCH (2026-07-31, the Route-4 seam loop; widened same day per
+                    # Jonny — "she can go to vermillion now"): EVERY badge win latches momentum.
+                    # A win IS the readiness proof; the human rhythm after any badge is heal →
+                    # stock → MARCH, with the bench training on the road forward — never a park
+                    # in the grass behind (a scrappy win used to skip the latch and the new
+                    # milestone's bench pin farmed Route 4 forever). `decisive` (zero faints,
+                    # ace healthy) is kept for FLAVOR only. Persisted (survives relaunch);
+                    # released by the next badge or any gym loss (loss-bump prep is the net).
+                    if MOMENTUM_ENABLED:
+                        try:
+                            import json as _j
+                            _pty = (self.read_live_state() or {}).get("party") or []
+                            _no_faints = bool(_pty) and all((m.get("hp") or 0) > 0 for m in _pty)
+                            _ace = max(_pty, key=lambda m: m.get("level", 0)) if _pty else None
+                            _ace_ok = bool(_ace and _ace.get("maxhp")
+                                           and (_ace.get("hp", 0) / _ace["maxhp"]) >= MOMENTUM_ACE_HP_FRAC)
+                            _decisive = _no_faints and _ace_ok
+                            _nbc = state.get("badge_count", 0) + 1   # the count AFTER this award
+                            with open(MOMENTUM_JSON, "w", encoding="utf-8") as f:
+                                _j.dump({"ts": time.time(), "badge_count": _nbc,
+                                         "beat": ng["leader"], "decisive": _decisive}, f)
+                            log(f"   [roam] 🔥 MOMENTUM LATCHED ({'DECISIVE' if _decisive else 'scrappy win'}): "
+                                f"{ng['leader']} is DOWN — readiness floor + bench pin STAND DOWN for the "
+                                f"next gym; heal/stock/MARCH (the road's trainers are the training). "
+                                f"Releases on the next badge or any gym loss.")
+                        except Exception as _mx:
+                            log(f"   [roam] momentum latch skipped: {_mx}")
                     # PHASE 6 — CATHARSIS: reference the worry so the relief is EARNED, not "oh great,
                     # moving on". Tier-3 big beat → her core deep-reaction path RISES; the saga promotes it.
                     nb = state.get("badge_count", 0) + 1
@@ -12275,6 +17991,31 @@ class Campaign:
                     # dread references). Tier-2 so it's felt, not swallowed.
                     self.on_event(f"no — no, we lost it. {ng['leader']} got me. okay… that one hurts. "
                                   f"I need to come back stronger.", kind="gym", tier=2)
+                    # HARD RELEASE ON LOSS (2026-07-31, Jonny's reversal after the Misty chalk): the
+                    # gym just PROVED she wasn't ready — every aggressive latch must stand down NOW
+                    # so the loss_bump/prep machinery (bench pin toward the milestone + ace XP via
+                    # the participation switch) owns the retry. The 5-stuck cap only covers nav
+                    # stucks; a battle LOSS never touched it. Clear the force latch, and delete a
+                    # live creator order (it's moot — obeying it again just re-feeds the loss; a
+                    # fresh order from Jonny re-arms everything).
+                    self._force_gym_pick = False
+                    try:
+                        if os.path.exists(CREATOR_ORDER_JSON):
+                            os.remove(CREATOR_ORDER_JSON)
+                            log(f"   [roam] !! GYM LOSS to {ng['leader']}: creator order RELEASED "
+                                f"(moot after the loss) + force latch cleared — loss_bump/prep "
+                                f"machinery owns the retry (grind bench + ace, THEN re-take)")
+                    except Exception as _cox:
+                        log(f"   [roam] creator-order release on loss skipped: {_cox}")
+                    # MOMENTUM releases on ANY gym loss (the gym just proved the ride is over) —
+                    # loss_bump/prep machinery owns the retry from here.
+                    try:
+                        if os.path.exists(MOMENTUM_JSON):
+                            os.remove(MOMENTUM_JSON)
+                            log(f"   [roam] 🔥 MOMENTUM released — {ng['leader']} beat her; prep "
+                                f"machinery (bench pin + loss bump) owns the retry")
+                    except Exception as _mox:
+                        log(f"   [roam] momentum release on loss skipped: {_mox}")
                 return out
             # WARP-AWARE forward routing toward the next gym CITY: route THROUGH warps/dungeons (the
             # Underground-Path class), not just map edges. Uses the world-model graph (live-learned warps
@@ -12282,21 +18023,50 @@ class Campaign:
             # live south-edge DISCOVERY below (she explores forward, learning each map's warps, which fills
             # the graph). One hop per tick — she can still divert (true free roam, discovery preserved).
             cur_map = tuple(state["map"])
-            # CAVE-PASS PRIORITY (2026-07-09 shift 6): when she's standing ON a billed 'pass' leg that
-            # runs THROUGH a dark warp-maze cave (Rock Tunnel: map (3,28) -> Lavender), the billed road
-            # MUST own the crossing (_cross_tunnel_leg), NOT the world-graph warp-route. Route 10's SOUTH
-            # map-connection to Lavender (3,4) is seeded as a plain EDGE, but that band is cliff-sealed —
-            # the only crossing is the tunnel — so _next_step_rideable returned an EDGE-ROUTE south that
-            # _edge_travel dead-ended on 'no_path', and head_to_gym got structurally pruned on Route 10
-            # (the shift-4 _cross_tunnel_leg fix never even ran). Same class as the shift-3 gated-shortcut
-            # preemption (Snorlax/Saffron), but via a phantom walkable edge. Run the billed road first so
-            # the tunnel crossing takes the leg; fall through to the warp-route only if it can't help.
-            _cave_road = self._gym_road(ng)
-            if _cave_road and any(leg["map"] == cur_map and leg.get("via") == "pass"
-                                  and leg.get("cave") for leg in _cave_road):
-                rr = self._road_step(state, _cave_road)
+            # BILLED-ROAD PRIORITY (2026-08-01, the Route-4 westward death-march): when a road is
+            # billed for the next gym, the CURATED road owns the routing OUTRIGHT — the world-graph
+            # warp-route below is only the fallback when the road can't help (_road_step -> None).
+            # WHY the flip: the graph route runs on whatever the graph believes, and seeded corridor
+            # priors can poison that belief — live 2026-08-01 03:5x, _next_step_rideable(Cerulean ->
+            # Vermilion) found the Diglett's-Cave prior and marched her WEST onto Route 4 (Mt.
+            # Moon... the long way around the region) while the billed road said SOUTH onto Route 5;
+            # the next western leg wedged, head_to_gym got structurally pruned, and with the seam
+            # bans live her action menu collapsed to talk_npc — the "repeating repeating" morning.
+            # This generalizes the shift-6 CAVE-PASS PRIORITY (Rock Tunnel), which was the same bug
+            # through a phantom edge: the road must preempt the graph EVERYWHERE, not only on cave
+            # legs. _road_step is leg-wise (one move per tick), gate-aware (questlines arm off it),
+            # and returns None off-road with no reachable anchor — exactly the fallback contract.
+            _road_first = self._gym_road(ng)
+            if _road_first:
+                rr = self._road_step(state, _road_first)
                 if rr is not None:
                     return rr
+                # ON-ROAD, THE ROAD IS AUTHORITATIVE — NO GRAPH FALLBACK (2026-08-01, part 2 of
+                # the Cerulean south-ledge seam fix): standing ON a billed (non-city) leg, the
+                # road's direction is the ONLY forward; the world-graph route below can believe
+                # a seeded/poisoned corridor (the Diglett's-Cave prior routes Cerulean->Vermilion
+                # the long way WEST through Route 4/Mt. Moon — i.e. BACKWARD along the billed
+                # road) and re-open the Cerulean<->Route 4 ping-pong the moment a road leg has a
+                # transient failure. _road_step returning None on a non-city leg is a KB data gap
+                # (a leg with no 'go'), never a license to route backward — fail LOUD and let the
+                # oracle re-decide. The gym CITY itself (the road's last leg) keeps the old flow:
+                # _road_step declines it by design and the blocks below own the in-city approach.
+                if any(l["map"] == cur_map for l in _road_first[:-1]):
+                    log(f"   [roam] ROAD to {ng.get('city', 'the next gym')}: ON the billed road at "
+                        f"{cur_map} but the road leg produced no move — road is AUTHORITATIVE here; "
+                        f"REFUSING the world-graph fallback (it can only lead backward off the road)")
+                    return "no_gym_route"
+            # PRE-SCOPE: capped road ends at Celadon — never graph-route toward Fuchsia (that
+            # re-opens Celadon→R7→R8→Lavender and the blank-line thrash). Drive the Scope errand
+            # (overwrite a parked Tea/detour — Scope is the only forward job until Flute).
+            if (ng and ng.get("leader") == "Koga"
+                    and not self._key_item_owned(359)
+                    and not self._key_item_owned(350)):
+                _sg = self._silph_scope_gate()
+                if _sg is not None and QUESTLINE_ENABLED and self._open_questline(_sg, state):
+                    log("   [roam] 🔭 PRE-SCOPE: refusing Fuchsia graph-route — running "
+                        "Silph Scope / Rocket Hideout errand")
+                    return self._run_questline_step(state)
             target_city = self._next_gym_city_map(ng)
             if target_city and target_city != cur_map:
                 # SAFFRON BYPASS (2026-07-09 shift 3): Saffron's gatehouses are GUARD-BLOCKED (a static
@@ -12520,6 +18290,14 @@ class Campaign:
             # WEAK members (not the ace) and level THEM to readiness — the real fix for "the display said
             # 'train the team' but the action trained the ace". Else the ordinary lead bump.
             t = self._prep_team_target(state)
+            # 2026-07-31 pacing tune: while Jonny has ordered the fight OR the ace overpowers the next
+            # gym, a picked 'battle' is a CASUAL fight (the bounded lead-bump below), never a parked
+            # full bench-grind session — same stand-down as the menu framing, kept in sync here so the
+            # executor can't do what the menu promised not to.
+            if t is not None and (self._creator_order(state) or self._gym_dominant(state)):
+                log("   [roam] battle executor: weak-member prep stands down (creator order / "
+                    "gym-dominant) — casual fight instead of a parked grind")
+                t = None
             if t is not None:
                 # E4-PREP FLOOR (PASS 3): when the target came from prep_for_e4 (badge 8, whole-team floor
                 # to ~L55), field only the LEVELABLE team (within E4_PREP_BAND) — never drag L8-14 box-fodder
@@ -12741,6 +18519,7 @@ class Campaign:
                 f"frozen-screen, sub-layer-agnostic)")
         self._stuck_request = None
         self._watchdog_trips = 0
+        self._latch_bails = 0
         red_ticks = 0                              # consecutive RED ticks (step-3 hard-recovery counter)
         hard_recovered = False                     # forced one position-break this RED streak already?
         escape_reloads = 0                         # ADDENDUM A: escape-hatch reloads this wedge-episode
@@ -12761,6 +18540,21 @@ class Campaign:
         except Exception as _ws:
             log(f"   [world] seed/caps skipped: {_ws}")
         self._boot_state_sanity()                  # PART C: scream NOW if the loaded save is suspect
+        # LEGENDARY REWIND (2026-08-05 EMERGENCY): a battled-away-but-uncaught quarry with a
+        # 'pre-<key>' bank resumes INTO the encounter — before the anchor below banks, before
+        # any lap/questline machinery can read the fought flag as 'done' and wander off.
+        try:
+            self._legend_rewind_at_boot()
+        except Exception as _lr:
+            log(f"   [hunt] legendary rewind check skipped: {_lr}")
+        # CATCH PIN SWEEP (2026-08-06): if a legendary is already owned, delete any leftover
+        # pre-<key> PROMOTE_TARGET so the next resume cannot rewind the catch.
+        try:
+            for _hk, (_hsp, _hh, _hf) in (getattr(self, "_LAP_HUNT_SPEC", {}) or {}).items():
+                if ram.pokedex_owns(self.b, _hsp) is True:
+                    self._clear_pre_hunt_promote(_hk, why="boot: already owned")
+        except Exception as _cps:
+            log(f"   [hunt] catch-pin sweep skipped: {_cps}")
         # BATCH 5 PHASE 1 — CAMPAIGN ANCHOR: bank her living save periodically + the moment she makes
         # real progress (a badge, a new area, a catch), so the next GO resumes the CLIMB from where she
         # actually is. _camp_sig is the cheap progress fingerprint we diff each tick.
@@ -12862,13 +18656,62 @@ class Campaign:
             # only; cannot touch the sacred states/kira/ spine (see _auto_checkpoint firewall).
             if AUTO_CKPT_ENABLED:
                 _now = _t.time()
-                _due = (_now - self._last_ckpt_t) >= CKPT_EVERY_S
-                if _gain_reason is not None or _due:
+                _cave_here = False
+                _mid_battle_ckpt = False
+                try:
+                    _mid_ck = tuple(tv.map_id(self.b))
+                    _cave_here = (_mid_ck in getattr(self, "_CELADON_SPINE_MAPS", ())
+                                  and _mid_ck[0] == 1) or _mid_ck in {(1, 81), (1, 82)}
+                    _mid_battle_ckpt = st.in_battle(self.b)
+                except Exception:
+                    _cave_here = False
+                _every = CKPT_EVERY_CAVE_S if _cave_here else CKPT_EVERY_S
+                _due = (_now - self._last_ckpt_t) >= _every
+                if _mid_battle_ckpt and (_gain_reason is not None or _due):
+                    log("   [roam] AUTO-CHECKPOINT deferred — mid-battle (refuse fight-rewind pin)")
+                elif _gain_reason is not None or _due:
                     if not _saved_this_tick:
                         self._save_campaign("ckpt"); self._continuity_save()
-                    self._auto_checkpoint(f"gain-{_gain_reason}" if _gain_reason else "periodic")
+                    self._auto_checkpoint(
+                        f"gain-{_gain_reason}" if _gain_reason
+                        else ("cave-periodic" if _cave_here else "periodic"))
                     self._last_ckpt_t = _now
             self._wait_overworld()
+            # POST-FLASH / ROUTE-4 RESCUE (2026-08-02 chalk #2): after Flash she rewound
+            # Pewter→Route3→Mt.Moon mouth; also parks on Route 4 forever. Force Diglett→Vermilion
+            # or Route4→Cerulean BEFORE any other roam pick can dig her deeper west.
+            _bc_now = sum(1 for i in range(8) if self.has_badge(0x820 + i))
+            # badge 3 ⇒ Erika/Celadon. Route4→Cerulean still applies at badge≥2 even without Flash.
+            _here = {
+                "map": tuple(tv.map_id(self.b)),
+                "badge_count": _bc_now,
+                "next_gym": {"city": "Celadon City"} if _bc_now == 3 else None,
+                "place": self._place_name(tuple(tv.map_id(self.b)), default=""),
+            }
+            _fr = self._rescue_post_flash_detour(_here)
+            if _fr is not None:
+                ledger.note_action("rescue_flash_detour", str(_fr))
+                if _fr in ("returned", "already_spine", "route4_east", "progress"):
+                    continue
+            # OFF-MISSION MT. MOON ESCAPE (2026-08-02 chalk): post-Cascade she wandered into Mt. Moon
+            # (graph prior / Diglett adjacency) and narrated it as Rock Tunnel. Escape on-foot via the
+            # proven clear_mt_moon plan BEFORE any other roam pick can dig her deeper. Teleport rescue
+            # stays retired — this is the on-foot substitute.
+            _esc = self._escape_off_mission_mt_moon({
+                "map": tuple(tv.map_id(self.b)),
+                "badge_count": _bc_now,
+            })
+            if _esc is not None:
+                ledger.note_action("escape_mt_moon", str(_esc))
+                # Only re-tick on real progress. "stuck" used to `continue` forever and skip
+                # leave_building (Route 4 Center park). Fall through so doors/roam can move her.
+                if _esc in ("cleared", "escaped_doors"):
+                    continue
+            # NOTE (2026-08-01): the RESCUE-TP boot seed that fired here is RETIRED — the blind
+            # party-submenu drive selected SUMMARY instead of TELEPORT live and looped her through
+            # menus on stream (see _teleport_rescue's docstring). Physical relocation goes through
+            # the deterministic CKPT/SNAPSHOT promote path in resume_marathon.ps1; on-foot routing
+            # is owned by head_to_gym's BILLED-ROAD PRIORITY.
             # WHITEOUT vs DELIBERATE INTERIORITY (night shift 14 — the S.S. Anne rival ping-pong): the
             # DIRECTED interior nav sets `_ql_inside_target` so the recovery below LEAVES her inside a
             # quest building (the ship). But a battle LOSS whites her out and warps her to a Pokémon Center
@@ -12906,6 +18749,22 @@ class Campaign:
             # (group != 3) and EXIT to the overworld so a real objective can re-establish from the Center
             # (a known-good anchor) — never leave her parked where nothing can succeed. The faint itself
             # is felt via _soul_after_objective(battle_loss); this is the explicit "I came to" beat.
+            # GYM-INTERIOR SANCTUARY (2026-08-02 Celadon chalk): standing in the NEXT gym after a
+            # junior fight looks exactly like a Center whiteout (indoors + battle_ran) — the old
+            # branch ejected her mid-gauntlet. Never treat an unearned target-gym map as blackout.
+            _tick_mid = tuple(tv.map_id(self.b))
+            _ng_live = None
+            try:
+                _ng_live = (self.read_live_state() or {}).get("next_gym")
+            except Exception:
+                _ng_live = None
+            _in_unearned_gym = bool(
+                _ng_live and _tick_mid == GYM_INTERIORS.get((_ng_live or {}).get("leader")))
+            if _in_unearned_gym:
+                self._ql_inside_target = True
+                self._ql_inside_map = _tick_mid
+                log(f"   [roam] GYM SANCTUARY: inside {_tick_mid} ({(_ng_live or {}).get('leader')}'s "
+                    f"gym, badge not earned) — NOT a blackout; staying for beat_gym")
             if (tv.map_id(self.b)[0] != 3 and not getattr(self, "_ql_inside_target", False)
                     and not getattr(self, "_battle_ran_this_action", False)):
                 # EVIDENCE GATE (run-9 ghost-vileplume class): being indoors at tick top is NOT proof of
@@ -12917,7 +18776,8 @@ class Campaign:
                 # rebuilt the hut hop-loop. No battle -> normal transit -> continue from inside.
                 log(f"   [roam] tick opened inside interior {tv.map_id(self.b)}@{tv.coords(self.b)} "
                     f"with no battle since last tick — NOT a blackout; continuing (mid-route interior)")
-            elif tv.map_id(self.b)[0] != 3 and not getattr(self, "_ql_inside_target", False):
+            elif (tv.map_id(self.b)[0] != 3 and not getattr(self, "_ql_inside_target", False)
+                    and not _in_unearned_gym):
                 # (…unless she's INSIDE a questline-target building on purpose — `_ql_inside_target`. The
                 # destination-interaction layer entered Bill's cottage to talk him; don't eject her before
                 # she does. It clears the marker itself on a wrong building / when the questline completes.)
@@ -12972,6 +18832,30 @@ class Campaign:
             if newly - self._afflict_seen:
                 log(f"   [roam] afflicted by {sorted(newly - self._afflict_seen)} — remembering for a cure run")
             self._afflict_seen |= newly
+            # FIELD CURE (2026-08-03): don't just REMEMBER the affliction — if the cure is in
+            # the bag, USE it right here on the overworld (poison eats HP every few steps).
+            if newly:
+                self._field_cure_tick()
+            # FIELD HEAL (2026-08-05, the Mt. Ember climb): the between-battles HP doctrine —
+            # ace under 50% (bench under 35%) + potions in the bag -> drink NOW ([fieldheal];
+            # skips-when-healthy is a cheap RAM scan, so this rides every tick).
+            try:
+                self.field_heal_check(reason="roam")
+            except Exception as _fhx:
+                log(f"   [fieldheal] roam seam skipped: {_fhx}")
+            # THE JOLTEON RITE (2026-08-03 OP-team pass): Eevee + Thunder Stone -> evolve on the
+            # spot; Eevee claimed but stone-less while standing in Celadon -> Dept 4F buys one.
+            # Cheap RAM scan, self-backing-off — see _jolteon_tick.
+            try:
+                self._jolteon_tick()
+            except Exception as _jt:
+                log(f"   [roam] jolteon tick skipped: {_jt}")
+            # EXP-SHARE EQUIP (2026-08-03): a claimed Exp. Share must RIDE on a mon to bank
+            # anything — hand it to the lowest healthy bench member the tick it's in the bag.
+            try:
+                self._expshare_equip_tick()
+            except Exception as _xe:
+                log(f"   [roam] exp-share equip skipped: {_xe}")
             # GATE-UNLOCK (PROACTIVE forward drive — ROOT FIX for the backward-grind): recognise the gate
             # on the FORWARD road to the next gym and OPEN/refresh the unlock questline BEFORE the action
             # set is built, so the errand is a dominant forward pull THIS tick instead of only firing
@@ -12979,6 +18863,20 @@ class Campaign:
             # (west to Route 4) and never trigger the gate. Self-clears the instant the flag reads satisfied.
             self._ensure_forward_questline(state)
             avail = self._available_actions(state)
+            # BAG-TM AUTO (empty offense): Teleport-only Abra etc. — a human opens the case
+            # immediately, doesn't wait for the oracle to notice. Score >=1000 = zero damaging
+            # moves on the recipient. One teach, then rebuild avail (offer drops once spent).
+            if BAG_TM_TEACH_ENABLED and "teach_tm" in avail:
+                try:
+                    _btp = self._plan_bag_tm_teach()
+                    if _btp and int(_btp.get("score") or 0) >= 1000:
+                        log(f"   [roam] !! BAG-TM AUTO: {_btp['mon']} has no damaging moves — "
+                            f"teaching TM{_btp['tm_no']:02d} now (not waiting on the oracle)")
+                        _btr = self.teach_bag_tms(max_teaches=1)
+                        log(f"   [roam] BAG-TM AUTO -> {_btr}")
+                        avail = self._available_actions(state)
+                except Exception as _bte:
+                    log(f"   [roam] BAG-TM AUTO skipped: {_bte}")
             party_str = ", ".join(f"{m['species']} L{m['level']}" for m in state["party"]) or "(none)"
             # MACRO PROGRESS LEDGER (increment 3): fingerprint THIS tick + escalate if the world has
             # sat unchanged across her last actions. GREEN=progressing / YELLOW=not getting anywhere /
@@ -12986,6 +18884,17 @@ class Campaign:
             fp = wf.fingerprint(self.b)
             macro = ledger.observe(fp)
             self._roam_progress = macro            # surfaced for the dashboard light to read later
+            # NEW-AREA GRACE bookkeeping (2026-08-05): stamp the first tick on every map this
+            # session — arriving somewhere never-visited is PROGRESS, and for NEW_AREA_GRACE_S
+            # the reload rungs stand down (gentle recovery only) while she learns the ground.
+            try:
+                _gm = tuple(tv.map_id(self.b))
+                if _gm not in self._map_first_seen:
+                    self._map_first_seen[_gm] = time.time()
+                if macro == ledger.GREEN:
+                    self._region_reload_skips = 0   # progress re-arms the region walk-back at newest
+            except Exception:
+                pass
             # ADDENDUM A — capture a KNOWN-GOOD snapshot on every PROGRESSING tick: this is the state the
             # escape-hatch rewinds to, so by construction it's from BEFORE any wedge and already carries
             # the latest gains. Cheap (one savestate held in memory); overwritten as she progresses.
@@ -12994,15 +18903,32 @@ class Campaign:
             # become the escape target — that was THE bug: the escape-hatch reloaded straight back into
             # the strand, looping forever (observed infinite STALL). A poisoned checkpoint is worse than
             # none. Both recent-good AND the gain-seam ring are guarded.
-            if macro == ledger.GREEN and not self._center_reachable_here():
+            if macro == ledger.GREEN and st.in_battle(self.b):
+                log("   [roam] known-good snapshot SKIPPED — mid-battle (refuse fight-rewind escape)")
+            elif macro == ledger.GREEN and not self._center_reachable_here():
                 log("   [roam] known-good snapshot SKIPPED — this spot can't reach a Center; refusing to "
                     "bank a poisoned escape target (would reload back into the strand)")
             elif macro == ledger.GREEN:
-                try:
-                    self._last_good_state = self.b.save_state()
-                    self._last_good_gain = self._gain_sig()
-                except Exception as _e:
-                    log(f"   [roam] last-good snapshot skipped: {_e}")
+                # POST-CASCADE Route 4 / Mt.Moon / that Center are DONE ground — banking them as
+                # escape-hatch targets rewound her to the Route 4 PC forever (2026-08-02 live TP chalk).
+                _km = tuple(tv.map_id(self.b))
+                _kbc = int(state.get("badge_count") or 0)
+                _kp = (state.get("place") or "").lower()
+                _route4_poison = (
+                    _km in self._MT_MOON_MAPS or _km == ROUTE4
+                    or "route 4" in _kp or "mt. moon" in _kp or "mt moon" in _kp
+                )
+                if _kbc >= 2 and _route4_poison:
+                    log(f"   [roam] known-good SKIPPED at {_km}/{_kp!r} — post-Cascade "
+                        f"Route4/Mt.Moon poison the escape-hatch rewind")
+                else:
+                    try:
+                        self._last_good_state = self.b.save_state()
+                        self._last_good_gain = self._gain_sig()
+                        self._last_good_map = _km      # region partition: the reload law needs
+                        #                                to know WHICH SIDE OF THE SEA this is
+                    except Exception as _e:
+                        log(f"   [roam] last-good snapshot skipped: {_e}")
                 # PHASE 1 — bank a deep-wedge fallback into the ring at a GAIN SEAM (a badge / a new
                 # teammate / a fresh catch since the last ring entry). Gain seams are guaranteed-clear
                 # states well clear of any wedge lip, so reverting to one ALWAYS escapes a structural
@@ -13012,6 +18938,7 @@ class Campaign:
                     if g is not None and g != self._ring_last_gain and (
                             self._ring_last_gain is None or any(c > p for c, p in zip(g, self._ring_last_gain))):
                         self._safe_ring.append({"state": self._last_good_state, "gain": g,
+                                                "map": _km,
                                                 "label": f"gain{g}@{state['place']}"})
                         self._ring_last_gain = g
                         log(f"   [roam] deep-wedge ring: banked safe checkpoint {g} @ {state['place']} "
@@ -13022,6 +18949,20 @@ class Campaign:
             log(f"   [roam] STATE IN: {state['place']} {state['coords']} | badges={state['badge_count']} "
                 f"({', '.join(state['badges']) or 'none'}) | party=[{party_str}] | {state['progress']}")
             log(f"   [roam] PROGRESS: {macro} (unchanged {ledger.stuck} ticks) | {wf.brief(fp)}")
+            # BORDER PING-PONG BREAKER (2026-08-04): the MACRO loop detector — many border
+            # crossings among few maps with zero world change = two controllers fighting over
+            # a boundary. Detects and breaks the rhythm (see _border_pingpong_tick).
+            try:
+                self._border_pingpong_tick(fp)
+            except Exception as _bpe:
+                log(f"   [roam] border ping-pong tick skipped: {_bpe}")
+            # STRAY-MENU SWEEP (2026-08-03 nuclear, the overworld Super-Potion loop): no flow is
+            # active at the tick top, so ANY bag/party/case screen here is an accident (a mis-fired
+            # START, an abandoned item flow) — B it closed before it eats the tick. Bounded + LOUD.
+            try:
+                self._sweep_stray_menus()
+            except Exception as _sme:
+                log(f"   [roam] stray-menu sweep skipped: {_sme}")
             # PHASE 7 cockpit: stamp the time a badge lands, then publish the health snapshot this tick.
             if state.get("badge_count", 0) > _prev_badges:
                 last_badge_ts = time.time()
@@ -13048,19 +18989,24 @@ class Campaign:
                 # PROBLEM 2 crash-hardening: the whole recovery is guarded LOUD so a disengage fault can't
                 # kill an unattended run (never swallow — full traceback logged).
                 try:
-                    from dialogue_drive import box_open as _bx
-                    if req["reason"] == "frozen_box" or _bx(self.b):
-                        self.on_event("this NPC's just looping the same lines and going nowhere — I'm "
-                                      "closing it and walking away.", kind="recover", tier=2)
-                        self._disengage_overworld_npc(req)      # B-to-close + step away + sticky mark
-                    else:
-                        self._mark_wedge_spot(req)
-                        self.on_event("I've been stuck on the same spot going nowhere — backing off and "
-                                      "trying something different.", kind="recover", tier=2)
+                    # RUNG 1 (extracted 2026-08-05, the Mt. Ember bag wedge): box -> B+step-away;
+                    # stray MENU -> bounded B-sweep + phantom-mark release, NEVER a wedge-mark
+                    # (the world was paused — the tile was never the problem); else wedge-mark.
+                    self._disengage_step1(req)
                     # ESCALATE only if she's STILL re-wedging this episode (the B+step-away didn't take):
                     if self._watchdog_trips >= 2:
                         log("   [roam] !! WATCHDOG re-trip this episode — escalating beyond B+step-away")
-                        if self._last_good_state:
+                        _grace = self._new_area_grace_left()
+                        if _grace > 0:
+                            # NEW-AREA GRACE (2026-08-05): virgin territory — a reload here is how
+                            # the One-Island teleport-back happened. Gentle rungs only while she
+                            # learns the ground; the reload rungs re-arm when the grace expires.
+                            log(f"   [roam] !! WATCHDOG escalation SOFTENED: never-visited map, "
+                                f"{_grace:.0f}s of new-area grace left — reload rungs stand down "
+                                f"(arriving here WAS the progress)")
+                            if tv.map_id(self.b)[0] != 3:
+                                self._exit_to_overworld()
+                        elif self._last_good_state:
                             self._escape_hatch_reload()
                         elif tv.map_id(self.b)[0] != 3:   # stranded in a building -> get to the overworld
                             self._exit_to_overworld()
@@ -13080,9 +19026,16 @@ class Campaign:
             # stop loud, never re-ask an impossible question for 20+ ticks (the live wedge). Capability-
             # not-script: she still picks among REAL options; this only fires when the WORLD won't move.
             red_ticks = red_ticks + 1 if macro == ledger.RED else 0
-            if macro != ledger.RED:
+            # WEDGE-EPISODE BUDGETS RESET ON *GREEN* ONLY (2026-07-30, the overnight revert-loop): these
+            # used to reset on any non-RED tick — but shuffling around inside a wedge basin reads YELLOW
+            # ("not getting anywhere"), so every reload bought a couple of YELLOW ticks, the budget reset,
+            # and the escape-hatch re-fired the SAME ~10s-old snapshot forever (Jonny watched it loop all
+            # night). The episode isn't over until REAL progress (GREEN) — until then each successive RED
+            # streak keeps consuming the SAME bounded budgets, so the ladder ESCALATES (recent-good reload
+            # x2 -> deep gain-seam ring -> abandon LOUD) instead of orbiting rung one.
+            if macro == ledger.GREEN:
                 hard_recovered = False
-                escape_reloads = 0                 # new episode — reset the escape budget
+                escape_reloads = 0                 # real progress — reset the escape budget
                 self._deepwedge_reverts = 0        # real progress — reset the deep-wedge ring budget too
             # ADDENDUM A — LAST-RESORT ESCAPE-HATCH: after the forced-heal hard-recovery has been tried and
             # RED *still* persists (a genuine fingerprint-frozen wedge, not idle), bank-current then reload
@@ -13090,13 +19043,20 @@ class Campaign:
             # self-re-wedging spot still reaches ABANDON. Anti-misfire safety lives in _escape_hatch_reload.
             if (red_ticks >= PROGRESS_ESCAPE_TICKS and hard_recovered
                     and escape_reloads < MAX_ESCAPE_RELOADS):
-                log(f"   [roam] !! ESCAPE-HATCH considering reload: RED {red_ticks} ticks, hard-recovery "
-                    f"already tried, reload {escape_reloads + 1}/{MAX_ESCAPE_RELOADS}")
-                if self._escape_hatch_reload():
-                    escape_reloads += 1
-                    red_ticks = 0                  # the reload broke the position — give it a fresh streak
-                    continue
-            if red_ticks >= max(wf.PROGRESS_ABANDON_TICKS, DEEPWEDGE_TICKS):
+                _grace = self._new_area_grace_left()
+                if _grace > 0:
+                    log(f"   [roam] !! ESCAPE-HATCH deferred: RED {red_ticks} ticks but she's on a "
+                        f"never-visited map ({_grace:.0f}s new-area grace left) — exploration is not "
+                        f"a wedge; the reload rung re-arms when the grace expires")
+                else:
+                    log(f"   [roam] !! ESCAPE-HATCH considering reload: RED {red_ticks} ticks, hard-recovery "
+                        f"already tried, reload {escape_reloads + 1}/{MAX_ESCAPE_RELOADS}")
+                    if self._escape_hatch_reload():
+                        escape_reloads += 1
+                        red_ticks = 0              # the reload broke the position — give it a fresh streak
+                        continue
+            if red_ticks >= max(wf.PROGRESS_ABANDON_TICKS, DEEPWEDGE_TICKS) \
+                    and self._new_area_grace_left() <= 0:
                 # PHASE 1 — DEEP-WEDGE FLOOR: the escape-hatch (recent-good) is exhausted and the world is
                 # STILL frozen — a structural wedge. Before abandoning, revert PROGRESSIVELY FURTHER BACK
                 # through the gain-seam ring to a guaranteed-clear checkpoint. Each revert is surfaced
@@ -13108,6 +19068,7 @@ class Campaign:
                     f"deep-wedge ring ({self._deepwedge_reverts} reverts) both exhausted — genuinely "
                     f"unrecoverable, this NEEDS A HUMAN (red light's real meaning)")
                 self._roam_progress = "ABANDONED"
+                self._save_wedge_memory()      # the relaunch MUST remember this trap — no amnesia loop
                 self.on_event("I'm completely stuck — I've tried everything and I can't find a way forward "
                               "on my own. I need a hand here.", kind="abandoned", tier=3)
                 self._fire_deadman_alert(state)    # PHASE 2 — dead-man's switch: ping Jonny, recovery failed
@@ -13142,11 +19103,25 @@ class Campaign:
             if not avail:
                 log("   [roam] no honest action available here — ending free roam"); break
             if self.soul is not None and (tick == 1 or tick % want_every == 1):
-                log(f"   [soul] surface_want FIRE -> {state['place']}")
-                self.soul.surface_want({"place": self._location_block(state), "map": state["map"],
-                                        "badges": state["badges"], "progress": state["progress"],
-                                        "party": self._party_brief(state),     # PHASE 1: team by NAME
-                                        "goal": self._goal_layers(state)})      # PHASE 1: 3-tier goal
+                # LIVE 2026-08-06: want oracle kept narrating Celadon/Eevee while victory_lap
+                # owned a Sevii ride-home turn — looked like she was "stuck talking in chat"
+                # with zero feet moving. Suppress the want while the lap drives the islands.
+                _lap_owns = False
+                try:
+                    # Only while Sevii-stranded: mainland lap legs can still voice wants.
+                    _lap_owns = (VICTORY_LAP_ENABLED and "victory_lap" in avail
+                                 and self._lap_sevii_stranded())
+                except Exception:
+                    _lap_owns = False
+                if _lap_owns:
+                    log(f"   [soul] surface_want SUPPRESSED — Sevii ride-home owns the turn "
+                        f"({state['place']})")
+                else:
+                    log(f"   [soul] surface_want FIRE -> {state['place']}")
+                    self.soul.surface_want({"place": self._location_block(state), "map": state["map"],
+                                            "badges": state["badges"], "progress": state["progress"],
+                                            "party": self._party_brief(state),     # PHASE 1: team by NAME
+                                            "goal": self._goal_layers(state)})      # PHASE 1: 3-tier goal
             # On YELLOW+, fold STUCK-AWARENESS into the oracle ctx via the existing `place` seam (the
             # only general field her oracle prompt renders — firewall: no core edit). She becomes AWARE
             # she's stuck; she still decides the next move HERSELF (capability-not-script).
@@ -13408,6 +19383,116 @@ class Campaign:
                     self._nav_watch = None
             except Exception as _nwx:
                 log(f"   [roam] wander-tripwire skipped: {_nwx}")
+            # ROUTE-12 SNORLAX: wake BEFORE force-gym / heal thrash (2026-08-02 LIVE).
+            try:
+                _ws = self._try_wake_route12_snorlax(state)
+                if _ws is not None:
+                    log(f"   [roam] !! FORCE SNORLAX WAKE (not gym/heal): {_ws}")
+                    self._force_gym_pick = False
+                    _forced_pick = None
+                    # Execute the wake as this tick's action result path — already ran inside
+                    # _try_wake_*; publish + continue like a completed pick.
+                    ledger.note_action("wake_snorlax", _ws)
+                    self._last_action_pick = "wake_snorlax"
+                    self._rationale = "Waking the Route 12 Snorlax with the Poké Flute — the road south is blocked until it moves."
+                    self._publish_health(macro, state, last_badge_ts, run_start_ts)
+                    continue
+            except Exception as _wsx:
+                log(f"   [roam] snorlax force-wake skipped: {_wsx}")
+            # HARD FORCE GYM (2026-07-31): DOMINANT→GO / CREATOR→GO latched _force_gym_pick while
+            # building the menu. If head_to_gym is still available, SKIP the oracle — she is not
+            # asked. Heal-only menus (hurt, gym option absent) leave the latch for the next tick
+            # so we never deadlock on a forced pick that isn't there.
+            # HEAL OUTRANKS THE WAR DRUM (2026-08-03, the lost gym-road battle): the 11:40
+            # session surfaced "SURVIVAL HURT: Blastoise 52/153" AND knew about the paralysis,
+            # then ACE-CARRIES GO HARD force-marched her past the Center into the fight that
+            # ended the run. Doctrine: a hurt or statused ACE turns around and heals FIRST —
+            # the gym march resumes next tick at full strength. Only the true creator order
+            # ("Jonny said go") may still override, and it does so LOUD.
+            if getattr(self, "_force_gym_pick", False) and "heal" in avail:
+                try:
+                    _sev, _ = self._hurt_severity()
+                    _statused = bool(self.party_statuses())
+                    _ph = self.party_health() or []
+                    _lead_frac = next((f for sl, h, m, f in _ph if sl == 0), 1.0)
+                    if _sev == "critical" or _statused or _lead_frac < 0.6:
+                        if self._creator_order(state):
+                            log("   [roam] !! GO HARD stands despite hurt/status — CREATOR ORDER "
+                                "(LAW); marching anyway (LOUD)")
+                        else:
+                            _forced_pick = "heal"
+                            self._force_gym_pick = False   # re-derived next tick, at full HP
+                            log(f"   [roam] !! FORCE HEAL over GO HARD: sev={_sev} "
+                                f"statused={_statused} lead_frac={_lead_frac:.2f} — a real player "
+                                f"heals BEFORE the war, not during the obituary")
+                            self.on_event("no no — we heal FIRST, then we go start the war. "
+                                          "marching in hurt is how runs end.", kind="heal", tier=2)
+                except Exception as _fhx:
+                    log(f"   [roam] force-heal check skipped: {_fhx}")
+            # TEAM-BUILD BREATHER (2026-08-04, Jonny + chat): under the GO-HARD latch the swap
+            # loop's actions (box_chaff/swap_keeper/fetch_keeper) were offered every tick and
+            # never picked — the forced march starved the roster rebuild, so the bench stayed
+            # hour-one chaff around the ace. When the bench is lopsided and a cheap roster move
+            # is on the menu, spend THIS tick on it (swap_keeper completes a cycle > box_chaff
+            # makes room > fetch_keeper catches at the area's level) and re-latch the march next
+            # tick. Bounded per badge; creator order (LAW) still marches; heal already outranked.
+            if (_forced_pick is None and getattr(self, "_force_gym_pick", False)
+                    and not self._creator_order(state)):
+                try:
+                    _tb = next((k for k in ("swap_keeper", "box_chaff", "fetch_keeper")
+                                if k in avail), None)
+                    if _tb and self._team_build_breather_ok(state):
+                        _forced_pick = _tb
+                        self._force_gym_pick = False   # re-derived next tick — the march resumes
+                        _tbs = getattr(self, "_tb_breather_spent", {})
+                        _tbc = int(state.get("badge_count") or 0)
+                        _tbs[_tbc] = _tbs.get(_tbc, 0) + 1
+                        self._tb_breather_spent = _tbs
+                        log(f"   [roam] !! TEAM-BUILD BREATHER "
+                            f"({_tbs[_tbc]}/{TEAM_BUILD_BREATHER_MAX} this badge): the forced march "
+                            f"yields ONE tick to '{_tb}' — the bench is dead weight and the plan has "
+                            f"a cheap fix on the menu; back on the gym road next tick")
+                except Exception as _tbx:
+                    log(f"   [roam] team-build breather skipped: {_tbx}")
+            if (_forced_pick is None and getattr(self, "_force_gym_pick", False)
+                    and "head_to_gym" in avail):
+                _forced_pick = "head_to_gym"
+                self._force_gym_pick = False
+                log("   [roam] !! FORCE GYM PICK: head_to_gym — oracle SKIPPED "
+                    "(dominant / creator order; grass is OFF the menu)")
+            # FORCE VICTORY LAP (2026-08-04): the pre-E4 checklist is not a taste question —
+            # when the lap action is on the menu it IS the endgame road (explicit order:
+            # Earthquake → Moltres → Articuno → Eevee → Zapdos). Heal still outranks a lap
+            # leg (the hunts are combat dungeons; nobody starts one hurt) — the lap re-forces
+            # next tick at full HP.
+            if _forced_pick is None and "victory_lap" in avail:
+                if "heal" in avail and self.needs_heal():
+                    _forced_pick = "heal"
+                    log("   [lap] !! heal BEFORE the lap leg — a combat dungeon is next; "
+                        "the lap re-forces at full HP")
+                else:
+                    _forced_pick = "victory_lap"
+                    log("   [lap] !! FORCE VICTORY LAP — oracle SKIPPED (the checklist owns "
+                        "the endgame sequencing; the order is code, not mood)")
+            # FORCE STOCK-UP (2026-08-03, the crucial battle lost with an empty-ish bag):
+            # standing IN a mart town, wallet healthy, carrying almost no heals = shopping is
+            # not a personality question. A real player tops up before walking back into the
+            # meat grinder — "make yourself broke so you're stocked" (creator doctrine). The
+            # oracle keeps its vote whenever she has a working kit; below the survival floor
+            # the pick is made for her. Gym force still outranks (its pre-gym legs stock too).
+            if _forced_pick is None and "stock_up" in avail:
+                try:
+                    _pots = sum(self.bag_count(i) for i in (ITEM_POTION, 22, 21, 20, 19))
+                    if _pots < 4 and self.money() > SHOP_MONEY_FLOOR + 700:
+                        _forced_pick = "stock_up"
+                        log(f"   [roam] !! FORCE STOCK-UP: only {_pots} potion(s) in the bag at a "
+                            f"mart town with ${self.money()} — oracle SKIPPED (survival doctrine: "
+                            f"never leave a shop under-stocked)")
+                        self.on_event("hold on — my bag is basically empty and there's a Mart "
+                                      "RIGHT there. shopping spree first, war after.",
+                                      kind="shop", tier=2)
+                except Exception as _fsx:
+                    log(f"   [roam] force stock-up check skipped: {_fsx}")
             # ZERO-INPUT THINK GUARANTEE (void-core batch): the watch-rig pump runs frames while the
             # LLM decides — if any prior handler left a key held (an abort path that skipped its
             # release), she WALKS during the think (the intra-tick position-jump class the QW-4 log
@@ -13420,10 +19505,19 @@ class Campaign:
             if _forced_pick is not None:
                 pick = _forced_pick
             else:
+                # THE STRATEGIST (2026-08-03): compute the prioritized directive block from live RAM
+                # and hand it to the oracle as its OWN ctx key — the bot renders it as a labeled
+                # "strategist brief" section (distinct from the narrative `place` folds), and the
+                # decide prompt now instructs her to FOLLOW it (champion doctrine, not taste/mood).
+                try:
+                    _strat = self._strategy_brief(state)
+                except Exception as _stx:
+                    _strat = ""
+                    log(f"   [strategist] brief skipped: {_stx}")
                 _t_choose = _t.time()
                 pick = self._soul_choose("action", avail,
                                          {"place": where, "progress": state["progress"], "party": _brief,
-                                          "goal": _goals})
+                                          "goal": _goals, "strategy": _strat})
                 _choose_ms = (_t.time() - _t_choose) * 1000
                 if _choose_ms > 500:
                     # F-7 pump-awareness: with play_live's frame_pump wired the world stays LIVE
@@ -13465,7 +19559,19 @@ class Campaign:
             # ROAD-BENCH-XP (PASS 3 NEW#1): on a forward-march leg with an under-milestone bench, lead
             # with the weak mon so it banks participation XP from this leg's road battles; the disarm in
             # the finally restores the ace so the weak lead never outlives the leg. Fail-safe throughout.
-            _road_xp = self._road_bench_xp_arm(pick, state)
+            # Skip when already IN the next gym's city and about to walk in — weak lead before
+            # beat_gym just fuelled paper_bench prep loops at Erika's door (2026-08-02).
+            _road_xp = False
+            try:
+                _gym_city_m = self._next_gym_city_map((state or {}).get("next_gym"))
+                _in_gym_city = (pick == "head_to_gym" and _gym_city_m
+                                and tuple((state or {}).get("map") or ()) == tuple(_gym_city_m))
+            except Exception:
+                _in_gym_city = False
+            if not _in_gym_city:
+                _road_xp = self._road_bench_xp_arm(pick, state)
+            else:
+                log("   [roam] ROAD-BENCH-XP: skipped — already at the gym city, ace leads the door")
             try:
                 out = self._route_action(pick, state)
             except Exception as _re:
@@ -13501,7 +19607,9 @@ class Campaign:
                              "questline_flash", "questline_catch",   # the Flash errand IS the work
                              "questline_strike_done", "questline_strike_exit_wip",  # the strike IS the work
                              "questline_prefight_heal",   # pre-rival Center tap IS the work (night shift 4)
-                             "need_heal", "healed_retry")
+                             "need_heal", "healed_retry",
+                             # Never park head_to_gym as dead because of a TM shop detour
+                             "need_cash_for_tm")
             if _is_move_pick and not _moved and out not in _benign_still:
                 self._nomove_streak += 1
                 self._dead_moves.add(pick)
@@ -13548,6 +19656,80 @@ class Campaign:
                 self._nomove_streak = 0
                 self._dead_moves.clear()
                 if tuple(_pos0[0]) != tuple(_pos1[0]):
+                    # ── SEAM-THRASH BREAKER (2026-07-31, the Route-4↔Cerulean border ping-pong):
+                    # count crossings of the SAME map seam; >=SEAM_TRIP_N inside SEAM_WINDOW_S with
+                    # no badge progress means two choosers are fighting over the border (one pulls
+                    # into backward grass, one pulls forward) — no amount of per-chooser bias is
+                    # trusted to be exhaustive, so break it STRUCTURALLY: no-go the backward member
+                    # for the session and hard-commit head_to_gym for the next few builds.
+                    if SEAM_BREAKER_ENABLED:
+                        try:
+                            _pair = frozenset((tuple(_pos0[0]), tuple(_pos1[0])))
+                            _bc_s = state.get("badge_count", -1)
+                            _nowt = _t.time()
+                            _sh = [e for e in getattr(self, "_seam_hist", [])
+                                   if _nowt - e[0] <= SEAM_WINDOW_S]
+                            _sh.append((_nowt, _pair, _bc_s))
+                            self._seam_hist = _sh
+                            _hits = sum(1 for e in _sh if e[1] == _pair and e[2] == _bc_s)
+                            if _hits >= SEAM_TRIP_N and _pair not in getattr(self, "_seam_broken", set()):
+                                self._seam_broken = getattr(self, "_seam_broken", set())
+                                self._seam_broken.add(_pair)
+                                _m_a, _m_b = sorted(_pair)
+
+                                def _fwd_score(m):
+                                    """Which side of the seam reads FORWARD: the objective itself,
+                                    the next gym's city, a map on its billed road, or a town (base
+                                    camp) — the other side is the backward pull to ban.
+                                    PRE-SCOPE: Lavender is NEVER forward (Tower chain locked) —
+                                    Celadon/Route 7 win so we ban the east thrash side."""
+                                    s = 0
+                                    try:
+                                        _pre_scope = (not self._key_item_owned(359)
+                                                      and not self._key_item_owned(350))
+                                        if _pre_scope and m == tuple(LAVENDER):
+                                            return -10
+                                        if _pre_scope and m == tuple(CELADON):
+                                            s += 6
+                                        if _pre_scope and m == (3, 25):   # Route 7 → Celadon
+                                            s += 4
+                                        if m == self._forward_objective_map(state):
+                                            s += 4
+                                        _ngx = state.get("next_gym")
+                                        if _ngx and m == self._next_gym_city_map(_ngx):
+                                            s += 3
+                                        if m in {tuple(l["map"]) for l in (self._gym_road(_ngx) or [])}:
+                                            s += 2
+                                        if self.world.is_town(m):
+                                            s += 1
+                                    except Exception:
+                                        pass
+                                    return s
+                                _sa, _sb = _fwd_score(_m_a), _fwd_score(_m_b)
+                                _back = _m_a if _sa < _sb else (_m_b if _sb < _sa else None)
+                                if _back is not None:
+                                    self._seam_nogo = getattr(self, "_seam_nogo", set())
+                                    self._seam_nogo.add(_back)
+                                self._seam_commit_ticks = 8
+                                log(f"   [roam] !!!! SEAM-THRASH BREAKER: crossed the "
+                                    f"{self.world.name(_m_a)}↔{self.world.name(_m_b)} border "
+                                    f"{_hits}x in {SEAM_WINDOW_S:.0f}s with no badge progress — "
+                                    + (f"{self.world.name(_back)} is NO-GO for the session; "
+                                       if _back is not None else
+                                       "no clear backward side (both read forward) — no ban; ")
+                                    + "hard-committing the FORWARD objective for the next 8 builds")
+                                self.on_event("okay, I've been pacing the same border like a lost "
+                                              "tourist — enough. Picking a direction and COMMITTING: "
+                                              "forward, next objective, go.", kind="travel", tier=2)
+                                # NOTE (2026-08-01): the teleport escalation that lived here is
+                                # RETIRED. Live, the blind party-submenu drive opened SUMMARY
+                                # instead of TELEPORT and looped her through menus on stream —
+                                # the exact "AI fiddling menus" look this project exists to avoid.
+                                # The border war's real root (graph-first gym routing) is fixed at
+                                # head_to_gym's BILLED-ROAD PRIORITY; the ban + forward-commit
+                                # above are the structural recovery. No blind menu driving.
+                        except Exception as _sbx:
+                            log(f"   [roam] seam breaker skipped: {_sbx}")
                     if pick == "head_to_gym":
                         # remember the leg so a structural fail on arrival can park its feeder
                         self._last_hg_leg = (tuple(_pos0[0]), tuple(_pos1[0]))
@@ -13912,6 +20094,15 @@ class Campaign:
             log(f"   !! CAMPAIGN SAVE REFUSED [{reason}]: the live world reads DEAD (title-screen "
                 f"signature — map (0,0), party 0). NOT poisoning the anchor (LOUD)")
             return False
+        # MID-BATTLE GUARD (2026-08-02): denser cave CKPTs + heartbeat saves must NEVER bank a
+        # fight-in-progress — escape-hatch / resume then rewind into the last seconds of the fight.
+        try:
+            if st.in_battle(self.b):
+                log(f"   !! CAMPAIGN SAVE REFUSED [{reason}]: mid-battle — not banking a fight "
+                    f"rewind target (LOUD)")
+                return False
+        except Exception:
+            pass
         try:
             os.makedirs(STATES_CAMPAIGN, exist_ok=True)
             path = os.path.join(STATES_CAMPAIGN, CAMPAIGN_SAVE)
@@ -14049,27 +20240,191 @@ class Campaign:
             log(f"   [auto-ckpt] prune skipped: {e}")
 
     def _playthrough_elapsed(self):
-        """HUD — seconds since this PLAYTHROUGH began (persists across sessions). Stamps the start once
-        (first ever free-roam) into playthrough.json, then reports elapsed forever after. Best-effort:
-        returns None if it can't read/write (the HUD just hides the timer rather than lying)."""
+        """HUD journey timer — TIME ACTUALLY PLAYED (2026-07-30 fix, Jonny's report: HUD said 23h on
+        a ~4h run). The old version reported wall-clock since a start_ts stamped at the showtime
+        migration — it kept counting overnight and between sessions. Now an ACCUMULATOR: this is
+        called on a live ~2s heartbeat (publish_health_tick), so we add each small heartbeat gap to
+        played_s and ignore big gaps (process down / offline). Backward-compat: a legacy
+        {start_ts}-only file restarts the accumulator at 0 — honest going forward, never inflated.
+        Best-effort: returns None on I/O trouble (the HUD hides the timer rather than lying)."""
         import json as _json
         try:
-            start = None
-            if os.path.exists(PLAYTHROUGH_JSON):
-                with open(PLAYTHROUGH_JSON, encoding="utf-8") as f:
-                    start = _json.load(f).get("start_ts")
-            if not start:
-                start = time.time()
+            now = time.time()
+            pt = getattr(self, "_playthrough", None)
+            if pt is None:
+                pt = {"played_s": 0.0, "beat_ts": now, "saved_ts": 0.0, "seeded_s": 0.0}
+                if os.path.exists(PLAYTHROUGH_JSON):
+                    try:
+                        with open(PLAYTHROUGH_JSON, encoding="utf-8") as f:
+                            data = _json.load(f) or {}
+                        if "played_s" in data:
+                            pt["played_s"] = float(data.get("played_s") or 0.0)
+                            # PRE-FIX BACKFILL (2026-07-31, Jonny: 'show new viewers how long this
+                            # run has been'): the accumulator started at ZERO at the 07-30 migration,
+                            # discarding the ~4-5h she'd genuinely played before it (that history was
+                            # only ever a wall-clock lie, so it couldn't be recovered exactly). Seed
+                            # Jonny's estimate ONCE into an existing un-seeded file: 'seeded_s' both
+                            # records the applied offset and blocks re-application. A FRESH run's
+                            # file is created below WITH seeded_s already set (0 backfill would be
+                            # a lie there — it truly starts at zero), so future runs never inherit it.
+                            if "seeded_s" in data:
+                                pt["seeded_s"] = float(data.get("seeded_s") or 0.0)
+                            else:
+                                seed = float(os.getenv("POKEMON_PLAYTHROUGH_SEED_H", "4.5")) * 3600.0
+                                pt["played_s"] += seed
+                                pt["seeded_s"] = seed
+                                log(f"   [hud] playthrough timer SEEDED +{seed / 3600.0:.1f}h (the "
+                                    f"pre-migration play the accumulator never saw) — journey total "
+                                    f"now {pt['played_s'] / 3600.0:.1f}h")
+                        else:
+                            log("   [hud] playthrough timer MIGRATED to time-actually-played — the "
+                                "legacy wall-clock stamp (counted offline hours) is discarded; the "
+                                "accumulator starts fresh from this session")
+                    except Exception:
+                        pass
+                self._playthrough = pt
+            gap = now - pt["beat_ts"]
+            if 0 < gap < 300.0:      # a live heartbeat (~2s..min); bigger = we were down, don't count it
+                pt["played_s"] += gap
+            pt["beat_ts"] = now
+            if now - pt["saved_ts"] > 15.0:              # throttled persist across restarts
+                pt["saved_ts"] = now
                 os.makedirs(STATES_CAMPAIGN, exist_ok=True)
                 tmp = PLAYTHROUGH_JSON + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as f:
-                    _json.dump({"start_ts": start}, f)
+                    _json.dump({"played_s": round(pt["played_s"], 1),
+                                "seeded_s": round(pt.get("seeded_s", 0.0), 1),
+                                "updated_ts": now}, f)
                 os.replace(tmp, PLAYTHROUGH_JSON)
-                log(f"   [hud] playthrough timer started (stamped {PLAYTHROUGH_JSON})")
-            return max(0.0, time.time() - start)
+            return pt["played_s"]
         except Exception as e:
-            log(f"   [hud] playthrough timer read skipped: {e}")
+            log(f"   [hud] playthrough timer skipped: {e}")
             return None
+
+    def _strategy_brief(self, state):
+        """THE STRATEGIST (2026-08-03, 'high level programmatic prompted strategy'): a PRIORITIZED,
+        machine-computed directive block folded into every action-oracle prompt as its own labeled
+        section — expert counsel from live RAM, not vibes. This is the missing UPSTREAM half of the
+        strategy work: the reflexes (force-heal / force-stock / futility breaker) fire when things are
+        already bad; this makes her PICKS strategic BEFORE the reflexes are ever needed, and it's what
+        turns 'taste/mood' choices into champion play (the bot-side prompt reframe consumes it).
+
+        Priority order (top outranks all below — the prompt says so explicitly):
+          1) SURVIVAL   — hurt/statused core -> heal/cure first, with names and numbers.
+          2) SUPPLIES   — thin bag + healthy wallet -> stock up; money is ammo.
+          3) WAR PREP   — next gym: leader/types/level band, HER best answer mon, underlevel warning.
+          4) TEAM BUILD — the planner's single highest-leverage roster move (catch/evolve/teach/grind).
+          5) STANDING ORDERS — roll credits; forward > wandering; type-first fighting.
+
+        Every line is derived (present only when its condition is REAL this tick) and bounded, so the
+        block never bloats. Best-effort throughout: a read fault degrades to fewer lines, never raises."""
+        lines = []
+        # ── 1) SURVIVAL ────────────────────────────────────────────────────────────────────────────
+        try:
+            sev, note = self._hurt_severity()
+            stats = self.party_statuses()
+            ph = self.party_health() or []
+            lead_frac = next((f for sl, h, m, f in ph if sl == 0), 1.0)
+            fainted = sum(1 for _, h, _, _ in ph if h == 0)
+            st_s = f" and status trouble ({', '.join(sorted(stats))})" if stats else ""
+            if sev == "critical" or lead_frac < 0.5:
+                lines.append(f"SURVIVAL FIRST (outranks everything): {note or 'the fighting core is in the red'}"
+                             f"{st_s} — heal/cure BEFORE any fight or march. Blackouts end runs; Centers are free.")
+            elif sev == "hurt" or stats or fainted:
+                bits = []
+                if note:
+                    bits.append(note)
+                if stats:
+                    bits.append(f"status: {', '.join(sorted(stats))} — cure from the bag NOW if carried")
+                if fainted:
+                    bits.append(f"{fainted} fainted on the bench")
+                lines.append("PATCH UP: " + "; ".join(bits) +
+                             ". Heal at the next Center you pass — never chain fights while damaged.")
+        except Exception as _e:
+            log(f"   [strategist] survival read skipped: {_e}")
+        # ── 2) SUPPLIES (item ids: potions 13/22/21/20/19, cures 14/18/23/17/15/16, revive 24,
+        #      balls 1-4 — same families the force-stock floor and shopping list use) ───────────────
+        try:
+            pots = sum(self.bag_count(i) for i in (13, 22, 21, 20, 19))
+            cures = sum(self.bag_count(i) for i in (14, 18, 23, 17, 15, 16))
+            revs = self.bag_count(24)
+            money = self.money()
+            if (pots < 5 or cures < 2) and money > SHOP_MONEY_FLOOR:
+                lines.append(f"QUARTERMASTER: the bag is thin — {pots} potion(s), {cures} status cure(s), "
+                             f"{revs} revive(s), ${money} in pocket. Money is ammo: next Mart, stock potions "
+                             f"toward ~12, cures for what's been hurting the team, a couple of Revives. "
+                             f"Never walk into a gym or a long route under-stocked.")
+        except Exception as _e:
+            log(f"   [strategist] supplies read skipped: {_e}")
+        # ── 3) WAR PREP — the next gym matchup, HER answers, the level bar ─────────────────────────
+        try:
+            ng = state.get("next_gym") or {}
+            rec = (getattr(self.planner, "threats", {}) or {}).get(ng.get("leader")) if ng else None
+            party = state.get("party") or []
+            if rec:
+                types = "/".join(rec.get("types") or []) or "?"
+                band = rec.get("level_band") or [0, 0]
+                weak = set(rec.get("weak_to") or [])
+                from pokemon_planner import _types_of as _pt
+                answers = [m.get("species") for m in party if weak & set(_pt(m))]
+                top = max((m.get("level", 0) for m in party), default=0)
+                war = (f"WAR PREP: next is {ng.get('leader')} ({types}, ~L{band[0]}-{band[-1]}). ")
+                war += (f"Your answer on the team: {answers[0]} — lead with it and keep it healthy. "
+                        if answers else
+                        f"No clean type answer on the team — {rec.get('counter', 'play careful and stocked')}. ")
+                if top < band[0] - 2:
+                    war += f"You're under the bar (top L{top} vs ~L{band[0]}): grind the road there first."
+                lines.append(war.strip())
+            elif state.get("badge_count", 0) >= 8 and not state.get("post_game"):
+                lines.append("WAR PREP: the Elite Four is five fights with NO Center between them — full "
+                             "restores, revives, ethers, and a levelled WHOLE team, or don't walk in.")
+        except Exception as _e:
+            log(f"   [strategist] war-prep read skipped: {_e}")
+        # ── 4) TEAM BUILD — the planner's one highest-leverage roster move ─────────────────────────
+        try:
+            act = self.team_planner.assess(state.get("party") or [], state.get("badge_count", 0),
+                                           post_game=state.get("post_game", False))
+            if act and act.get("kind") not in (None, "on_track"):
+                lines.append(f"TEAM BUILD: {act.get('why', act.get('kind'))}.")
+        except Exception as _e:
+            log(f"   [strategist] team-build read skipped: {_e}")
+        # ── 4b) DEX PUSH — the Exp. Share bar (Route 15 aide, 50 CAUGHT). Opportunistic doctrine:
+        #      catch every NEW species crossed, never wander for it. Silent once claimed/met. ────
+        try:
+            if (EXPSHARE_FETCH_ENABLED and (state.get("badge_count") or 0) >= 5
+                    and not fm.read_flag(self.b, 0x256)):
+                _owned = self.pokedex_count() or 0
+                if _owned < 50:
+                    lines.append(f"DEX PUSH: {_owned}/50 species caught — at 50 the Route 15 aide "
+                                 f"(by Fuchsia) hands over the EXP. SHARE (the whole bench levels "
+                                 f"off every fight). Catch every NEW species you cross; never "
+                                 f"wander just to hunt.")
+        except Exception as _e:
+            log(f"   [strategist] dex-push read skipped: {_e}")
+        # ── 4c) ICE BEAM FUND — the Game Corner TM13 budget (2026-08-04, Jonny: 'get ice beam
+        #      to OP herself through the game'). Doctrine while short: money is being SAVED —
+        #      sell loot at every counter (automatic), don't splurge past the stock floors.
+        #      Silent once affordable (the gate takes over) or once somebody knows move 58. ────
+        try:
+            if ICEBEAM_FETCH_ENABLED and (state.get("badge_count") or 0) >= 5:
+                import game_corner as gc
+                _pc = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+                if (st.party_knows_move(self.b, gc.MOVE_ICE_BEAM, _pc) is None
+                        and gc.tm_case_qty(self.b, gc.ITEM_TM13) <= 0):
+                    _short = gc.ice_beam_cash_shortfall(self)
+                    if _short > 0:
+                        lines.append(f"ICE BEAM FUND: ¥{_short:,} short of the Game Corner TM13 "
+                                     f"budget (~¥80,500 total). Ice Beam on the ace freezes "
+                                     f"everything left — Venusaur, Lance's dragons, the birds. "
+                                     f"Fight your battles for the payouts, sell loot at marts, "
+                                     f"buy supplies but never splurge. It arms itself when funded.")
+        except Exception as _e:
+            log(f"   [strategist] ice-beam-fund read skipped: {_e}")
+        # ── 5) STANDING ORDERS — the doctrine floor, always present ────────────────────────────────
+        lines.append("STANDING ORDERS: the goal is ROLL CREDITS. Forward progress beats wandering; heal "
+                     "beats fighting hurt; type advantage decides fights; build the planned team, not "
+                     "just the ace.")
+        return "\n".join(f"{i}) {ln}" for i, ln in enumerate(lines, 1))
 
     def _party_brief(self, state):
         """Her team, by NAME — '<nickname> the <species> (Lxx)' when she's named one (soul.bonds), else
@@ -14134,12 +20489,28 @@ class Campaign:
                 onward = f", then push on toward {ng['city']}" if ng else ""
                 medium = f"Build a team strong enough to beat {who} at {place}{onward}"
             elif ng:
-                medium = (f"You're ready — travel to {ng['city']} and take on {ng['leader']}" if rdy
+                # DOMINANCE counts as ready (2026-07-31): rdy is wall-relative (needs a recorded LOSS),
+                # so a never-lost run said only 'Make your way to <city>' — a nothing-goal when she's
+                # already standing in it, which let the bench-alarm beats own her intent.
+                medium = (f"You're ready — travel to {ng['city']} and take on {ng['leader']}"
+                          if (rdy or self._gym_dominant(state))
                           else f"Make your way to {ng['city']}")
             elif state.get("post_game"):
                 medium = "Head out of the league, heal up, and pick the next adventure"
             else:
                 medium = "Press on through the league"
+            # QUESTLINE-FIRST MEDIUM (2026-07-30, the post-Nugget-Bridge Misty-vs-Bill dither): while
+            # an unlock errand is ACTIONABLE, the road to the gym literally runs THROUGH it (canon
+            # order: Bill's S.S. Ticket before Misty) — but the goal layers kept saying "Misty" while
+            # the questline said "north to Bill", and she flip-flopped between the two voices. One
+            # stated order ends the dither. Generic: works for every gate, not just Cerulean.
+            try:
+                _qlg = getattr(self, "_active_questline", None)
+                if _qlg is not None and getattr(_qlg, "actionable", None) is not None:
+                    _errand = getattr(_qlg.actionable, "human", None) or "finish the unlock errand"
+                    medium = f"FIRST {_errand} — the gym comes right after; that errand is the road"
+            except Exception:
+                pass
             # SHORT — current want, or the concrete strengthen task with an END CONDITION when walled
             want = ""
             try:
@@ -14147,7 +20518,72 @@ class Campaign:
                     want = str(self.soul.wants[-1])
             except Exception:
                 want = ""
-            if wr and not rdy:
+            # SURGE REMATCH PREP (2026-08-01/02): Wartortle below Blastoise, or readiness says
+            # not ready (paper bench / rematch bar) — NEVER "You're ready — stop grinding".
+            # Viewers-fine grass farm: Blastoise +1–2 and one bench ~L20, THEN retry.
+            _surge_prep = False
+            _surge_blastoise = False
+            try:
+                if ng and ng.get("leader") == "Lt. Surge":
+                    _top_g = max(party, key=lambda m: m.get("level", 0)) if party else None
+                    _sp_g = (_top_g.get("species") or "").lower() if _top_g else ""
+                    _lv_g = int(_top_g.get("level") or 0) if _top_g else 0
+                    if _sp_g in ("squirtle", "wartortle") and _lv_g < BLASTOISE_EVO_LEVEL:
+                        _surge_prep = True
+                    elif self._gym_go_hard_blocked(state):
+                        _surge_prep = True
+                        _surge_blastoise = (_sp_g == "blastoise")
+            except Exception:
+                _surge_prep = False
+            if _surge_prep and ng:
+                if _surge_blastoise:
+                    short = (f"Grind Blastoise toward L{BLASTOISE_REMATCH_LEVEL} and raise one "
+                             f"bench mon to ~L20 in grass, THEN retry Lt. Surge")
+                    medium = ("Close last time — a short farm so Blastoise finishes Raichu "
+                              "(or a bench mon can), then re-take the Thunder Badge. Not "
+                              "infinite gym spam.")
+                else:
+                    short = (f"Evolve to Blastoise (L{BLASTOISE_EVO_LEVEL}) — level up Wartortle, "
+                             f"THEN re-challenge Lt. Surge")
+                    medium = ("Raise the fieldable bench so they survive Raichu, then re-take the "
+                              "Thunder Badge — do not march in with paper mons")
+                return {"short": short, "medium": medium, "long": long}
+            # GO-HARD (dominant / creator / momentum / ace-carries / force latch): never whisper
+            # "grind to L19" — _prep_team_target returns None when the ace carries (Celadon chalk),
+            # and short goals must say MARCH, not park. Matches the menu prune + FORCE GYM PICK.
+            # Prep-blocked (mid-evo / loss bump): only creator order may still say GO.
+            _go_hard = False
+            _mom_g = False
+            _ace_g = False
+            try:
+                _prep_block = self._gym_go_hard_blocked(state)
+                _ord_g = self._creator_order(state)
+                _mom_g = (not _prep_block) and self._momentum_live(state)
+                _ace_g = (not _prep_block) and self._ace_carries_next_gym(state)
+                _go_hard = bool(_ord_g or (
+                    (not _prep_block) and (
+                        getattr(self, "_force_gym_pick", False)
+                        or self._gym_dominant(state)
+                        or _mom_g
+                        or _ace_g)))
+            except Exception:
+                _go_hard = False
+            if _go_hard and ng:
+                # Questline "Bill before Misty" medium also drops — badge is the beat now.
+                # MOMENTUM flavor: she CRUSHED the last one — the spine says ride it, and the
+                # road's trainers are the training (never backward grass).
+                if _mom_g:
+                    _mbt_g = getattr(self, "_momentum_beat", "the last gym leader")
+                    _mwin = (f"You CRUSHED {_mbt_g}" if getattr(self, "_momentum_decisive", True)
+                             else f"You beat {_mbt_g}")
+                    medium = (f"{_mwin} — ride the momentum: {ng['leader']} in {ng['city']} is "
+                              f"NEXT (not fought yet); the trainers on the way are your training")
+                elif _ace_g:
+                    medium = (f"Your ace already clears {ng['leader']}'s level bar — march to "
+                              f"{ng['city']}; train the bench on the road (not parked grass)")
+                else:
+                    medium = f"You're ready — travel to {ng['city']} and take on {ng['leader']}"
+            if wr and not rdy and not _go_hard:
                 target = wr.get("lead_level") or 0
                 # STRATEGIC UNDERLEVEL-GRIND (Task B): when the TEAM FLOOR is the problem, the concrete
                 # task is to level the WEAK members (named) by fielding them — not a vague "train the team".
@@ -14163,7 +20599,7 @@ class Campaign:
                     short = "Catch a teammate so you're not going in solo, then retry"
                 else:
                     short = "Grind the team up a couple levels, then go back and retry"
-            elif rdy:
+            elif rdy or _go_hard:
                 _bc = state.get("badge_count", 0)
                 _bn = self._BADGE_NAMES[_bc] if _bc < len(self._BADGE_NAMES) else None
                 short = (f"You're ready — stop grinding and head to {ng['city']}"
@@ -14180,19 +20616,40 @@ class Campaign:
 
     # FIX 2 — RUN HISTORY (her story-so-far), keyed by what her badges PROVE she's done this run. Honest
     # past, NOT omniscient future (the Lapras-confabulation guard: she knows where she's BEEN, discovers
-    # what's ahead). Extend as she earns more badges.
+    # what's ahead). MUST cover every badge count — empty at ≥3 made her forget Surge on stream
+    # (2026-08-02 chalk: "forgot beating Lt. Surge" while Thunder Badge was in RAM).
     _STORY_MILESTONES = {
         0: "You just set out from Pallet Town with your first Pokémon — the whole journey's ahead of you.",
         1: "You started in Pallet Town, crossed Route 1-2 and Viridian Forest, and beat Brock in Pewter "
            "City for the Boulder Badge. Now you're pushing on toward the next gym.",
         2: "You started in Pallet Town, beat Brock in Pewter (Boulder Badge), fought up Route 3 and "
            "through the Mt. Moon cave — a real maze you nearly got lost in — reached Cerulean City, and "
-           "beat Misty for the Cascade Badge. Now you're after your third gym.",
+           "beat Misty for the Cascade Badge. That badge unlocked Cut (HM01) — you can clear cuttable "
+           "trees. Now you're after your third gym: Lt. Surge in Vermilion.",
+        3: "You've beaten Brock (Boulder), Misty (Cascade), and Lt. Surge in Vermilion for the Thunder "
+           "Badge — that's THREE gyms done. You have Cut and can clear trees on the road. Next is Erika "
+           "in Celadon City (Rainbow Badge).",
+        4: "Four badges: Brock, Misty, Lt. Surge, and Erika in Celadon (Rainbow). You've been through "
+           "the early Kanto road — next is Koga in Fuchsia for the Soul Badge.",
+        5: "Five badges in — Brock, Misty, Surge, Erika, Koga. Surf should be opening the seas. Next is "
+           "Sabrina in Saffron (Marsh Badge).",
+        6: "Six badges: only Blaine on Cinnabar (Volcano) and Giovanni in Viridian (Earth) stand between "
+           "you and the Elite Four road.",
+        7: "Seven badges — one left: Giovanni in Viridian for the Earth Badge, then the Indigo Plateau.",
+        8: "All eight Gym Badges are yours. The Elite Four and the Champion are the summit.",
     }
 
     def _story_so_far(self, badge_count):
-        """Her real run history (what she's actually done), for grounding her decision + voice context."""
-        return self._STORY_MILESTONES.get(badge_count, "")
+        """Her real run history (what she's actually done), for grounding her decision + voice context.
+        Uses the highest milestone ≤ badge_count so a missing key never blanks her past."""
+        try:
+            bc = int(badge_count or 0)
+        except Exception:
+            bc = 0
+        for k in range(bc, -1, -1):
+            if k in self._STORY_MILESTONES:
+                return self._STORY_MILESTONES[k]
+        return ""
 
     def _spine_and_history(self, state):
         """FIX 1+2 — the FIXED main-quest SPINE + her real RUN HISTORY, folded into her oracle ctx so she's
@@ -14239,6 +20696,31 @@ class Campaign:
                       f"forward leads there: until you've won you are ALWAYS making progress toward the "
                       f"next gym. Grinding/catching/detours are fine — but ONLY with a clear purpose, and "
                       f"then you GET BACK ON THE ROAD to {ng['city']}. Never just circle the same grass.")
+            # ONE ORDER, NOT TWO VOICES (2026-07-30, the Misty-vs-Bill dither): while an unlock
+            # errand is live, say EXPLICITLY that it comes before the gym — otherwise this spine
+            # ("next is Misty") and the questline narration ("head north to Bill") read as two
+            # competing objectives and she oscillates between them tick to tick.
+            try:
+                _qls = getattr(self, "_active_questline", None)
+                if _qls is not None and getattr(_qls, "actionable", None) is not None:
+                    _errand = getattr(_qls.actionable, "human", None) or "the unlock errand"
+                    spine += (f" ⚠️ ORDER OF OPERATIONS: before {ng['leader']}, {_errand} — that errand "
+                              f"comes FIRST (it unblocks the road and the trainers along it are exactly "
+                              f"the training you need). {ng['leader']} is step two, not a competing "
+                              f"choice.")
+            except Exception:
+                pass
+            # CREATOR ORDER (2026-07-31, LAW): Jonny's spoken order outranks every layer of this
+            # spine — say so EXPLICITLY so her reasoning and her voice both align with obeying it
+            # (chat is advice she weighs; Jonny is command authority she follows).
+            try:
+                _ord = self._creator_order(state)
+                if _ord:
+                    spine += (f" ⚡ JONNY'S DIRECT ORDER (LAW): \"{_ord.get('raw', '')}\" — Jonny told "
+                              f"you this OUT LOUD, and his word outranks every prep instinct, every "
+                              f"grind plan, and everything chat says. Do it NOW; training can wait.")
+            except Exception:
+                pass
             # P-1(b) ANTICIPATION FOLKLORE (couch fix-pass 1): what she's HEARD about the gym
             # ahead — trainer-talk a first-timer picks up, never walkthrough knowledge. Feeds
             # the forward-musing habit ("I hear the first gym is rock-type… that's bad for you,
@@ -14282,9 +20764,15 @@ class Campaign:
             return f"Heading for the next gym{(' — ' + ng['city']) if ng else ''}: {short}."
         if pick in ("battle", "wander_catch"):
             # STRATEGIC UNDERLEVEL-GRIND (Task B): make the WHY explicit on the dashboard — she's leveling
-            # the weak members on purpose to cross the wall, not aimlessly farming.
+            # the weak members on purpose to cross the wall, not aimlessly farming. Stand down when
+            # dominant / creator-ordered / force-latched so the dashboard never says "grind to L14"
+            # while the menu is forcing the gym (road-bench-XP still reads _prep_team_target raw).
             try:
                 pt = self._prep_team_target(state)
+                if pt is not None and (self._creator_order(state) or self._gym_dominant(state)
+                                       or self._ace_carries_next_gym(state)
+                                       or getattr(self, "_force_gym_pick", False)):
+                    pt = None
                 if pt is not None and pick == "battle":
                     weak = self._prep_team_weak(state, pt)
                     who = (weak[0] if len(weak) == 1
@@ -14309,6 +20797,10 @@ class Campaign:
     def _publish_health(self, macro, state, last_badge_ts, run_start_ts):
         """BATCH 6 PHASE 7 — write the cockpit health snapshot (atomic JSON) the dashboard polls. Game-side
         only; the dashboard merges API spend from the bot's cost-tracker. Best-effort, never blocks the run."""
+        # WEDGE-MEMORY FLUSH (throttled ~30s): piggyback the health heartbeat so blocks discovered by
+        # TRAVEL (which never pass through _mark_wedge_spot) also survive a kill/restart.
+        if time.time() - getattr(self, "_wedge_mem_saved_at", 0) > 30:
+            self._save_wedge_memory()
         import json as _json
         try:
             cp = os.path.join(STATES_CAMPAIGN, CAMPAIGN_SAVE)
@@ -14333,6 +20825,42 @@ class Campaign:
                 f"Now: {goals['short']}" if goals.get("short") else "",
                 f"Next: {goals['medium']}" if goals.get("medium") else "",
                 f"Goal: {goals['long']}" if goals.get("long") else "") if p)
+            # WHO'S ON THE FIELD (2026-07-30, Jonny live report: the HUD showed the wrong mon on faints):
+            # the party cards are gPlayerParty SLOT ORDER, but mid-battle the mon actually fighting is
+            # gBattleMons[0] — after a faint/switch that's NOT slot 0, so viewers read the top card as
+            # "who's out" and it lied. Publish the active battler's species (plaintext battle struct,
+            # cheap read) and flag its card; the HUD + her voice context both consume it.
+            active_species = None
+            if now_state == "BATTLE":
+                try:
+                    _asp = (st.read_mon(self.b, 0) or {}).get("species")
+                    active_species = st.SPECIES_NAME.get(_asp) if _asp else None
+                except Exception:
+                    active_species = None
+            party_hud = [{"species": m["species"], "level": m["level"],
+                          "hp": m.get("hp"), "maxhp": m.get("maxhp"),
+                          "species_id": m.get("species_id"),
+                          "types": st.species_types(m.get("species_id"))} for m in state.get("party", [])]
+            if active_species:
+                for c in party_hud:                       # flag the FIRST alive match (dupes possible)
+                    if c["species"] == active_species and (c.get("hp") or 0) > 0:
+                        c["active"] = True
+                        break
+            # FIELD HMs (2026-08-02 chalk): publish what she can actually use so voice grounding
+            # stops denying Cut while she's chopping trees on stream. Same usable_hms RAM truth
+            # the Cut actuator reads — badge_ok means it would work RIGHT NOW.
+            field_hms = []
+            try:
+                import field_moves as _fm
+                _uh = _fm.usable_hms(self.b, int(state.get("party_count") or 6))
+                for _info in _uh.values():
+                    _nm = _info.get("name") or "?"
+                    if _info.get("badge_ok"):
+                        field_hms.append(_nm)
+                    else:
+                        field_hms.append(f"{_nm} (taught, need badge)")
+            except Exception:
+                field_hms = []
             health = {
                 "ts": time.time(),
                 "progress": macro,                       # GREEN / YELLOW / RED / ABANDONED — the watchdog light
@@ -14340,11 +20868,10 @@ class Campaign:
                 "badge_count": state.get("badge_count"), "badges": state.get("badges"),
                 "party": [f"{m['species']} L{m['level']}" for m in state.get("party", [])],
                 # HUD — per-mon card data: sprite (by species_id), name, level, HP, and Gen-3 type badges.
-                "party_hud": [{"species": m["species"], "level": m["level"],
-                               "hp": m.get("hp"), "maxhp": m.get("maxhp"),
-                               "species_id": m.get("species_id"),
-                               "types": st.species_types(m.get("species_id"))} for m in state.get("party", [])],
+                "party_hud": party_hud,
+                "active_species": active_species,        # who's ACTUALLY fighting right now (None = not in battle)
                 "party_count": state.get("party_count"), "dex_caught": state.get("dex_caught"),
+                "field_hms": field_hms,                  # Cut/Flash/Surf/… she can use (or taught-gated)
                 "next_gym": state.get("next_gym"),
                 "now_state": now_state, "objective": objective, "want": want,
                 "goals": goals, "plan": plan,            # PHASE 1 — 3-tier goal (short/medium/long) + flat line
@@ -14605,12 +21132,28 @@ class Campaign:
         kept), then older on each repeat, until a checkpoint actually clears the wedge. Banks the
         current (even-wedged) state first so nothing is truly lost, then surfaces the revert
         in-character. Returns True if it reverted, False if the ring is exhausted (-> ABANDON)."""
-        idx = len(self._safe_ring) - 1 - self._deepwedge_reverts
+        # REGION PARTITION (2026-08-05, the One-Island teleport-back): the ring may span the sea —
+        # candidates are restricted to gain-seams banked in HER CURRENT region, so a Sevii wedge
+        # can never deep-revert to a Kanto checkpoint (or vice versa). Legacy entries without a
+        # banked map stay eligible (they predate the partition; in-memory, so rare after deploy).
+        try:
+            cur_region = map_region(tuple(tv.map_id(self.b)))
+        except Exception:
+            cur_region = "kanto"
+        candidates = [e for e in self._safe_ring
+                      if e.get("map") is None or map_region(tuple(e["map"])) == cur_region]
+        skipped = len(self._safe_ring) - len(candidates)
+        idx = len(candidates) - 1 - self._deepwedge_reverts
         if idx < 0:
             log(f"   [roam] deep-wedge ring EXHAUSTED ({self._deepwedge_reverts} reverts, "
-                f"{len(self._safe_ring)} banked) — no clean checkpoint left to fall back to")
-            return False
-        entry = self._safe_ring[idx]
+                f"{len(candidates)} same-region of {len(self._safe_ring)} banked"
+                + (f", {skipped} cross-region excluded" if skipped else "")
+                + ") — no clean checkpoint left to fall back to; trying the same-region disk banks")
+            return self._reload_same_region_checkpoint(cur_region)
+        entry = candidates[idx]
+        if skipped:
+            log(f"   [roam] deep-wedge ring: {skipped} cross-region checkpoint(s) excluded "
+                f"(she is in {cur_region} — the revert must not re-cross the sea)")
         try:
             # bank the current (wedged) state first — never blind-overwrite (an unbanked shiny survives a misfire)
             try:
@@ -14622,6 +21165,7 @@ class Campaign:
                 log(f"   [roam] deep-wedge pre-revert backup skipped: {_be}")
             self.b.load_state(entry["state"])
             self._deepwedge_reverts += 1
+            self._reset_strike_memory("deep-wedge revert")
             log(f"   [roam] !!!! DEEP-WEDGE REVERT #{self._deepwedge_reverts}: escape-hatch spent + still "
                 f"frozen -> reverted to safe checkpoint {entry['label']} (gain {entry['gain']})")
             # IN-CHARACTER COVER — watchable, never a silent blink (Constraint: announce, don't illusion-break)
@@ -14687,7 +21231,28 @@ class Campaign:
                 f"as the new known-good and declining (ABANDON will surface for a human instead).")
             self._last_good_state = self.b.save_state()
             self._last_good_gain = cur_gain
+            self._last_good_map = tuple(tv.map_id(self.b))
             self._save_campaign("escape_reanchor")
+            return False
+        # 2b) REGION GUARD (2026-08-05, the One-Island teleport-back): the gain sig is MAP-BLIND —
+        # sailing to the Sevii archipelago reads as ZERO gain, so nothing above stops a rewind
+        # that re-crosses the sea. A wedge is answered ON ITS OWN SIDE: cross-region recent-good
+        # is refused, and recovery falls to the newest SAME-REGION auto-checkpoint on disk. The
+        # hatch keeps its full purpose inside a region — bound, don't blind.
+        try:
+            cur_region = map_region(tuple(tv.map_id(self.b)))
+        except Exception:
+            cur_region = "kanto"
+        tgt_map = getattr(self, "_last_good_map", None)
+        if tgt_map is not None and map_region(tuple(tgt_map)) != cur_region:
+            log(f"   [roam] !! ESCAPE-HATCH: last-good was banked at {tuple(tgt_map)} "
+                f"({map_region(tuple(tgt_map))}) but she is wedged in {cur_region} — a reload would "
+                f"teleport her ACROSS THE SEA (the 08:50 One-Island incident). REFUSING the "
+                f"cross-region rewind; trying the newest same-region checkpoint instead.")
+            if self._reload_same_region_checkpoint(cur_region):
+                return True
+            log("   [roam] !! ESCAPE-HATCH: no same-region fallback either — declining (current "
+                "already banked; the ladder above escalates honestly)")
             return False
         # 3) reload the last known-good state — the actual escape
         try:
@@ -14696,12 +21261,469 @@ class Campaign:
                 f"(gain {good_gain}); current backed up to pre_reload_{ts}.state. Continuing the climb. (LOUD)")
             self.on_event("something got me properly stuck back there — I'm backing up to where I knew what "
                           "I was doing and picking it up from there.", kind="recover", tier=2)
+            self._reset_strike_memory("escape-hatch reload")
             self._wait_overworld()
             self._save_campaign("post_escape_reload")
             return True
         except Exception as e:
             log(f"   [roam] !! ESCAPE-HATCH: reload FAILED ({e}) — staying on current state (already backed up)")
             return False
+
+    def _new_area_grace_left(self):
+        """Seconds of NEW-AREA GRACE remaining on the map she's standing on (0.0 = none).
+        A map first seen this session under NEW_AREA_GRACE_S ago AND absent from the world
+        model's named places is virgin territory — arriving there was PROGRESS, and reload
+        rungs must stand down while she learns the ground (the gentle rungs still run)."""
+        try:
+            m = tuple(tv.map_id(self.b))
+            first = self._map_first_seen.get(m)
+            if first is None:
+                return 0.0
+            left = NEW_AREA_GRACE_S - (time.time() - first)
+            if left <= 0:
+                return 0.0
+            # a map the harness can already NAME is charted ground — no grace needed there
+            # (grace exists for honest "an unfamiliar area" territory, i.e. the Sevii crossing)
+            try:
+                if self._place_name(m, default=None):
+                    return 0.0
+            except Exception:
+                pass
+            return left
+        except Exception:
+            return 0.0
+
+    def _reset_strike_memory(self, why):
+        """A savestate reload REWOUND the world — the in-memory strike-try/refund counters were
+        fed by a timeline the save no longer remembers, so keeping them re-parks errands the
+        reloaded world never failed (the 08:50 desync: 3 spent Moltres tries survived the reload
+        and the lap armed 'articuno' over the still-owed bird). Lap fail counts stay — the
+        bounded-skip law still owns honest exhaustion across reloads."""
+        n = len(getattr(self, "_ql_strike_tries_map", {}) or {})
+        self._ql_strike_tries_map = {}
+        self._ql_strike_refunds = {}
+        self._moltres_home_tries = 0
+        if n:
+            log(f"   [roam] strike memory reset ({why}): {n} errand try-counter(s) cleared — "
+                f"the reloaded world gets fresh strike attempts")
+
+    def _reload_same_region_checkpoint(self, region):
+        """REGION-LOCAL DISK FALLBACK (2026-08-05): when the in-memory targets are all on the
+        wrong side of the sea, reload the newest on-disk auto-checkpoint whose banked map is in
+        the SAME region (checkpoint.json carries the map id). Walks progressively FURTHER BACK
+        on repeat calls (_region_reload_skips; GREEN resets it) so a re-wedging newest bank
+        still escapes. Loads only the .state — the live sidecars stay, same campaign."""
+        import json as _json
+        root = os.path.join(STATES_CAMPAIGN, "checkpoints")
+        try:
+            names = sorted((n for n in os.listdir(root)
+                            if os.path.isdir(os.path.join(root, n))
+                            and not n.endswith(".partial")), reverse=True)
+        except Exception as _le:
+            log(f"   [roam] region-local reload: no checkpoint dir readable ({_le}) — declining")
+            return False
+        skips = int(getattr(self, "_region_reload_skips", 0) or 0)
+        seen = 0
+        for name in names:
+            state_p = os.path.join(root, name, CAMPAIGN_SAVE)
+            try:
+                with open(os.path.join(root, name, "checkpoint.json"), "r", encoding="utf-8") as f:
+                    meta = _json.load(f)
+                m = tuple(meta.get("map") or ())
+                if len(m) != 2 or map_region(m) != region or not os.path.exists(state_p):
+                    continue
+                if seen < skips:
+                    seen += 1
+                    continue
+                with open(state_p, "rb") as f:
+                    self.b.load_state(f.read())
+                self._region_reload_skips = skips + 1
+                log(f"   [roam] !!!! REGION-LOCAL RELOAD: same-region ({region}) auto-checkpoint "
+                    f"'{name}' loaded (map {m}, skip depth {skips}) — recovery stays on this side "
+                    f"of the sea (LOUD)")
+                self.on_event("something glitched me out — backing up a little, but I'm staying "
+                              "right here on this island and pushing on.", kind="recover", tier=2)
+                # re-anchor: the reloaded moment is the new recent-good (region partition bounds
+                # any residual poison to THIS side of the sea; a re-wedge walks further back)
+                try:
+                    self._last_good_state = self.b.save_state()
+                    self._last_good_gain = self._gain_sig()
+                    self._last_good_map = tuple(tv.map_id(self.b))
+                except Exception:
+                    pass
+                self._reset_strike_memory("region-local reload")
+                self._wait_overworld()
+                self._save_campaign("post_region_reload")
+                return True
+            except Exception as _ce:
+                log(f"   [roam] region-local candidate {name} skipped: {_ce}")
+        log(f"   [roam] !! REGION-LOCAL RELOAD: no same-region ({region}) checkpoint bank on disk "
+            f"past skip depth {skips} — declining")
+        return False
+
+    def _legend_rewind_at_boot(self):
+        """LEGENDARY REWIND AT BOOT (2026-08-05 EMERGENCY, Jonny: 'load her back there'): a
+        fought/hide flag with the quarry DEFINITIVELY uncaught plus a 'pre-<key>' bank on disk
+        means the last session ended mid-catch (fled, fainted it, whiteout, or a bad divert) —
+        resume INTO the encounter, not past it. The savestate restore clears the flag and
+        refills the thrown balls, so this self-limits: the next boot reads the flag clear and
+        no-ops. Runs BEFORE the roam anchor banks, so 'roam_start' captures the at-the-bird
+        moment. Dex-owned reads must be a hard False (an unreadable dex never rewinds a
+        possibly-caught mon). Returns True when a rewind happened."""
+        for key, (sp, hide, fought) in self._HUNT_SPEC_ALL.items():
+            try:
+                if ram.pokedex_owns(self.b, sp) is not False:
+                    continue                     # caught (or unreadable — never rewind blind)
+                if not (fm.read_flag(self.b, fought) or fm.read_flag(self.b, hide)):
+                    continue                     # encounter still live — nothing to rewind
+            except Exception:
+                continue
+            if self._reload_hunt_checkpoint(key):
+                log(f"   [hunt] !!!! LEGENDARY REWIND AT BOOT: {key} was battled-away but NOT "
+                    f"caught — resumed INTO the encounter from 'pre-{key}' (balls restored, "
+                    f"flag clear, standing at the bird) (LOUD)")
+                try:
+                    self.on_event(f"we are NOT leaving {key} behind like that. back to the "
+                                  f"summit moment — balls ready, doing it right this time.",
+                                  kind="legendary", tier=3)
+                except Exception:
+                    pass
+                return True
+        return False
+
+    def _has_labeled_checkpoint(self, tag):
+        """True when a reloadable auto-checkpoint whose dir name carries `tag` exists on disk
+        (non-partial, with the .state present). The FREE-RETRY predicates read this — cheap
+        (one listdir of a pruned dir), never raises."""
+        try:
+            root = os.path.join(STATES_CAMPAIGN, "checkpoints")
+            return any(tag in n and not n.endswith(".partial")
+                       and os.path.exists(os.path.join(root, n, CAMPAIGN_SAVE))
+                       for n in os.listdir(root))
+        except Exception:
+            return False
+
+    def _reload_labeled_checkpoint(self, tag, verify=None, ratchet_region=None, max_loads=10):
+        """LABELED RELOAD (2026-08-05, THE FREE RETRY at Moltres): load the NEWEST on-disk
+        auto-checkpoint whose dir name carries `tag` (labels are the _ckpt_label reason
+        suffix — 'pre-moltres', 'moltres-leg', ...). Savestates restore FULL RAM, so a
+        failed legendary catch rewinds to the pre-press moment: fought/hide flags clear,
+        balls back in the bag, party topped up. Loads only the .state (live sidecars stay —
+        same campaign, same soul). Re-anchors the recent-good so the watchdog's escape
+        hatch agrees this moment is home. Returns True on a verified load; never raises.
+
+        VERIFIED RATCHET (2026-08-05 URGENT, the poisoned 'pre-moltres' bank): a checkpoint's
+        NAME is a claim, not a proof — the live rewind loaded a 'pre-moltres' banked AFTER the
+        fled encounter, so the fought flag was set INSIDE the savestate and the summit was
+        empty. With `verify` (a zero-arg callback reading FRESH post-load RAM), every loaded
+        candidate must pass before it counts: a rejected bank logs 'poisoned' LOUDLY and the
+        ratchet steps to the next older candidate — first the remaining `tag` matches, then
+        (with `ratchet_region`) every older same-region bank on disk (moltres-leg, room-entry,
+        roam-start...), newest->oldest, bounded by `max_loads`. If every candidate is poisoned
+        the ORIGINAL live state is restored — a failed ratchet must not strand her in a
+        random rejected bank.
+
+        SETTLE RE-VERIFY (2026-08-06 URGENT, the 'flew away' mid-script bank): MonFlewAway
+        removeobject/msgbox can still be PENDING inside a savestate whose fought/hide flags
+        read clear. Instant flag-verify alone accepted that bank (182452); advancing frames
+        then played "The MOLTRES flew away!". After a flag-clear load we `_wait_overworld`
+        and verify AGAIN — a settle that flips fought|hide|sprite-gone rejects and ratchets."""
+        import json as _json
+        root = os.path.join(STATES_CAMPAIGN, "checkpoints")
+        try:
+            all_names = sorted((n for n in os.listdir(root)
+                                if os.path.isdir(os.path.join(root, n))
+                                and not n.endswith(".partial")), reverse=True)
+        except Exception as _le:
+            log(f"   [ckpt] labeled reload '{tag}': checkpoint root unreadable ({_le}) — declining")
+            return False
+        tagged = [n for n in all_names if tag in n]
+        # Drop blacklisted poison banks (182452-class mid-flee) before any load attempt.
+        _bl = tuple(getattr(self, "_HUNT_BANK_BLACKLIST", ()) or ())
+        if _bl:
+            _dropped = [n for n in tagged if any(b in n for b in _bl)]
+            tagged = [n for n in tagged if n not in _dropped]
+            for n in _dropped:
+                log(f"   [ckpt] !! LABELED RELOAD '{tag}': skipping BLACKLISTED bank "
+                    f"'{n}' (known mid-flee / spent summit) (LOUD)")
+        # Preferred clean banks FIRST (exact name, then substring), then newest→oldest tagged.
+        _pref_first = []
+        try:
+            _key = tag[4:] if tag.startswith("pre-") else ""
+            for pref in (getattr(self, "_HUNT_PREFERRED_PRE", {}) or {}).get(_key, ()):
+                hit = next((n for n in tagged if n == pref or pref in n), None)
+                if hit and hit not in _pref_first:
+                    _pref_first.append(hit)
+        except Exception:
+            pass
+        candidates = _pref_first + [n for n in tagged if n not in _pref_first]
+        if _pref_first:
+            log(f"   [ckpt] labeled reload '{tag}': preferring clean bank(s) "
+                f"{_pref_first[:2]} ahead of newest-tagged (LOUD)")
+        if verify is not None and ratchet_region:
+            # ratchet fallback: same-region banks OLDER than the newest tag match (all of them
+            # when no tag match exists). Region proven by the bank's own checkpoint.json map —
+            # an unprovable candidate is skipped, never a blind cross-sea teleport.
+            horizon = tagged[0] if tagged else None
+            for n in all_names:
+                if n in tagged or (horizon is not None and n >= horizon):
+                    continue
+                try:
+                    with open(os.path.join(root, n, "checkpoint.json"), "r",
+                              encoding="utf-8") as f:
+                        m = tuple(_json.load(f).get("map") or ())
+                    if len(m) == 2 and map_region(m) == ratchet_region:
+                        candidates.append(n)
+                except Exception:
+                    continue
+        orig = None
+        if verify is not None:
+            try:
+                orig = self.b.save_state()
+            except Exception:
+                orig = None
+        loads = 0
+        for name in candidates:
+            if loads >= max_loads:
+                log(f"   [ckpt] !! LABELED RELOAD '{tag}': ratchet budget spent "
+                    f"({max_loads} loads) — stopping the walk-back")
+                break
+            state_p = os.path.join(root, name, CAMPAIGN_SAVE)
+            try:
+                if not os.path.exists(state_p):
+                    continue
+                with open(state_p, "rb") as f:
+                    self.b.load_state(f.read())
+                loads += 1
+                if verify is not None and not verify():
+                    log(f"   [ckpt] !! LABELED RELOAD '{tag}': candidate '{name}' is POISONED "
+                        f"(post-load verify failed: fought|hide set / quarry gone / no sprite) "
+                        f"— ratcheting to the next older bank (LOUD)")
+                    continue
+                # Settle BEFORE accepting: mid-flee scripts complete here (hide flips, dialogue).
+                # Drain A on pending textboxes — MonFlewAway's msgbox needs presses; frames alone
+                # left 182452 "verified" then played "The MOLTRES flew away!" on the next walk.
+                try:
+                    self._wait_overworld()
+                except Exception:
+                    pass
+                try:
+                    from dialogue_drive import box_open as _dd_box
+                    for _ in range(120):
+                        if not _dd_box(self.b):
+                            break
+                        self.b.press("A", 6, 6, self.render, owner="agent")
+                        for __ in range(10):
+                            self.b.run_frame(); self.render()
+                    for _ in range(90):
+                        self.b.run_frame(); self.render()
+                except Exception:
+                    pass
+                if verify is not None and not verify():
+                    log(f"   [ckpt] !! LABELED RELOAD '{tag}': candidate '{name}' is POISONED "
+                        f"AFTER SETTLE (mid-script flew-away / hide flipped / sprite gone) — "
+                        f"ratcheting to the next older bank (LOUD)")
+                    continue
+                log(f"   [ckpt] !!!! LABELED RELOAD '{tag}': checkpoint '{name}' loaded"
+                    + (" and VERIFIED" if verify is not None else "")
+                    + " — resuming at that banked moment (LOUD)")
+                try:
+                    self._last_good_state = self.b.save_state()
+                    self._last_good_gain = self._gain_sig()
+                    self._last_good_map = tuple(tv.map_id(self.b))
+                except Exception:
+                    pass
+                self._save_campaign(f"post_labeled_reload_{tag}")
+                # Remember which bank landed so the promote pin targets THIS name, not a
+                # newer poison that happens to share the tag.
+                self._last_labeled_reload = name
+                return True
+            except Exception as _ce:
+                log(f"   [ckpt] labeled candidate {name} skipped: {_ce}")
+        if loads and orig is not None:
+            try:
+                self.b.load_state(orig)
+                log(f"   [ckpt] !! LABELED RELOAD '{tag}': every candidate rejected — "
+                    f"ORIGINAL live state restored (no stranding in a rejected bank)")
+            except Exception:
+                pass
+        log(f"   [ckpt] !! LABELED RELOAD '{tag}': no acceptable checkpoint bank on disk — declining")
+        return False
+
+    # (species, hide, fought) — hide OR fought with uncaught dex = poisoned hunt bank
+    _HUNT_SPEC_ALL = {"moltres": (146, 0x052, 0x2BD), "articuno": (144, 0x082, 0x2BE),
+                      "zapdos": (145, 0x05D, 0x2BF), "mewtwo": (150, 0x081, 0x2BC)}
+    # Region anchors for the same-region ratchet walk (must be Sevii for Moltres).
+    _HUNT_SITE_ALL = {"moltres": (1, 101), "articuno": (1, 87), "zapdos": (1, 95),
+                      "mewtwo": (1, 74)}
+    # On-quarry-map bird-present proof: (map, tile, gfx_id). Mid-flee banks can read BOTH
+    # flags clear while removeobject already despawned the sprite (182452 class).
+    _HUNT_PRESENCE_ALL = {
+        "moltres":  ((1, 101), (9, 6), fm.GFX_MOLTRES),
+        "articuno": ((1, 87), (9, 2), fm.GFX_ARTICUNO),
+        "zapdos":   ((1, 95), (5, 11), fm.GFX_ZAPDOS),
+        "mewtwo":   ((1, 74), (7, 12), fm.GFX_MEWTWO),
+    }
+    # PREFERRED clean pre-banks (tried FIRST). Cleared for moltres 2026-08-06: 182052 was
+    # "clean bird" but only ~6 Ultras + often Bite:0 — soft-reload/pin kept undoing the
+    # Three Island war-chest. Newest verified 'pre-moltres' (post-buy) must win.
+    _HUNT_PREFERRED_PRE = {
+        "moltres": (),
+    }
+    # Name substrings that must NEVER be free-retried / boot-rewound (mid-flee / spent summit).
+    _HUNT_BANK_BLACKLIST = (
+        "20260805_182452",  # mid-script "The MOLTRES flew away!" after "VERIFIED"
+    )
+
+    def _hunt_bank_live(self, key):
+        """FRESH post-load RAM read (never a cached value): True when the state now in the
+        emulator still CONTAINS the encounter — fought AND hide clear (either bit poisons),
+        and on the quarry map the legendary sprite is still an active object — or the quarry
+        is already owned (a post-catch bank is a fine place to stand). Unreadable flag/dex
+        -> False (an unprovable bank is a rejected bank)."""
+        spec = self._HUNT_SPEC_ALL.get(key)
+        if not spec:
+            return False
+        sp, hide, fought = spec
+        try:
+            if ram.pokedex_owns(self.b, sp) is True:
+                return True
+            if fm.read_flag(self.b, fought) or fm.read_flag(self.b, hide):
+                return False
+        except Exception:
+            return False
+        site = self._HUNT_PRESENCE_ALL.get(key)
+        if not site:
+            return True
+        qmap, qtile, qgfx = site
+        try:
+            here = tuple(tv.map_id(self.b) or ())
+        except Exception:
+            # Synthetic/recon bridges often can't decode map — flag-clear is enough off-emulator.
+            return True
+        if here != qmap:
+            return True                          # climb/leg bank: flags alone prove live-enough
+        try:
+            objs = fm.scan_field_objects(self.b, {qgfx})
+            if not any(tuple(ob.get("coord") or ()) == qtile for ob in (objs or [])):
+                return False
+        except Exception:
+            return False                         # on quarry map, unreadable sprite = reject
+        # ZERO-BALL summit bank can't catch — reject (soak 080642 oracle: "ZERO Poké Balls"
+        # after a "verified" pre-moltres load; free-retry then looped flee/respawn).
+        try:
+            n_balls = sum(self._balls_pocket_count(i) for i in (2, 3, 4))  # Ultra/Great/Poké
+            if n_balls <= 0:
+                return False
+        except Exception:
+            pass
+        return True
+
+    def _clear_pre_hunt_promote(self, key, why=""):
+        """Delete a leftover pre-<key> PROMOTE_TARGET pin so the next resume cannot
+        rewind a CATCH. LIVE 2026-08-06: a pre-moltres pin from 21:02 overwrote the
+        21:17 post-catch canonical on resume — Moltres was in the party and still got
+        erased from the live save (backed up as replaced_20260806_212026.state)."""
+        try:
+            pin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PROMOTE_TARGET.txt")
+            if not os.path.isfile(pin):
+                return
+            body = open(pin, encoding="utf-8").read()
+            if f"pre-{key}" not in body.lower():
+                return
+            os.remove(pin)
+            log(f"   [hunt] CLEARED pre-{key} PROMOTE_TARGET pin"
+                + (f" ({why})" if why else "")
+                + " — resume must not rewind a catch (LOUD)")
+        except Exception as e:
+            log(f"   [hunt] !! clear pre-{key} PROMOTE pin skipped: {e}")
+
+    def _pin_pre_hunt_promote(self, key, name=None):
+        """Write PROMOTE_TARGET.txt -> CKPT <verified bank> so the next resume_marathon
+        hard-teleports onto that bird (one-shot; consumed on launch). Prefer the explicit
+        `name` (the bank we just verified) over a newest-on-disk scan — scanning re-pinned
+        the poison 182452 after a clean load.
+
+        REFUSES once the quarry is already owned — a post-catch pin of pre-<key> is a
+        resume landmine that undoes the catch."""
+        try:
+            sp = (self._HUNT_SPEC_ALL.get(key) or (None,))[0]
+            if sp is not None and ram.pokedex_owns(self.b, sp) is True:
+                self._clear_pre_hunt_promote(key, why="quarry already caught — refusing pre-pin")
+                return
+            root = os.path.join(STATES_CAMPAIGN, "checkpoints")
+            if not name:
+                name = getattr(self, "_last_labeled_reload", None)
+            if not name or f"pre-{key}" not in name:
+                names = sorted(
+                    (n for n in os.listdir(root)
+                     if f"pre-{key}" in n and not n.endswith(".partial")
+                     and os.path.exists(os.path.join(root, n, CAMPAIGN_SAVE))),
+                    reverse=True)
+                name = names[0] if names else None
+            if not name:
+                return
+            pin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "PROMOTE_TARGET.txt")
+            with open(pin, "w", encoding="utf-8") as f:
+                f.write(f"CKPT {name}\n")
+            log(f"   [hunt] pinned PROMOTE_TARGET.txt -> CKPT {name} "
+                f"(next resume_marathon hard-teleports here)")
+        except Exception as e:
+            log(f"   [hunt] !! PROMOTE_TARGET pin skipped: {e}")
+
+    def _reload_hunt_checkpoint(self, key):
+        """The hunts' ONLY reload door (boot rewind + THE FREE RETRY): 'pre-<key>' first,
+        post-load flag+sprite verification (settle re-check), poisoned banks ratchet back
+        through older same-region banks (climb / roam-start / fight-won / moltres-leg…)
+        until one still contains the bird. On a verified landing, immediately re-banks a
+        fresh 'pre-<key>' and pins PROMOTE_TARGET. Never silently accepts a spent summit.
+        Returns True on a verified landing."""
+        key = str(key).lower()
+        site = self._HUNT_SITE_ALL.get(key)
+        ok = self._reload_labeled_checkpoint(
+            f"pre-{key}", verify=lambda: self._hunt_bank_live(key),
+            ratchet_region=map_region(site) if site else None,
+            max_loads=40)
+        if ok:
+            try:
+                if self._hunt_bank_live(key):
+                    # Re-bank for durability, but PIN the preferred clean bank (or the
+                    # bank we actually loaded) — never let a free-retry re-bank outrank
+                    # 182052 in PROMOTE_TARGET (soak 081352 pinned post-flee 081023).
+                    loaded = getattr(self, "_last_labeled_reload", None)
+                    self._bank_milestone(f"pre-{key}")
+                    log(f"   [hunt] !!!! re-banked fresh verified 'pre-{key}' after clean "
+                        f"rewind — next resume has a known-good bird (LOUD)")
+                    pref = (getattr(self, "_HUNT_PREFERRED_PRE", {}) or {}).get(key) or ()
+                    pin_name = None
+                    if pref:
+                        root = os.path.join(STATES_CAMPAIGN, "checkpoints")
+                        for p in pref:
+                            hit = next((n for n in os.listdir(root)
+                                        if (n == p or p in n) and f"pre-{key}" in n
+                                        and not n.endswith(".partial")
+                                        and os.path.exists(os.path.join(root, n, CAMPAIGN_SAVE))),
+                                       None)
+                            if hit:
+                                pin_name = hit
+                                break
+                    self._pin_pre_hunt_promote(key, name=pin_name or loaded)
+            except Exception as e:
+                log(f"   [hunt] !! post-rewind re-bank of 'pre-{key}' skipped: {e}")
+            return True
+        # Fail-closed into a poisoned live summit is the 182452 morning failure mode —
+        # SCREAM so we never pretend she's at a live bird.
+        try:
+            sp = (self._HUNT_SPEC_ALL.get(key) or (None,))[0]
+            if (sp is not None and ram.pokedex_owns(self.b, sp) is False
+                    and not self._hunt_bank_live(key)):
+                log(f"   [hunt] !!!! SCREAMING: every '{key}' candidate rejected AND the "
+                    f"live/canonical state is ALSO poisoned (uncaught + fought|hide|no "
+                    f"sprite) — she is NOT at a live bird. Pin CKPT to an older climb/"
+                    f"pre-{key} bank (LOUD)")
+        except Exception:
+            pass
+        return False
 
     MAX_BLACKOUT_RETRIES = 12     # per segment — a thin solo roster needs several Miguel attempts;
                                   # each retry re-walks (more trainer XP) + re-heals, so it converges.

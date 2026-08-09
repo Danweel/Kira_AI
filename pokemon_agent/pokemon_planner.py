@@ -48,6 +48,33 @@ BENCH_SPREAD_ALARM = int(os.getenv("POKEMON_BENCH_SPREAD_ALARM", "14"))
 # the grind target is the ace level + this margin. Party target scales toward ~4 by mid-game. Tunable.
 GYM_ANSWER_LEVEL_GAP = int(os.getenv("POKEMON_GYM_ANSWER_LEVEL_GAP", "3"))
 GYM_LEVEL_MARGIN     = int(os.getenv("POKEMON_GYM_LEVEL_MARGIN", "1"))
+# DOMINANCE margin (2026-07-31, the human-pacing tune): top mon this far ABOVE the grind target
+# (which already includes GYM_LEVEL_MARGIN + any loss bump) = she clearly overpowers the leader —
+# skip the type-answer/party-size prep and go fight (a human wouldn't farm grass at that point).
+# RAISED 5→8 same day (Jonny's reversal after the Misty chalk): L28-vs-L22 fired the override,
+# Wartortle walked in water-vs-water neutral against a fast Starmie and DIED — a pure level gap
+# lies in a neutral/resisted matchup. 8 keeps the mechanism for genuine overpowers only.
+GYM_DOMINANCE_MARGIN = int(os.getenv("POKEMON_GYM_DOMINANCE_MARGIN", "8"))
+# FIELDABLE BENCH (2026-08-02, Surge rematch chalk): Raichu one-shots L13–17 paper mons after
+# Blastoise drops the first two. A "fieldable" bench mon is within this many levels of the
+# leader's ace — enough to land one finishing hit (~L20 vs Surge ace L24). Softer than the
+# old paper gate (bench_max < ace) so a short grass farm unlocks the rematch without boxing
+# the whole party up to Raichu's level.
+FIELDABLE_BENCH_GAP = int(os.getenv("POKEMON_FIELDABLE_BENCH_GAP", "4"))
+# OVERLEVEL CARRY (same chalk): no ground Diglett yet, but Blastoise is ~14+ above Surge's ace
+# (L38 vs Raichu L24) AND the bench can survive one hit — walk in. Dominance still wants +8
+# over the grind bar (which rises after losses); this is the "couple more levels then crush it"
+# retry Jonny called for after the barely-lost Surge attempts.
+OVERLEVEL_CARRY_MARGIN = int(os.getenv("POKEMON_OVERLEVEL_CARRY_MARGIN", "14"))
+# MID-STAGE STARTERS (2026-08-01, the live Surge chalk): Wartortle L33 vs Raichu was called
+# DOMINANT (top >= ace+margin) and GO HARD marched a paper bench into one-shots. A mid-evo
+# starter is NOT dominant until its final form's evo level (or it has already evolved).
+# species -> level at which it evolves into the FINAL form.
+_MID_STAGE_FINAL_EVO = {
+    "ivysaur": 32,      # → venusaur
+    "charmeleon": 36,   # → charizard
+    "wartortle": 36,    # → blastoise
+}
 
 
 def load_strategy_kb(path=_KB_PATH, log=print):
@@ -122,13 +149,78 @@ class StrategicPlanner:
         level_target = ace_level + GYM_LEVEL_MARGIN + loss_bump
         top_level = max((m.get("level", 0) for m in party), default=0)
         target_size = min(6, party_target + (1 if loss_bump else 0))
+        _top_mon = max(party, key=lambda m: m.get("level", 0)) if party else None
+        _top_sp = (_top_mon.get("species") or "").lower() if _top_mon else ""
+        # Mid-evo starter still below final form: grind bar at least the final evo level so
+        # Wartortle L33 isn't "levels OK" vs Surge while Blastoise is the real rematch bar.
+        if _top_sp in _MID_STAGE_FINAL_EVO and top_level < _MID_STAGE_FINAL_EVO[_top_sp]:
+            level_target = max(level_target, _MID_STAGE_FINAL_EVO[_top_sp])
+        # DOMINANCE OVERRIDE (2026-07-31, Jonny pacing note: L27 Wartortle walked OUT of Misty's gym
+        # to hunt a grass/electric 'type answer' she doesn't need). A human who clearly overpowers
+        # the leader just goes and wins — the type-answer and party-size niceties are for teams
+        # scraping the bar, not towering over it. Dominant = top mon >= target + margin (target
+        # already includes GYM_LEVEL_MARGIN and any loss_bump, so this is a REAL overpower read).
+        # Self-correcting: a loss bumps level_target, dominance evaporates, and the full prep
+        # (catch a counter / grind / coverage-teach) returns for the retry.
+        # MATCHUP GUARD (2026-07-31, the Misty chalk — Jonny's reversal): a top mon that SHARES a
+        # type with the gym fights a neutral-at-best slugfest (Wartortle's water STAB is RESISTED
+        # by Misty's whole water team while Starmie hits back neutral + fast), so the raw level
+        # gap overstates real power. Dominance now also requires NO shared type with the gym —
+        # a genuinely off-type overpower (e.g. an over-leveled ace vs Brock's rocks) still fires.
+        # MID-EVO GUARD (2026-08-01, Surge chalk): a mid-stage starter below its FINAL evo level
+        # is never dominant — Wartortle L33 vs Raichu looked like overpower on paper and died.
+        # PAPER-BENCH GUARD (same chalk): if the rest of the party maxes below the gym ace (or the
+        # spread is alarm-wide and the floor is under the ace), Raichu farms them — not dominant.
+        _gym_types = set(rec.get("types") or [])
+        _slugfest = bool(_top_mon is not None and _gym_types
+                         and (_gym_types & set(_types_of(_top_mon))))
+        _mid_evo_block = bool(_top_sp in _MID_STAGE_FINAL_EVO
+                              and top_level < _MID_STAGE_FINAL_EVO[_top_sp])
+        _rest_lv = []
+        if party:
+            try:
+                _ti = max(range(len(party)), key=lambda i: party[i].get("level", 0))
+                _rest_lv = sorted(int(party[i].get("level") or 0)
+                                  for i in range(len(party)) if i != _ti)
+            except Exception:
+                _rest_lv = []
+        _bench_max = _rest_lv[-1] if _rest_lv else 0
+        _fieldable_floor = max(1, ace_level - FIELDABLE_BENCH_GAP)
+        # Paper = nobody on the bench can take a hit / land a finisher. ONE fieldable mon
+        # is enough (2026-08-02 Surge chalk) — do NOT require the whole bench at the floor
+        # (spread alarm still nudges bench XP elsewhere; it must not block the rematch).
+        _paper_bench = bool(
+            not _rest_lv  # solo carry = paper
+            or _bench_max < _fieldable_floor
+        )
+        dominant = bool(top_level and top_level >= level_target + GYM_DOMINANCE_MARGIN
+                        and not _slugfest and not _mid_evo_block and not _paper_bench)
+        # Overlevel carry: ace far enough above the leader + a fieldable finisher — no type
+        # answer required (Blastoise L38 vs Surge with a ~L20 Spearow cleaning up Raichu).
+        _overlevel_carry = bool(
+            top_level and ace_level
+            and top_level >= ace_level + OVERLEVEL_CARRY_MARGIN
+            and top_level >= level_target
+            and not _paper_bench and not _mid_evo_block
+            and len(party) >= target_size
+        )
+        _answer_ready = bool(
+            has_answer and top_level >= level_target and len(party) >= target_size
+            and not _paper_bench
+        )
         return {
             "gym": gym_name, "ace": rec.get("ace"), "ace_level": ace_level,
             "level_target": level_target, "top_level": top_level, "underleveled": top_level < level_target,
             "has_type_answer": has_answer, "want_types": want,
             "answer_species": rec.get("answer_species") or [],
             "party_size": len(party), "target_size": target_size, "thin": len(party) < target_size,
-            "ready": has_answer and top_level >= level_target and len(party) >= target_size,
+            "dominant": dominant,
+            "mid_evo_block": _mid_evo_block,
+            "paper_bench": _paper_bench,
+            "fieldable_floor": _fieldable_floor,
+            "bench_max": _bench_max,
+            "overlevel_carry": _overlevel_carry,
+            "ready": _answer_ready or dominant or _overlevel_carry,
         }
 
     # ── threat selection ─────────────────────────────────────────────────────────────────────────────
@@ -244,7 +336,6 @@ class StrategicPlanner:
         """The Elite Four bloc beat — the scaffolding-free hole at the run's climax. Names the gauntlet +
         her per-seat answers in one breath, spotlights the ICE/Lance insight tied to HER party, and folds
         the bench-development alarm (the E4 punishes a lopsided team hardest)."""
-        ptypes = self._party_types(party)
         lance = self.threats.get("Lance") or {}
         low = (lance.get("level_band") or [52, 60])[0]
         # ice answer she OWNS (Lapras/Dewgong/Jynx/Cloyster/Articuno)?
@@ -300,6 +391,18 @@ TEAM_PLANNER_ENABLED = os.getenv("POKEMON_TEAM_PLANNER", "1") == "1"
 PLAN_DUE_WINDOW = int(os.getenv("POKEMON_PLAN_DUE_WINDOW", "1"))
 # Bounded, watchable grind: top-of-party must be within this of the next milestone or she's "underleveled".
 PLAN_UNDERLEVEL_SLACK = int(os.getenv("POKEMON_PLAN_UNDERLEVEL_SLACK", "0"))
+
+# LAP NO-CATCH — the GM fix (2026-08-05, the Kindle Road 'abra -> alakazam answers Bruno' beat):
+# at badge 8 pre-credits the E4 team is already DECIDED (the victory lap's legendary strikes +
+# the built core) — a catch_keeper divert now is endgame-irrelevant (Alakazam literally needs a
+# link trade, impossible on this cart). While the lap owns the run (badges >= 8, post_game not
+# yet), assess() suppresses catch_keeper unless the species is on the curated endgame allowlist.
+# The allowlist is deliberately EMPTY: her real remaining route (Sevii sea legs + Kanto hunt
+# roads) holds nothing that out-values a strike bird — the birds arrive via the lap's strikes,
+# not diverts. Post-champion assess() already short-circuits (post_game -> on_track). Shares the
+# kill switch with the battle engine's dex_push suppression: POKEMON_LAP_NO_CATCH=0 reverts.
+LAP_NO_CATCH = os.getenv("POKEMON_LAP_NO_CATCH", "1") != "0"
+LAP_KEEPER_ALLOWLIST = frozenset()   # curated; empty = no keeper is worth a lap detour
 
 _GYM_SEQ = ["Brock", "Misty", "Lt. Surge", "Erika", "Koga", "Sabrina", "Blaine", "Giovanni"]
 _E4_SEQ = ["Lorelei", "Bruno", "Agatha", "Lance", "Champion"]
@@ -384,8 +487,46 @@ class TeamPlanner:
         if self.state is None:
             self.init_plan(party, badges)
         else:
+            self._migrate_plan_slots(party)
             self._recompute_status(party)
         return self.state
+
+    def _migrate_plan_slots(self, party):
+        """PLAN-STATE MIGRATION (2026-08-03, the OP-team pass): the plan-state PERSISTS in the campaign
+        bundle, so a resumed run is frozen on whatever the archetype JSON said at init — roster upgrades
+        (eevee->jolteon replacing the rare-Pikachu hunt; the zapdos/articuno legendary slots) would never
+        reach a run already in flight. Reconcile the live state against the CURRENT archetype JSON:
+          - a role in the archetype but not in the state -> APPEND as planned (new ambition);
+          - a role whose TARGET changed while the state slot is still 'planned' (nothing caught yet)
+            -> REPLACE with the new version (the pikachu slot she never filled becomes the eevee slot);
+          - anything already acquired/evolved is NEVER touched (her real mons outrank the JSON).
+        Idempotent (byte-equal plans no-op) + LOUD when it changes anything."""
+        try:
+            arch = next((a for a in self.archetypes
+                         if a.get("name") == self.state.get("archetype")), None)
+            if not arch:
+                return
+            def _mk(s):
+                return {"role": s["role"], "target": (s.get("species") or [s.get("role")])[-1],
+                        "line": s.get("line") or s.get("species") or [], "covers": s.get("covers") or [],
+                        "acquire": s.get("acquire") or {}, "evolve": s.get("evolve") or [],
+                        "teach": s.get("teach") or [], "why": s.get("why", ""), "status": "planned"}
+            have = {s["role"]: s for s in self.state["slots"]}
+            changed = []
+            for s in arch.get("slots", []):
+                cur = have.get(s["role"])
+                if cur is None:
+                    self.state["slots"].append(_mk(s))
+                    changed.append(f"+{s['role']}")
+                elif (cur.get("status") == "planned"
+                      and cur.get("target") != _mk(s)["target"]):
+                    cur.update(_mk(s))
+                    changed.append(f"~{s['role']}")
+            if changed:
+                self.log(f"   [teamplan] plan MIGRATED to the current archetype JSON: "
+                         f"{', '.join(changed)} (acquired slots untouched)")
+        except Exception as e:
+            self.log(f"   [teamplan] plan migration skipped: {e} (LOUD)")
 
     # ── live status: which slots are already fielded / evolved ────────────────────────────────────
     def _recompute_status(self, party):
@@ -446,6 +587,23 @@ class TeamPlanner:
 
         # (1) DUE, MISSING keeper — the proactive heart. Earliest deadline, then highest multiplicity.
         planned = [s for s in self.state["slots"] if s["status"] == "planned" and self._due(s, badge_count)]
+        # LAP NO-CATCH (2026-08-05): while the victory lap owns the run (badge 8, pre-credits),
+        # drop every catch_keeper slot not on the endgame allowlist BEFORE picking — this is the
+        # single seam every consumer reads (_keeper_due, _plan_keeper_target, the keeper router,
+        # the chaff swap, the '[teamplan] next action' voice line), so one filter kills them all.
+        if planned and LAP_NO_CATCH and badge_count >= 8 and not post_game:
+            kept = [s for s in planned
+                    if not ((s.get("acquire") or {}).get("species")
+                            and str((s.get("acquire") or {}).get("species")).lower()
+                            not in LAP_KEEPER_ALLOWLIST)]
+            if len(kept) != len(planned) and not getattr(self, "_lap_keeper_hold_logged", False):
+                self._lap_keeper_hold_logged = True
+                _held = ", ".join(str((s.get("acquire") or {}).get("species"))
+                                  for s in planned if s not in kept)
+                self.log(f"   [teamplan] catch_keeper SUPPRESSED for the victory lap ({_held}) — "
+                         f"the E4 team arrives via the lap strikes, not diverts "
+                         f"(POKEMON_LAP_NO_CATCH=0 reverts)")
+            planned = kept
         if planned:
             def leverage(s):
                 by = (s["acquire"] or {}).get("by_badge", 99)

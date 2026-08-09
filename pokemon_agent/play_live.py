@@ -186,6 +186,68 @@ def main():
             b.set_input_owner("agent")
             log(f"⛰️  RESUMING CAMPAIGN from campaign/{CAMPAIGN_SAVE}: map={tv.map_id(b)} "
                 f"coords={tv.coords(b)} — she keeps climbing from here  url={args.url}")
+            # BOOT-IN-BATTLE ABORT (2026-08-02 LIVE): a mid-fight bank / wedged save must NOT
+            # reopen the Fight↔menu thrash. Mash flee/A until overworld — she opens her eyes
+            # OUT of the broken battle. Prefer a CKPT teleport; this is the belt-and-suspenders.
+            try:
+                if st.in_battle(b):
+                    log("!! BOOT INTO LIVE BATTLE — soft-aborting so she wakes in overworld "
+                        "(not the menu thrash). Prefer CKPT teleport next time.")
+                    from battle_agent import BattleAgent as _BA
+                    _ag = _BA(b, on_event=lambda *a, **k: None, render=lambda: None, log=log)
+                    # Party open + alive active: NEVER A (A re-selects Blastoise = the sticky loop).
+                    for _ in range(40):
+                        if not st.in_battle(b):
+                            break
+                        if _ag._party_screen():
+                            log("   boot-battle: party screen open — B only (anti Blastoise thrash)")
+                            for _b in range(10):
+                                if not _ag._party_screen():
+                                    break
+                                b.press("B", 2, 10, lambda: None, owner="agent")
+                                for _f in range(6):
+                                    b.run_frame()
+                            continue
+                        break
+                    try:
+                        _ag.flee(max_seconds=25)
+                    except Exception:
+                        pass
+                    for _ in range(60):
+                        if not st.in_battle(b):
+                            break
+                        if _ag._party_screen():
+                            b.press("B", 2, 10, lambda: None, owner="agent")
+                        else:
+                            b.press("B", 2, 10, lambda: None, owner="agent")
+                            b.press("A", 2, 10, lambda: None, owner="agent")
+                        for _f in range(8):
+                            b.run_frame()
+                    log(f"   boot-battle abort done: in_battle={st.in_battle(b)} "
+                        f"map={tv.map_id(b)}@{tv.coords(b)}")
+                else:
+                    # BOOT STRAY-MENU SWEEP (2026-08-03, the overworld Super-Potion loop): the
+                    # save can bank MID-MENU (bag/party open on the road). B-cascade it closed —
+                    # never A (A is what applied potions to a full team forever).
+                    def _menu_px():
+                        p = b.frame_rgb().load()
+                        teal = sum(1 for x, y in ((30, 110), (60, 115), (20, 90), (70, 108))
+                                   if p[x, y][0] < 100 and p[x, y][1] > 120 and p[x, y][2] > 120
+                                   and abs(p[x, y][1] - p[x, y][2]) < 40)
+                        yellow = sum(1 for x, y in ((160, 30), (200, 60), (120, 10))
+                                     if p[x, y][0] > 240 and p[x, y][1] > 240 and 180 < p[x, y][2] < 230)
+                        return teal >= 3 or yellow >= 2
+                    if _menu_px():
+                        log("!! BOOT INTO OPEN MENU (bag/party banked mid-flow) — B-closing before roam")
+                        for _ in range(12):
+                            if not _menu_px():
+                                break
+                            b.press("B", 4, 12, lambda: None, owner="agent")
+                            for _f in range(10):
+                                b.run_frame()
+                        log(f"   boot-menu sweep done: menu_open={_menu_px()}")
+            except Exception as _bbe:
+                log(f"!! boot-battle abort skipped: {_bbe}")
         else:
             boot_path = resolve_state(args.boot)
             if not boot_path:
@@ -256,32 +318,36 @@ def main():
             return
         _holding[0] = True
         try:
-            read_s = 1.6 if tier >= 3 else 1.1    # per-page dwell = viewer reading time (snappier)
-            max_pages = 4 if tier >= 3 else 2
-            cap = 5.0 if tier >= 3 else 3.0       # HARD total backstop — a hold can't run long
-            try:
-                b.release(owner="agent")          # stop the caller mashing; we pace the reveal
-            except Exception:
-                pass
-            try:
-                prev = dialogue._read_buffer()
-            except Exception:
-                prev = None
-            t_start = time.time()
-            for _page in range(max_pages):
-                t0 = time.time()                  # land THIS page at reading pace (or until capped)
-                while time.time() - t0 < read_s and time.time() - t_start < cap:
-                    b.run_frame(); _draw()
-                if time.time() - t_start >= cap:
-                    break
-                b.press("A", 6, 8, _draw, owner="agent")   # advance one page
+            # THINKING-GATE (2026-07-30): a read-hold is DELIBERATE stillness — declare it to the
+            # watchdog so the held span never counts toward "wedged" (it compounds with adjacent
+            # oracle-think time otherwise).
+            with camp.watchdog_hold(f"read-hold:T{tier}"):
+                read_s = 1.6 if tier >= 3 else 1.1    # per-page dwell = viewer reading time (snappier)
+                max_pages = 4 if tier >= 3 else 2
+                cap = 5.0 if tier >= 3 else 3.0       # HARD total backstop — a hold can't run long
                 try:
-                    cur = dialogue._read_buffer()
+                    b.release(owner="agent")          # stop the caller mashing; we pace the reveal
                 except Exception:
-                    cur = prev
-                if not cur or cur == prev:
-                    break                         # no more text -> land it, don't freeze on it
-                prev = cur
+                    pass
+                try:
+                    prev = dialogue._read_buffer()
+                except Exception:
+                    prev = None
+                t_start = time.time()
+                for _page in range(max_pages):
+                    t0 = time.time()                  # land THIS page at reading pace (or until capped)
+                    while time.time() - t0 < read_s and time.time() - t_start < cap:
+                        b.run_frame(); _draw()
+                    if time.time() - t_start >= cap:
+                        break
+                    b.press("A", 6, 8, _draw, owner="agent")   # advance one page
+                    try:
+                        cur = dialogue._read_buffer()
+                    except Exception:
+                        cur = prev
+                    if not cur or cur == prev:
+                        break                         # no more text -> land it, don't freeze on it
+                    prev = cur
         finally:
             _holding[0] = False
 
@@ -331,14 +397,31 @@ def main():
             return
         tier = max(1, voice.tier_of(summary or "")) if summary else 1
         wait_s, hold_s, tail = HOLD.get(tier, HOLD[1])
-        t0 = time.time()
-        while time.time() - t0 < wait_s and not voice.is_speaking():
-            b.run_frame(); render()
-        t1 = time.time()
-        while time.time() - t1 < hold_s and voice.is_speaking():
-            b.run_frame(); render()
-        for _ in range(tail):
-            b.run_frame(); render()
+        # CHAT-SPEECH IS NOT BEAT-SPEECH (2026-07-31, Jonny stream debrief: 'she stands in the same
+        # area talking to me/chat instead of playing'). is_speaking is a GLOBAL flag — when a beat
+        # fired while she was ALREADY mid-reply to Jonny/chat, the hold loop below treated that
+        # conversation as the beat's voice and froze the hands for the full savor window, on EVERY
+        # beat, all night on a chatty stream (each battle turn's beat=True emit compounds it). If
+        # she's already talking at entry, this beat's line is queued in the bot BEHIND that turn
+        # anyway — holding the game can't sync with it — so skip the savor and keep playing (the
+        # tail frames still give a brisk breath). Genuine beat-voice (starts within wait_s of the
+        # beat, when she was silent) holds exactly as before.
+        if voice.is_speaking():
+            for _ in range(tail):
+                b.run_frame(); render()
+            return
+        # THINKING-GATE (2026-07-30): a savor-hold is DELIBERATE stillness (a T3 can hold ~17s while
+        # her voice lands — more than 2x the 8s watchdog). These loops call render() -> feed_watchdog
+        # with a static world, so without the gate every big voice moment tripped a false self-heal.
+        with camp.watchdog_hold(f"voice-hold:T{tier}"):
+            t0 = time.time()
+            while time.time() - t0 < wait_s and not voice.is_speaking():
+                b.run_frame(); render()
+            t1 = time.time()
+            while time.time() - t1 < hold_s and voice.is_speaking():
+                b.run_frame(); render()
+            for _ in range(tail):
+                b.run_frame(); render()
 
     def battle_runner():
         """Every campaign battle (wild, forest trainer, gym trainer, Brock) runs through here,
@@ -392,10 +475,19 @@ def main():
                 snap.append((st.read_party_species(b, s), b.rd16(base + 0x56)))
             return snap
         party0 = _party_hp()
+        # Trainers (Rock Tunnel gauntlet etc.) need headroom for multi-mon + EXP + level-up
+        # drains; 180s was exhausting mid-victory and travel re-entered the same fight
+        # (2026-08-02 stream: win → rewind into last seconds). Wilds stay at 180.
+        _budget = 420 if trainer else 180
+        # log=REAL (2026-08-03 11:24 recon): this was `lambda m: None` — every [engine] line from
+        # every on-stream battle was DISCARDED. Weeks of menu-loop forensics ran on voice lines
+        # and phone photos of the monitor while the engine's own confession ("GAME REFUSED slot",
+        # "CURSOR MISMATCH", famine/futility counters) went to /dev/null. Never mute the one
+        # subsystem that wedges.
         out = BattleAgent(b, on_event=voice.emit, render=render,
                           pace=(None if args.no_pace else pace),
                           choose=voice.choose,          # PART B: in-battle "use your items" instinct -> her
-                          log=lambda m: None).run(max_seconds=180)
+                          log=log).run(max_seconds=_budget)
         voice.clear_context()
         _end_beat = False       # P-3: did a bigger beat already own this battle's ending?
         # HIGHLIGHT (Phase 4): a CLUTCH win — she pulled it out at a sliver of HP. Post-battle the lead

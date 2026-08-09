@@ -37,6 +37,7 @@ GBATTLE_MOVES = 0x08250C04   # ROM addr (CANDIDATE)
 MOVE_SIZE     = 12
 MOVE_F_POWER  = 0x01         # u8
 MOVE_F_TYPE   = 0x02         # u8
+MOVE_F_ACCURACY = 0x03       # u8 (0 = always-hit / special; else 1..100)
 
 
 # ── Party species (Gen-3 encrypted substructures) ───────────────────────────
@@ -136,7 +137,9 @@ MOVE_NAMES = {
     43: "Leer", 28: "Sand-Attack", 98: "Quick Attack", 64: "Peck", 16: "Gust",
     52: "Ember", 108: "Smokescreen", 82: "Dragon Rage", 232: "Metal Claw",
     22: "Vine Whip", 74: "Growth", 73: "Leech Seed", 77: "PoisonPowder",
-    79: "Sleep Powder", 75: "Razor Leaf", 55: "Water Gun", 145: "Bubble",
+    79: "Sleep Powder", 75: "Razor Leaf",     55: "Water Gun", 145: "Bubble", 352: "Water Pulse", 56: "Hydro Pump",
+    250: "Whirlpool", 308: "Hydro Cannon", 231: "Iron Tail", 332: "Aerial Ace",
+    280: "Brick Break", 351: "Shock Wave",
     44: "Bite", 99: "Rage", 84: "Thunder Shock", 88: "Rock Throw", 111: "Defense Curl",
     # HM field moves (ids from campaign's TEACH BRIDGE): without these her oracle move-drop
     # ctx rendered a learned HM as "move#15" instead of "Cut" (soul gap — she'd narrate the
@@ -148,6 +151,20 @@ MOVE_NAMES = {
     58: "Ice Beam", 94: "Psychic", 60: "Psybeam", 105: "Recover", 93: "Confusion",
     34: "Body Slam", 109: "Confuse Ray", 195: "Perish Song", 100: "Teleport", 50: "Disable",
     95: "Hypnosis", 1: "Pound", 31: "Fury Attack", 89: "Earthquake",
+    # 2026-08-04 (the Gary wipe read as "move#130 - a solid hit" on stream): mid-game
+    # level-up moves her team actually carries — plus the charge/recharge family the
+    # policy now half-scores, so the narration matches the tactics.
+    130: "Skull Bash", 158: "Hyper Fang", 91: "Dig", 222: "Magnitude",
+    76: "SolarBeam", 63: "Hyper Beam", 143: "Sky Attack", 13: "Razor Wind",
+    291: "Dive", 340: "Bounce", 120: "Selfdestruct", 153: "Explosion",
+    110: "Withdraw", 116: "Focus Energy", 36: "Take Down",
+    38: "Double-Edge", 163: "Slash", 103: "Screech", 21: "Slam",
+    156: "Rest", 182: "Protect", 104: "Double Team", 162: "Super Fang",
+    30: "Horn Attack", 154: "Fury Swipes", 161: "Tri Attack", 129: "Swift",
+    48: "Supersonic", 141: "Leech Life", 18: "Whirlwind", 17: "Wing Attack",
+    97: "Agility", 119: "Mirror Move", 65: "Drill Peck", 12: "Guillotine",
+    106: "Harden", 40: "Poison Sting", 42: "Pin Missile", 51: "Acid",
+    35: "Wrap", 137: "Glare", 124: "Sludge", 168: "Thief",
 }
 
 
@@ -162,6 +179,59 @@ def read_party_species(bridge, slot=0):
     growth_addr = base + 32 + order.index("G") * 12
     species = (bridge.rd32(growth_addr) ^ key) & 0xFFFF
     return species
+
+
+# Plaintext battle-stats block in the 100-byte party struct (same offsets campaign uses).
+_PARTY_LEVEL_OFF, _PARTY_HP_OFF, _PARTY_MAXHP_OFF = 0x54, 0x56, 0x58
+
+
+def read_party_public(bridge, slot=0):
+    """HUD/oracle snapshot for party slot N: species, level, hp, maxhp.
+
+    Tear-guard (2026-08-02 stream chalk): mid-swap / mid-battle party-reorder reads once
+    produced impossible rows (ekans HP 115/40) — chat reads that as 'stats/abilities got
+    swapped between Blastoise and Ekans'. Two agreeing sane samples, else best effort.
+    Display-only — never writes RAM, never invents abilities (species table owns those)."""
+    def _sample():
+        base = ram.GPLAYER_PARTY + slot * PARTY_MON_SIZE
+        sp = read_party_species(bridge, slot)
+        lv = bridge.rd8(base + _PARTY_LEVEL_OFF)
+        hp = bridge.rd16(base + _PARTY_HP_OFF)
+        mx = bridge.rd16(base + _PARTY_MAXHP_OFF)
+        return sp, lv, hp, mx
+
+    def _sane(sp, lv, hp, mx):
+        return (1 <= sp <= 411 and 1 <= lv <= 100 and 1 <= mx <= 999 and 0 <= hp <= mx)
+
+    a = _sample()
+    b = _sample()
+    if a == b and _sane(*a):
+        sp, lv, hp, mx = a
+    else:
+        pick = None
+        for _ in range(3):
+            cur = _sample()
+            if _sane(*cur):
+                pick = cur
+                break
+        sp, lv, hp, mx = pick if pick is not None else (b if _sane(*b) else a)
+        # Last resort: clamp a torn HP so the HUD never shows 115/40.
+        if not _sane(sp, lv, hp, mx):
+            if not (1 <= mx <= 999):
+                mx = max(mx, hp, 1) if hp else 1
+            hp = max(0, min(hp, mx))
+            if not (1 <= lv <= 100):
+                lv = max(1, min(lv or 1, 100))
+            if not (1 <= sp <= 411):
+                sp = 0
+    return {
+        "species_id": sp,
+        "species": SPECIES_NAME.get(sp, f"species#{sp}" if sp else "?"),
+        "level": lv,
+        "hp": hp,
+        "maxhp": mx,
+        "types": species_types(sp),
+    }
 
 
 def read_enemy_species(bridge, slot=0):
@@ -331,13 +401,25 @@ def _type_name(b):
 
 
 def move_info(bridge, move_id):
-    """(type_name, power) for a move id, read from ROM gBattleMoves. CANDIDATE offsets."""
+    """(type_name, power) for a move id, read from ROM gBattleMoves. CANDIDATE offsets.
+    Prefer move_info_full when accuracy is needed (STAB expected-damage picks)."""
     if move_id == 0:
         return (None, 0)
     base = GBATTLE_MOVES + move_id * MOVE_SIZE
     power = bridge.rd8(base + MOVE_F_POWER)
     tname = _type_name(bridge.rd8(base + MOVE_F_TYPE))
     return (tname, power)
+
+
+def move_info_full(bridge, move_id):
+    """(type_name, power, accuracy) from ROM gBattleMoves. accuracy 0 = always-hit."""
+    if move_id == 0:
+        return (None, 0, 0)
+    base = GBATTLE_MOVES + move_id * MOVE_SIZE
+    power = bridge.rd8(base + MOVE_F_POWER)
+    tname = _type_name(bridge.rd8(base + MOVE_F_TYPE))
+    acc = bridge.rd8(base + MOVE_F_ACCURACY)
+    return (tname, power, acc)
 
 
 def read_mon(bridge, index):
@@ -351,9 +433,10 @@ def read_mon(bridge, index):
     moves = []
     for i in range(4):
         mid = bridge.rd16(base + F_MOVES + i * 2)
-        mt, mp = move_info(bridge, mid)
+        mt, mp, macc = move_info_full(bridge, mid)
         moves.append({"id": mid, "name": MOVE_NAMES.get(mid, f"move#{mid}"),
-                      "type": mt or "normal", "power": mp, "pp": bridge.rd8(base + F_PP + i)})
+                      "type": mt or "normal", "power": mp, "accuracy": macc,
+                      "pp": bridge.rd8(base + F_PP + i)})
     types = [t for t in (t1, t2) if t and t != "normal" or t == t1]
     # status1 (u32 @ 0x4C in BattlePokemon): sleep = bits 0-2 (turn counter), poison 0x08, burn 0x10,
     # freeze 0x20, paralysis 0x40, bad-poison 0x80. Exposed so the engine can sleep-LOCK a foe (re-apply
@@ -364,10 +447,77 @@ def read_mon(bridge, index):
             "asleep": bool(status1 & 0x07)}
 
 
+# ── DOUBLE BATTLES (2026-08-04, the first trainer-pair wedge) ────────────────────────────────
+# In a double, "ours" is battler 0 OR 2 (whichever the game is asking to act) and "the enemy" is
+# battlers 1 AND 3 — the old fixed 0/1 read fed the engine slot 0's moves while slot 2 was choosing
+# and read a fainted foe's corpse as "the enemy". All doubles branches gate on the VERIFIED
+# BATTLE_TYPE_DOUBLE bit + gBattlersCount == 4; singles stay byte-identical.
+_PLAYER_INPUT_FUNCS = frozenset({ram.HANDLE_INPUT_CHOOSE_ACTION,
+                                 ram.HANDLE_INPUT_CHOOSE_MOVE,
+                                 ram.HANDLE_INPUT_CHOOSE_TARGET})
+
+
+def double_chooser(bridge):
+    """[dbl] The PLAYER battler (0 or 2) whose controller is waiting for input right now, or None.
+    gBattlerControllerFuncs is the same ground-truth class as gMain.callback2 — opponent AI
+    battlers never hold the player input handlers. Fail-closed (None on any read fault)."""
+    try:
+        for b in (0, 2):
+            if bridge.rd32(ram.GBATTLER_CONTROLLER_FUNCS + 4 * b) in _PLAYER_INPUT_FUNCS:
+                return b
+    except Exception:
+        pass
+    return None
+
+
+def _dbl_battler_brief(bridge, b):
+    """Cheap (species, hp, maxhp) for gBattleMons[b] — no ROM move lookups."""
+    base = GBATTLE_MONS + b * MON_SIZE
+    return (bridge.rd16(base + F_SPECIES), bridge.rd16(base + F_HP),
+            bridge.rd16(base + F_MAXHP))
+
+
+def _read_battle_double(bridge):
+    """Doubles snapshot: ours = the battler being asked to act (else the live player battler),
+    enemy = the LIVE foe with the lowest HP fraction (focus-fire the weak one — also the target
+    the engine's target-select steers to). Falls back to the last foe corpse when both are down
+    so the faint-transition detector still sees hp==0."""
+    absent = bridge.rd8(ram.GABSENT_BATTLER_FLAGS)
+    ours_b = double_chooser(bridge)
+    if ours_b is None:
+        ours_b = 0
+        for b in (0, 2):
+            if absent & (1 << b):
+                continue
+            sp, hp, mhp = _dbl_battler_brief(bridge, b)
+            if 1 <= sp <= 411 and hp > 0:
+                ours_b = b
+                break
+    live, corpse = [], None
+    for b in (1, 3):
+        sp, hp, mhp = _dbl_battler_brief(bridge, b)
+        if not (1 <= sp <= 411 and 0 < mhp <= 999):
+            continue
+        if hp > 0 and not (absent & (1 << b)):
+            live.append((hp / mhp, b))
+        elif corpse is None:
+            corpse = b
+    enemy_b = min(live)[1] if live else (corpse if corpse is not None else 1)
+    snap = {"ours": read_mon(bridge, ours_b), "enemy": read_mon(bridge, enemy_b),
+            "double": True, "ours_battler": ours_b, "enemy_battler": enemy_b}
+    return snap
+
+
 def read_battle(bridge):
     """Full battle snapshot or None if not in battle. CANDIDATE - verify with dump."""
     if not in_battle(bridge):
         return None
+    try:
+        if (bridge.rd32(ram.GBATTLE_TYPE_FLAGS) & ram.BATTLE_TYPE_DOUBLE
+                and bridge.rd8(ram.GBATTLERS_COUNT) == 4):
+            return _read_battle_double(bridge)
+    except Exception:
+        pass                                     # any doubles read fault -> the proven singles path
     return {"ours": read_mon(bridge, 0), "enemy": read_mon(bridge, 1)}
 
 

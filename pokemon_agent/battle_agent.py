@@ -22,6 +22,150 @@ HOLD = 8
 
 # Gen-1 legendaries (FireRed national-dex ids) — a big-beat recognition in run() (Phase 2D).
 _LEGENDARY_SPECIES = frozenset({144, 145, 146, 150, 151})   # Articuno, Zapdos, Moltres, Mewtwo, Mew
+# Diglett's Cave floors (campaign._PLACE_NAMES / frlg_connections) — common keepers; never KO on sight
+# when unowned (2026-08-02 Diglett chalk: Flash cave-cross fought every Diglett after Jonny said catch).
+_DIGLETT_CAVE_MAPS = frozenset({(1, 36), (1, 37), (1, 38)})
+_DIGLETT_LINE = frozenset({50, 51})  # Diglett, Dugtrio
+# Creator "catch that!" latch path (kira/bot.py -> states/*/creator_order.json).
+_CREATOR_ORDER_TTL_S = float(os.getenv("POKEMON_CREATOR_ORDER_TTL_S", "1800"))
+
+# ── THE LEGENDARY BALL RESERVE + LAP NO-CATCH (2026-08-05, the Kindle Road Meowth) ────────────────
+# Mid-victory-lap, a dex_push divert threw an ULTRA at a trash Meowth L31: 'cheap' degraded to the
+# only tier in the bag — the exact stock the legendary hunts need (_hunt_ready wants 6 spendable;
+# Moltres was minutes away). Two laws:
+#   RESERVE (HUNT_BALL_RESERVE): while any legendary hunt is still pending (the same signal the
+#   Mart Ultra-stock doctrine reads — campaign._shop_list 2026-08-04), a NON-hunt catch
+#   (pref='cheap') holds the ENTIRE Ultra tier for the hunt: 'cheap' means genuinely cheap
+#   (Poké/Great/specials), and when only reserved Ultras remain the catch is REFUSED
+#   ('[catch] RESERVE' log) — fight/flee via the normal flow. Holding the whole tier (not just a
+#   floor slice) guarantees the count never dips below the _hunt_ready floor AND trash never
+#   nibbles the hunt's break-free surplus. Hunt targets (pref='best': legendary/shiny) spend
+#   freely; the Master Ball stays Mewtwo-only; a creator catch_now spends cheap tiers under the
+#   reserve unless Jonny literally names the Ultra in the order. POKEMON_HUNT_BALL_RESERVE=0 kills.
+#   LAP NO-CATCH (LAP_NO_CATCH): badge 8 + credits not rolled = the victory lap owns the run —
+#   it ends at the E4, so the Route-15 Exp. Share (50 caught) is dead weight and dex_push diverts
+#   are SUPPRESSED until FLAG_SYS_GAME_CLEAR (the post-champion Mewtwo era may dex-push again).
+#   POKEMON_LAP_NO_CATCH=0 reverts (the same switch gates the planner's catch_keeper — see
+#   pokemon_planner.assess).
+HUNT_BALL_RESERVE = os.getenv("POKEMON_HUNT_BALL_RESERVE", "1") != "0"
+LAP_NO_CATCH = os.getenv("POKEMON_LAP_NO_CATCH", "1") != "0"
+# The hunt-pending signal's per-legendary (species, battled-away flag) pairs — MIRRORS the Mart
+# Ultra-stock doctrine exactly: Zapdos 0x2BF / Articuno 0x2BE / Moltres 0x2BD / Mewtwo 0x2BC.
+_HUNT_QUARRY = ((145, 0x2BF), (144, 0x2BE), (146, 0x2BD), (150, 0x2BC))
+
+
+def dex_push_gate(badges, game_clear, aide_paid, owned_count, owns_species, spendable):
+    """PURE decision core for the dex_push wild-catch divert (synthetic-testable —
+    recon_catch_discipline_test). Returns (fire, lap_suppressed):
+      fire           -> divert this wild to a catch (the 2026-08-04 Exp.-Share push);
+      lap_suppressed -> the push WOULD have fired but the VICTORY LAP owns the run
+                        (badge 8, credits not rolled — fight/flee, never a trash catch).
+    `spendable` is the RESERVE-AWARE ball count (_spendable_for_pref('cheap')), so a bag
+    of hunt-reserved Ultras reads 0 here and the divert never arms on the hunt's stock."""
+    would = (not aide_paid and badges >= 5 and owned_count < 50
+             and not owns_species and spendable >= 2)
+    lap_era = LAP_NO_CATCH and badges >= 8 and not game_clear
+    return (would and not lap_era), (would and lap_era)
+
+
+# ── THE CATCH SEND-IN + ABORT-LATCH LAWS (2026-08-05, the Magmar forced-send-in wedge) ────────────
+# Live 14:10 (commit 50650f6, wedge present in current code too): Lapras fainted MID-CATCH
+# (creator catch_now on a Machoke, Blastoise already down) and the game entered the forced
+# send-in state ("BLASTOISE has no energy left to battle!" -> "use next POKéMON?"). In FRLG the
+# bag CANNOT open in that state — so throw_ball aborted "bag would not open (open-A eaten)" and
+# the catch loop re-offered the SAME throw forever: the session-ending wedge, with 2 of 3 mons
+# down the whole time. Three laws, one pure per-turn gate (catch_turn_gate):
+#   SEND-IN FIRST: our active battler DOWN (verified RAM — gBattleMons hp cross-checked against
+#   the party struct's plaintext HP, doubles via the e4002d9 per-battler read) -> this turn's
+#   throw is ABANDONED, the proven forced-send-in flow (_force_switch) runs, and the catch
+#   resumes only once a healthy mon is seated.
+#   CATCH-ABORT LATCH: CATCH_ABORT_MAX consecutive throw_ball aborts in one battle latch the
+#   catch OFF for the whole battle (the HEAL-FAIL LATCH / POTION-BLOCK pattern) — stop offering
+#   throws, fight/flee normally. Clears when the battle ends (run() attach resets it).
+#   PARTY-WIPE GUARD: <=1 healthy mon left and the target isn't a legendary hunt -> no catch is
+#   worth the wipe; fight/flee instead, and a latched creator order RELEASES loudly (voice +
+#   log) instead of spinning "KEPT for retry" forever (catch_order_release).
+CATCH_ABORT_MAX = int(os.getenv("POKEMON_CATCH_ABORT_MAX", "3"))
+
+
+def catch_turn_gate(our_active_down, healthy_left, throw_aborts, abort_latched, hunt_target):
+    """PURE per-turn catch-continuation gate (synthetic-testable — recon_catch_discipline_test).
+    Returns one of:
+      'abort'      -> the CATCH-ABORT latch is up (>= CATCH_ABORT_MAX consecutive throw aborts
+                      this battle): stop offering throws entirely, fight/flee normally;
+      'send_in'    -> OUR active battler is down: abandon this turn's throw and run the forced
+                      send-in flow first (the bag cannot open in that state);
+      'party_risk' -> <=1 healthy mon left and the target isn't a legendary hunt: abandon the
+                      catch — no catch is worth the party wipe (a creator order releases);
+      'throw'      -> normal catch turn (weaken/throw)."""
+    if abort_latched or throw_aborts >= CATCH_ABORT_MAX:
+        return "abort"
+    if our_active_down:
+        return "send_in"
+    if healthy_left <= 1 and not hunt_target:
+        return "party_risk"
+    return "throw"
+
+
+def catch_order_release(res, abort_latched, healthy_left):
+    """PURE order-hygiene rule for a latched creator catch_now (2026-08-05): must the LAW be
+    RELEASED instead of 'KEPT for retry'? Clean failures (target fled / balls ran out / PP
+    depleted / one flaky menu) keep the order — Jonny still gets his catch after the Mart or
+    heal. A WEDGED flow (the catch-abort latch) or a party-wipe risk (<=1 healthy mon) must
+    release it loudly: retrying either just re-arms the wedge that ended the 14:10 session."""
+    return (res in ("catch_abort", "party_risk")
+            or bool(abort_latched) or healthy_left <= 1)
+
+
+# ── THE LEGENDARY CATCH DOCTRINE (2026-08-05, standing at Moltres with 6 Ultras) ──────────────────
+# The generic weaken-then-throw discipline is tuned for trash dex-catches: 'any status OR <=50%
+# HP -> throw'. On a 3/255-base-rate legendary that wastes the whole thin ball stock — at 50% HP
+# an Ultra lands ~2%, and 'status = ready' meant one Sing at FULL HP opened the throws. The
+# legendary band (divert_reason == 'legendary') overrides three dials, nothing else:
+#   RED ZONE   — throw-ready only at <= CATCH_READY_FRAC_LEGEND HP; a status is a MULTIPLIER on
+#                top, never a substitute for the chip (Jonny: 'LOW HP before throwing any ball').
+#   DEEP CHIP  — the chip loop aims CATCH_CHIP_TARGET_LEGEND, with a bigger hit budget (the
+#                faint-guards — measured-damage 1.6x + est-vs-current-HP — still outrank the
+#                target: she stops ABOVE it rather than risk the KO; a 33% throw beats a corpse).
+#   SLEEP RUNG — before every throw, if the foe carries NO status: fire a sleep move (x2 catch
+#                rate in Gen 3) from the ACTIVE mon, or switch ONCE to a party sleeper (Lapras'
+#                Sing) — bounded by LEGEND_RESLEEP_MAX total casts, refused when the party is
+#                too thin to absorb the switch (the wipe outranks the multiplier).
+CATCH_READY_FRAC_LEGEND = float(os.getenv("POKEMON_CATCH_READY_LEGEND", "0.20"))
+CATCH_CHIP_TARGET_LEGEND = float(os.getenv("POKEMON_CATCH_CHIP_LEGEND", "0.15"))
+# HARD THROW FLOOR (2026-08-06 LIVE, soak 180943: Fearow fainted mid-chip, loop kept
+# "attacking" a corpse, then SANCTIONED early throw at 75% HP — 5 Ultras burned for
+# nothing). Jonny: at least half HP before any legendary ball. Ideal is still the red
+# zone above; this floor is the NEVER-WORSE-THAN line. Above it: deepen the ace chip
+# or SOFT-RELOAD the pre-bank — NEVER flee (flee runs MonFlewAway and "respawns" via
+# free-retry — the 2026-08-06 morning spectacle).
+CATCH_THROW_FLOOR_LEGEND = float(os.getenv("POKEMON_CATCH_THROW_FLOOR_LEGEND", "0.50"))
+LEGEND_RESLEEP_MAX = 4        # total sleep casts per encounter (Sing is 55%-acc — misses priced in)
+LEGEND_CHIP_HITS = 10         # deep-chip swing budget (each swing re-guarded; generic stays at 4)
+# Species → hunt key for the soft-reload door (wired by campaign at boot).
+_LEGEND_SOFT_KEYS = {144: "articuno", 145: "zapdos", 146: "moltres", 150: "mewtwo"}
+# Optional campaign hook: callable(key) -> bool. Set by Campaign.__init__; None in pure
+# unit tests. Soft-reloads 'pre-<key>' WITHOUT pressing RUN (no MonFlewAway).
+LEGEND_SOFT_RELOAD = None
+# Ultra war-chest ferry in progress (set by LegendaryHunt._set_ball_restock_mode). While
+# True, creator catch_now must NOT divert wilds — flee/reserve wedges the Kindle sea cross.
+BALL_RESTOCK_MODE = False
+
+
+def catch_ready(hp_frac, status1, legend):
+    """PURE throw-ready rule (synthetic-testable). Generic targets: ANY status or the 50% band
+    (unchanged). Legendary targets: the RED ZONE alone decides — a status boosts the throw it
+    does NOT green-light one (the full-HP Sing-then-throw ball burn)."""
+    if legend:
+        return hp_frac <= CATCH_READY_FRAC_LEGEND
+    return bool(status1) or hp_frac <= BattleAgent.CATCH_READY_FRAC
+
+
+def legend_throw_allowed(hp_frac):
+    """HARD FLOOR: legendary Ultras may fly at/below half HP. Above that the attempt is
+    refused (deepen ace chip / soft-reload — never a ball dump, never RUN)."""
+    return hp_frac <= CATCH_THROW_FLOOR_LEGEND
+
 
 # SELF-DESTRUCT FAMILY (FireRed national-dex ids) — foes that can NUKE-TRADE our active: Self-
 # Destruct/Explosion one-shots even a dominant lead (koga_run3 2026-07-07: Koga's L37 Koffing
@@ -49,16 +193,61 @@ BAG_SCROLL = 0x0203AD0A      # u16 itemsAbove[0] — rows hidden above the windo
 # taps + pixel detection, which WEDGE on the long-running core (the keystone freeze-spin).
 MOVE_CURSOR = 0x02023FFC
 MENU_MODE = 0x02023E82
+# ⚠️ ARRAY TRUTH (2026-08-04, the first double battle): BOTH cursors are u8[4] PER-BATTLER arrays
+# (pret: gMoveSelectionCursor[gActiveBattler] / gActionSelectionCursor[gActiveBattler]) — the bare
+# addresses above are battler 0's entries. In a DOUBLE her second mon is battler 2 and the game
+# reads its cursors at +2; writing [0] while slot 2 chooses does NOTHING. And MENU_MODE is really
+# gBattleCommunication[0] (battler 0's selection state; battler 2's is at +2) — see firered_ram's
+# GBATTLE_COMM note. Singles behavior is untouched: every doubles-aware path resolves to +0 there.
+# ── DOUBLE BATTLES (2026-08-04, the trainer-pair infinite loop near Cinnabar) ─────────────────────
+# The single-battle turn flow wedged in FRLG doubles in four distinct places (all verified vs pret):
+#  (1) confirming a single-target move vs TWO live foes opens the TARGET-SELECT step
+#      (HandleInputChooseTarget) which the engine never answered — the 600-frame verify then read
+#      "no PP drop" as a refusal, exiled the move, and rotated the whole moveset into exile;
+#  (2) BOTH her battlers (0 and 2) choose actions each turn — slot 2's menus wrote/read battler 0's
+#      cursor bytes and read battler 0's moves for the pick;
+#  (3) GBATTLE_MENU_UP (= gBattleCommunication[4] = ACTIONS_CONFIRMED_COUNT) reads 2-3 in a
+#      4-battler fight, never 1 — every menu classifier went blind and menus were "text";
+#  (4) "the enemy" was hardwired to battler 1 — a fainted lead foe read as a corpse while
+#      battler 3 kept fighting.
+# Policy in doubles is deliberately MINIMAL (they're a handful of trainer pairs; the E4 is all
+# singles): each acting mon picks its best move via the existing move_score against the weakest
+# live foe, target-select steers to that foe by gMultiUsePlayerCursor READBACK (never blind), and
+# items/voluntary switches are PUNTED (attack-only) — the forced faint send-in still works. Every
+# branch logs with a [dbl] tag and is gated on the verified BATTLE_TYPE_DOUBLE bit so single
+# battles stay byte-identical. Kill switch: POKEMON_DOUBLES=0 reverts to the old (wedging) flow.
+DOUBLES_ENABLED = os.getenv("POKEMON_DOUBLES", "1") == "1"
 # In-battle PARTY-LIST cursor = gPartyMenu.slotId (recon_partycursor_derive 2026-06-28): DOWN increments,
 # UP decrements (0=lead, 1=2nd, ... + a CANCEL entry past the last mon). Lets the in-battle SWITCH nav by
 # readback instead of blind DOWN*slot taps that wedge/mis-land on the long core (the gated switch's gap).
 PARTY_CURSOR = 0x02020777
+# gMain.callback2 TRUTH for the in-battle BAG/PARTY sub-screens (2026-08-04, the Revive
+# insta-click: the aim block only ran on laps where the PIXEL party classifier fired, so on
+# frozen frames the bare walk-A confirmed the target screen's HOME cursor — the alive lead —
+# "It won't have any effect." forever). The game physically SWITCHES gMain.callback2 to these
+# menu loops while a sub-screen owns input (same ground truth as ram.battle_cb2_dead), so a
+# RAM read beats any frozen frame. pret pokefirered.sym rev0 — CB2_Overworld 0x080565B4 in the
+# same map matches the live-verified ram._CB2_OVERWORLD. Stored with the thumb bit set.
+_CB2_PARTY_MENU = {0x0811EBA0 | 1,   # CB2_UpdatePartyMenu  (steady-state party/target screen)
+                   0x0811EBD0 | 1,   # CB2_InitPartyMenu    (opening fade)
+                   0x08124C8C | 1}   # CB2_ShowPartyMenuForItemUse (bag USE -> target transition)
+_CB2_BAG_MENU = {0x08107EE0 | 1,     # CB2_BagMenuRun       (steady-state bag list)
+                 0x08107F10 | 1,     # CB2_OpenBagMenu
+                 0x08107ECC | 1,     # CB2_BagMenuFromBattle
+                 0x08124D90 | 1}     # CB2_ReturnToBagMenu  (target screen -> bag)
 _ITEMS_POCKET_OFF = 0x0310   # SaveBlock1 Items pocket (potions + status cures live here), 42 slots
 # Gen-3 item ids for the in-battle instinct (CANDIDATES; the use is self-verified by the item count
 # dropping, so a wrong id simply doesn't fire -> 'failed' -> keep fighting, never a wrong action).
 _HEAL_ITEMS_PREF = (19, 20, 21, 22, 13)   # Full Restore, Max, Hyper, Super, Potion (strongest usable first)
 _REVIVE_ITEMS_PREF = (25, 24)             # Max Revive, Revive
-_ETHER_ITEMS_PREF = (37, 36, 35, 34)      # Max Elixir, Elixir, Max Ether, Ether (all-move first)
+# CHEAPEST-FIRST ether order (2026-08-03 potion-economics pass): an Ether (10 PP, one move)
+# almost always un-famines the workhorse slot — burning the Max Elixir first was hoard-in-reverse.
+_ETHER_ITEMS_PREF = (34, 36, 35, 37)      # Ether, Elixir, Max Ether, Max Elixir
+# How much each potion tier heals (Gen 3): the right-sized-potion picker's fact table.
+_POTION_HEALS = {13: 20, 22: 50, 21: 200, 20: 9999, 19: 9999}
+ITEM_QTY_NAMES = {13: "a Potion", 22: "a Super Potion", 21: "a Hyper Potion", 20: "a Max Potion",
+                  19: "a Full Restore", 14: "an Antidote", 15: "a Burn Heal", 16: "an Ice Heal",
+                  17: "an Awakening", 18: "a Parlyz Heal", 23: "a Full Heal"}
 # Kanto species whose ability is ALWAYS Levitate -> Ground does NOTHING despite the chart's x2
 # (Agatha's gengars: EQ 'connects' on paper, so chart-only famine never fires while EQ has PP).
 # Game-knowledge inline (portability debt: belongs in gamedata/ when the ability layer generalizes).
@@ -88,7 +277,27 @@ _FULL_HEAL = 23
 # default — a frozen session is strictly worse than a flee — but disable-able / tunable. Capability-
 # not-script: she still picks her move every turn; this only catches the dead-end where NO move resolves.
 BATTLE_FLEE_FLOOR = os.getenv("POKEMON_BATTLE_FLEE_FLOOR", "1") == "1"
-UNRESOLVED_FLEE_AT = int(os.getenv("POKEMON_UNRESOLVED_FLEE_AT", "3"))
+# Was 3 — on LIVE stream menu thrash, 3 unresolved turns ≈ minutes of scrolling. Bail at 2.
+UNRESOLVED_FLEE_AT = int(os.getenv("POKEMON_UNRESOLVED_FLEE_AT", "2"))
+# Hard wall-clock escape when menu understanding is wedged (seconds since LAST real progress —
+# PP drop / HP change / faint / item consume). Was "45s from battle start" which false-fired
+# mid-Gary and killed the stream with "menus are glitched" on a progressing fight (2026-08-02).
+BATTLE_MENU_WEDGE_S = float(os.getenv("POKEMON_BATTLE_MENU_WEDGE_S", "60"))
+# Force-switch wall-clock: party scroll theater must not eat 60–90s of stream (2026-08-02 docks).
+FSWITCH_BUDGET_S = float(os.getenv("POKEMON_FSWITCH_BUDGET_S", "5"))
+# PP-FAMINE SWITCH RETRIES (2026-07-31, Jonny stream debrief — the 10-minute Teleport-Abra fight):
+# the famine switch used to be ONE-SHOT per species per battle, and the try was consumed even when
+# the switch nav FAILED to confirm — so a Teleport-only Abra whose single try misfired was doomed
+# to war-must-advance its failing move for the rest of the battle (and every 180s travel re-entry).
+# Bounded retries keep the anti-churn intent (never an infinite switch loop) while making one flaky
+# menu nav non-fatal.
+FAMINE_SWITCH_TRIES = int(os.getenv("POKEMON_FAMINE_SWITCH_TRIES", "3"))
+# FUTILITY BREAKER (2026-08-03 09:07, the parked-on-Tackle photo evidence): total fruitless
+# move-list confirms per battle before the engine stops trusting the move list entirely and
+# bench-switches. This is the slot-agnostic floor UNDER the per-slot refusal ledger: when the
+# cursor readback and the drawn cursor disagree, refusals get tallied on the wrong slots and
+# the ledger never converges — this counter converges anyway, because it counts EVENTS not slots.
+FUTILE_AMOVE_MAX = int(os.getenv("POKEMON_FUTILE_AMOVE_MAX", "4"))
 # NS#12 — HEAL-CONSUME-FAILED LATCH (the Route-10/Rock-Tunnel bag-USE/CANCEL livelock). An in-battle
 # heal can open the bag, reach "ITEM is selected -> USE/CANCEL", and FAIL to consume (count never drops)
 # — _bag_screen() doesn't fingerprint that sub-box, so the turn-top close is bypassed and every "pick a
@@ -108,6 +317,14 @@ HEAL_FAIL_LATCH = os.getenv("POKEMON_HEAL_FAIL_LATCH", "1") == "1"
 # the canon 3-mon fixture — SWITCHED ivysaur->spearow). The wedge was a WRONG-ADDRESS derivation (the old
 # PARTY_CURSOR=0x2020777 was a shadow byte); the real nav is BLIND DOWN*(slot+1) like the working
 # _force_switch (live cursor is a heap struct). Fail-safe B-out on any miss = never wedges, so default-on is safe.
+# 2026-08-03 NUCLEAR (morning): DEFAULT OFF after the Blastoise↔POKEMON thrash on stream.
+# 2026-08-03 RE-ARMED (same day, 08:28 live): the thrash's REAL root is now fixed at the source —
+# the blind-A/cursor-parking disease (every settled action menu re-homes to FIGHT; no escape path
+# presses a blind A; the party-thrash guard hard-bans voluntary POKEMON after 3 sightings). With
+# the ban still on, a PP-dry mon had NO winning line: Jonny watched her re-fire a refused Tackle
+# forever because the famine/must-leave switches — the exact rescue for that state — were gated
+# off. The switch nav itself is recon-verified (recon_switch3.py, 2026-07-05) and fail-safe
+# (non-confirm -> B-out -> fight). Killing the rescue was the wrong nuke; default back ON.
 BATTLE_SWITCH_ENABLED = os.getenv("POKEMON_BATTLE_SWITCH", "1") == "1"
 # ── NS23: LOAD-SHARE between two SE attackers (the E4-Champion team-depth lever). The anti-churn rule
 # (an SE attacker >=2x STAYS and swings, _best_switch_slot) is load-bearing but makes a LONE specialist
@@ -165,8 +382,8 @@ WHIFF_RESERVE_LEVEL_BAND = int(os.getenv("POKEMON_WHIFF_RESERVE_BAND", "15"))  #
 # fix is bigger: route the weak-grind to a SAFE MAP (Route 3: flat, L3-6, Center-reachable via Pewter) rather
 # than Route 4 at all, OR make a true strand (heal 'stuck', no reachable Center) force an escape-hatch reload
 # that recovers. Flagged in STATE §0 as the top rebuild item. Switch MECHANISM + BATTLE_SWITCH stay armed/verified.
-GRIND_SWITCH_ENABLED = os.getenv("POKEMON_GRIND_SWITCH", "1") != "0"   # DEFAULT-ON 2026-07-05: chain
-#   proven end-to-end (bench L8/10->16 via participation XP -> Gary first-try -> bridge -> Bill -> TICKET)
+# 2026-08-03 NUCLEAR: DEFAULT OFF with BATTLE_SWITCH — same party-menu thrash class.
+GRIND_SWITCH_ENABLED = os.getenv("POKEMON_GRIND_SWITCH", "0") == "1"
 PROTECT_LEAD_GRIND = False                 # set True by grind_weak_members only; read per battle in run()
 # SELECTIVE SOLO (2026-07-11 NS#26 — the bench-leveling KILL-XP lever, the frontier #2). The participation
 # GRIND SWITCH hands the KO to the ace, so the fielded weak lead banks only a SHARE of participation XP —
@@ -266,6 +483,13 @@ class BattleAgent:
                                        # _finish must not voice the same win again 5-15s later.
         self._catching = False         # F-7(c) guard: KOing a CATCH target is a failure, never a
                                        # "you won" beat — set for the catch_pokemon flow.
+        self._switch_fail_n = 0        # voluntary matchup-switch fails this battle (latch at 1)
+        self._throw_bag_aborts = 0     # CATCH-ABORT LATCH (2026-08-05, the Magmar wedge):
+                                       # consecutive throw_ball aborts; a real throw resets it.
+        self._catch_abort = False      # latched at CATCH_ABORT_MAX -> no more throws this battle
+                                       # (campaign calls catch_pokemon on FRESH agents, so the
+                                       # __init__ zero is the direct-call battle scope; run()'s
+                                       # attach re-zeros it per battle for the divert path).
 
     # ── input (owner-attributed) ───────────────────────────────────────────────
     def _tap(self, key):
@@ -278,6 +502,423 @@ class BattleAgent:
     def _is_trainer_battle(self):
         """BATTLE_TYPE_TRAINER (0x08). Valid in-battle. Wild = can flee, trainer = can't."""
         return bool(self.b.rd32(ram.GBATTLE_TYPE_FLAGS) & 0x08)
+
+    # ── [dbl] double-battle primitives (see the module-level DOUBLE BATTLES note) ─────────
+    def _is_double(self):
+        """[dbl] True iff the LIVE battle is a double: verified BATTLE_TYPE_DOUBLE bit AND
+        gBattlersCount == 4. Only meaningful in-battle (the flags are stale outside — every
+        caller is an in-battle path). Fail-closed; POKEMON_DOUBLES=0 kills all doubles branches."""
+        if not DOUBLES_ENABLED:
+            return False
+        try:
+            return bool(self.b.rd32(ram.GBATTLE_TYPE_FLAGS) & ram.BATTLE_TYPE_DOUBLE) \
+                and self.b.rd8(ram.GBATTLERS_COUNT) == 4
+        except Exception:
+            return False
+
+    def _cursor_battler(self):
+        """[dbl] The battler whose action/move cursor the game reads RIGHT NOW: the choosing
+        player battler in a double (0 or 2), always 0 in singles — so every address helper
+        below resolves to the historical byte in singles (byte-identical old behavior)."""
+        if self._is_double():
+            b = st.double_chooser(self.b)
+            if b is not None:
+                return b
+        return 0
+
+    def _ac_addr(self):
+        """gActionSelectionCursor[choosing battler] (u8[4] — see the ARRAY TRUTH note)."""
+        return ram.GBATTLE_ACTION_CURSOR + self._cursor_battler()
+
+    def _mc_addr(self):
+        """gMoveSelectionCursor[choosing battler] (u8[4] — see the ARRAY TRUTH note)."""
+        return MOVE_CURSOR + self._cursor_battler()
+
+    def _dbl_at_target_select(self):
+        """[dbl] The doubles 'choose a target' step owns input (HandleInputChooseTarget in
+        gBattlerControllerFuncs — the same ground-truth class as GMAIN_CB2). The old flow had
+        no answer for this screen: its timeout read as a move refusal and looped the battle."""
+        if not self._is_double():
+            return False
+        try:
+            b = st.double_chooser(self.b)
+            return b is not None and self.b.rd32(
+                ram.GBATTLER_CONTROLLER_FUNCS + 4 * b) == ram.HANDLE_INPUT_CHOOSE_TARGET
+        except Exception:
+            return False
+
+    def _dbl_weakest_foe(self):
+        """[dbl] Battler id (1 or 3) of the LIVE foe with the lowest HP fraction, else None.
+        Skips absent slots (gAbsentBattlerFlags). This is both the target-select steer AND the
+        'any foe still standing?' probe."""
+        try:
+            absent = self.b.rd8(ram.GABSENT_BATTLER_FLAGS)
+            best, best_frac = None, None
+            for fb in (1, 3):
+                if absent & (1 << fb):
+                    continue
+                base = st.GBATTLE_MONS + fb * st.MON_SIZE
+                sp = self.b.rd16(base + st.F_SPECIES)
+                hp = self.b.rd16(base + st.F_HP)
+                mhp = self.b.rd16(base + st.F_MAXHP)
+                if 1 <= sp <= 411 and 0 < mhp <= 999 and hp > 0:
+                    frac = hp / mhp
+                    if best_frac is None or frac < best_frac:
+                        best, best_frac = fb, frac
+            return best
+        except Exception:
+            return None
+
+    def _dbl_our_down(self):
+        """[dbl] True iff one of OUR battler slots (0/2) is fainted/empty — the 'Choose a
+        POKéMON' screen is then a MANDATORY send-in, never a thrash to B-close (the doubles
+        read returns the LIVE partner as 'ours', so the singles hp==0 check can't see it)."""
+        try:
+            absent = self.b.rd8(ram.GABSENT_BATTLER_FLAGS)
+            for b in (0, 2):
+                if absent & (1 << b):
+                    return True
+                base = st.GBATTLE_MONS + b * st.MON_SIZE
+                sp = self.b.rd16(base + st.F_SPECIES)
+                if 1 <= sp <= 411 and self.b.rd16(base + st.F_HP) == 0:
+                    return True
+            return False
+        except Exception:
+            return False
+
+    def _dbl_confirm_target(self, tries=8):
+        """[dbl] Answer the doubles target-select step (pret battle_controller_player.c ground
+        truth): d-pad cycles LIVE foes only for damaging single-target moves (player-side
+        positions are skipped, so taps can never land on her partner), A confirms
+        gMultiUsePlayerCursor, B backs out to the move list — B is NEVER pressed here (that
+        was the infinite loop). Steer to the weakest live foe by cursor READBACK (pitfall 13:
+        verify each press moved it); if the byte won't budge or reads garbage, confirm the
+        game's own default — the game presets it to a live foe."""
+        want = self._dbl_weakest_foe()
+        frozen = 0
+        for _ in range(tries):
+            if not self._dbl_at_target_select():
+                return True                       # confirmed / the step is gone
+            try:
+                cur = self.b.rd8(ram.GMULTIUSE_PLAYER_CURSOR)
+            except Exception:
+                cur = None
+            if cur is not None and want is not None and cur != want and frozen < 2:
+                self.log(f"   [dbl] target-select: cursor on battler {cur}, steering to "
+                         f"the weaker foe {want} (RIGHT + readback)")
+                self._tap("RIGHT")
+                self._wait(10)
+                try:
+                    if self.b.rd8(ram.GMULTIUSE_PLAYER_CURSOR) == cur:
+                        frozen += 1               # eaten press / frozen byte -> take the default
+                except Exception:
+                    frozen += 1
+                continue
+            self.log(f"   [dbl] target-select: confirming battler "
+                     f"{cur if cur is not None else '?'} (want {want}"
+                     f"{', cursor frozen -> game default' if frozen >= 2 else ''}) — A")
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(16)
+        return not self._dbl_at_target_select()
+
+    def _creator_catch_order_path(self):
+        """First live creator_order.json under states/campaign or states/kira (same dirs the bot writes)."""
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "states")
+        for sub in ("campaign", "kira"):
+            p = os.path.join(root, sub, "creator_order.json")
+            if os.path.isfile(p):
+                return p
+        return None
+
+    def _peek_creator_catch_order(self):
+        """True when Jonny's voice latched order=catch_now and the TTL hasn't expired."""
+        import json as _j
+        path = self._creator_catch_order_path()
+        if not path:
+            return False
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = _j.load(f) or {}
+            if data.get("order") != "catch_now":
+                return False
+            ts = float(data.get("ts") or 0)
+            if not ts or time.time() - ts > _CREATOR_ORDER_TTL_S:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _creator_order_wants_ultra(self):
+        """Jonny NAMED the Ultra in the spoken catch order ('use an ultra ball') — the one
+        voice override that waives the legendary ball reserve for this catch. Reads the
+        latched order's raw transcript (kira/bot.py stores the spoken words in 'raw')."""
+        import json as _j
+        path = self._creator_catch_order_path()
+        if not path:
+            return False
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = _j.load(f) or {}
+            return "ultra" in str(data.get("raw") or "").lower()
+        except Exception:
+            return False
+
+    def _clear_creator_catch_order(self):
+        """Release catch_now after a committed catch attempt settles (caught or abandoned)."""
+        import json as _j
+        root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "states")
+        for sub in ("campaign", "kira"):
+            p = os.path.join(root, sub, "creator_order.json")
+            try:
+                if not os.path.isfile(p):
+                    continue
+                with open(p, encoding="utf-8") as f:
+                    data = _j.load(f) or {}
+                if data.get("order") == "catch_now":
+                    os.remove(p)
+                    self.log("   [engine] creator catch_now order CLEARED (fulfilled/released)")
+            except Exception as e:
+                self.log(f"   [engine] creator-catch clear skipped ({sub}): {e}")
+
+    def _party_owns_species(self, species_id):
+        """Cheap party-only owned check (box scan lives on Campaign; party covers the live Diglett case)."""
+        try:
+            n = min(self.b.rd8(ram.GPLAYER_PARTY_CNT), 6)
+            for i in range(n):
+                if st.read_party_species(self.b, i) == species_id:
+                    return True
+        except Exception:
+            pass
+        return False
+
+    def _dex_owns_species(self, species_id):
+        """Pokédex owned bit — true once she's EVER caught this species (party OR box)."""
+        try:
+            return ram.pokedex_owns(self.b, species_id) is True
+        except Exception:
+            return self._party_owns_species(species_id)
+
+    def _resolve_open_battle(self, max_seconds=120):
+        """NEVER return while in_battle is still True (Arena Trap / failed flee leaves a live fight —
+        travel then re-enters the same battle forever → RUN spam loop). Fight it out."""
+        if not st.in_battle(self.b):
+            return "win"
+        self.log("   [engine] battle still open after catch/flee fail — FIGHTING to clear "
+                 "(Arena Trap / Can't escape class)")
+        self._skip_catch_divert = True
+        try:
+            return self.run(max_seconds=max_seconds)
+        finally:
+            self._skip_catch_divert = False
+
+    def _divert_wild_catch(self, reason, foe_name, max_seconds):
+        """Shared careful-capture divert (shiny / legendary / creator catch_now / Diglett keeper).
+
+        2026-08-02 LIVE: catch_now + ZERO balls used to fall through to `run()` (= FIGHT) and
+        Blastoise one-shot the Route-12 Snorlax Jonny ordered caught. Creator / shiny / legendary
+        NEVER fight-clear on empty balls — flee, keep the order live, Mart first."""
+        _never_ko = reason in ("shiny", "legendary", "creator_catch_now")
+        # PARTY-WIPE GUARD at the DIVERT DOOR (2026-08-05, the Magmar wedge: 2 of 3 mons down
+        # and the catch flow still owned the battle): with <=1 healthy mon a non-hunt catch is
+        # never worth the wipe — fight/flee instead, and a latched creator order releases
+        # LOUDLY (never a silent forever-retry into the next faint). Legendary/shiny attempts
+        # stay allowed — the send-in gate inside catch_pokemon still outranks their throws.
+        if reason not in ("legendary", "shiny") and self._healthy_party_count() <= 1:
+            self.log(f"   [catch] PARTY-WIPE GUARD — {self._healthy_party_count()} healthy "
+                     f"mon left; refusing the {reason} catch divert (fight/flee instead)")
+            if reason == "creator_catch_now":
+                self._release_catch_order_loud(
+                    "party-wipe risk: down to the last healthy mon",
+                    f"I can't catch right now — I'm down to my last Pokémon. I have to get "
+                    f"out of this {foe_name} fight alive first.")
+            self._skip_catch_divert = True
+            try:
+                return self.run(max_seconds=max(120, max_seconds))
+            finally:
+                self._skip_catch_divert = False
+        try:
+            _is_mewtwo = (reason == "legendary"
+                          and (st.read_battle(self.b) or {}).get("enemy", {}).get("species") == 150)
+        except Exception:
+            _is_mewtwo = False
+        # BALL TIER doctrine (2026-08-04) + THE LEGENDARY RESERVE (2026-08-05): a legendary/
+        # shiny gets the STRONGEST ball first and spends freely ('best'); everything else is
+        # 'cheap' and may not touch the hunt's Ultras. A creator catch_now spends cheap tiers
+        # under the reserve — UNLESS Jonny literally named the Ultra in the spoken order
+        # ("use an ultra ball"), the one voice override that waives it.
+        _pref = "best" if reason in ("legendary", "shiny") else "cheap"
+        if reason == "creator_catch_now" and self._creator_order_wants_ultra():
+            _pref = "best"
+            self.log("   [catch] creator order NAMES the Ultra — reserve waived for this catch")
+        _reserved = (self._spendable_for_pref(_pref) <= 0 < self._ball_count())
+        if self._spendable_for_pref(_pref) <= 0 \
+                and not (_is_mewtwo and self._ball_qty(self._BALL_MASTER) > 0):
+            if _reserved:
+                self.log("   [catch] RESERVE — ultras held for the hunt, skipping trash catch")
+            if _never_ko:
+                self.log(f"   [engine] WILD CATCH DIVERT ({reason}) — "
+                         f"{'only RESERVED ultras' if _reserved else 'ZERO balls'}; "
+                         f"{'soft-reload' if reason == 'legendary' else 'FLEEING'} "
+                         f"(NOT fighting — that KOs the catch target)")
+                if _reserved:
+                    self.emit(f"my Ultra Balls are the legendaries' — I'm not spending them "
+                              f"here and I'm NOT killing this {foe_name}. backing out; "
+                              f"cheap balls first, then we catch.", beat=True, tier=3)
+                else:
+                    self.emit(f"I've got ZERO Poké Balls — I am NOT killing this {foe_name}. "
+                              f"backing out. Mart first, then we catch.", beat=True, tier=3)
+                # LEGENDARY: never RUN (MonFlewAway spends the static). Soft-reload the
+                # pre-bank so balls come back without the flew-away spectacle.
+                if reason == "legendary":
+                    try:
+                        _sp0b = (st.read_battle(self.b) or {}).get("enemy", {}).get("species")
+                    except Exception:
+                        _sp0b = None
+                    if self._try_legend_soft_reload(_sp0b):
+                        return "no_balls"
+                    self.log("   [engine] !! legendary + 0 balls + soft-reload failed — "
+                             "NOT fleeing (LOUD)")
+                    return "no_balls"
+                # KEEP catch_now live — clearing it made the next wake/fight a free KO.
+                fled = self.flee(max_seconds=60)
+                if not st.in_battle(self.b):
+                    return "no_balls"
+                if self._foe_blocks_flee():
+                    # Diglett Arena Trap + 0 balls + catch order: can't flee, can't catch.
+                    # Fighting is the only exit — LOUD. (Snorlax is fleeable; never hits here.)
+                    self.log("   [engine] catch_now + 0 balls + Arena Trap — must fight clear (LOUD)")
+                    self._skip_catch_divert = True
+                    try:
+                        return self.run(max_seconds=max(120, max_seconds))
+                    finally:
+                        self._skip_catch_divert = False
+                return "no_balls"
+            self.log(f"   [engine] WILD CATCH DIVERT skipped ({reason}) — "
+                     f"{'only reserved ultras' if _reserved else 'no balls'}; fighting instead")
+            self._skip_catch_divert = True
+            try:
+                return self.run(max_seconds=max(120, max_seconds))
+            finally:
+                self._skip_catch_divert = False
+        self.log(f"   [engine] WILD CATCH DIVERT ({reason}) — {foe_name}: weaken+balls, never KO")
+        # Mewtwo — alone — may spend the Silph Co. Master Ball (the classic move; any other
+        # target would waste it). _pref was decided above (reserve-aware).
+        _master = False
+        if reason == "legendary":
+            try:
+                _master = (st.read_battle(self.b) or {}).get("enemy", {}).get("species") == 150
+            except Exception:
+                _master = False
+        res = self.catch_pokemon(max_seconds=max(150, max_seconds), weaken=True,
+                                 ball_pref=_pref, allow_master=_master,
+                                 divert_reason=reason)
+        if reason == "creator_catch_now" and res == "caught":
+            self._clear_creator_catch_order()
+        elif reason == "creator_catch_now" and res in ("fainted",):
+            # KO'd the catch target — LOUD failure, clear so she doesn't re-latch forever.
+            self.log("   [engine] !! catch_now FAILED — target fainted (KO). order cleared.")
+            self.emit(f"no — I knocked out the {foe_name}. that was the catch order. I'm an idiot.",
+                      beat=True, tier=3)
+            self._clear_creator_catch_order()
+        elif reason == "creator_catch_now" and catch_order_release(
+                res, getattr(self, "_catch_abort", False), self._healthy_party_count()):
+            # ORDER HYGIENE (2026-08-05): a WEDGED catch (abort latch) or a party-wipe risk
+            # RELEASES the LAW — 'KEPT for retry' is for clean failures only. Retrying a
+            # wedge just re-arms the 14:10 session-ender.
+            _wiped = self._healthy_party_count() <= 1
+            self._release_catch_order_loud(
+                f"res={res}, abort_latch={getattr(self, '_catch_abort', False)}, "
+                f"healthy={self._healthy_party_count()}",
+                "I can't catch right now — " +
+                ("I'm down to my last Pokémon. staying alive comes first." if _wiped else
+                 "my throw flow is wedged this fight. letting the order go — "
+                 "I'll get the next one."))
+        elif reason == "creator_catch_now" and res in ("no_balls", "cant_weaken", "fled",
+                                                       "stuck", "our_down"):
+            # Keep order — she still owes the catch after Mart / heal / retry (CLEAN failure).
+            self.log(f"   [engine] catch_now unresolved ({res}) — LAW order KEPT for retry")
+        if res == "caught" or not st.in_battle(self.b):
+            return res
+        # ABANDON-VERDICT RESOLUTION (2026-08-05): the new verdicts hand back a LIVE battle —
+        # resolve it HERE (returning with the fight open makes travel re-enter it forever).
+        # Protected targets (legendary/shiny/an order that survived release) get one flee
+        # first; then WAR-MUST-ADVANCE — fight it out rather than idle (pitfall 34), loudly.
+        if res in ("catch_abort", "party_risk", "our_down"):
+            if _never_ko and res != "our_down":       # no flee from the send-in screen —
+                #                                       run()'s faint drain owns that state
+                if reason == "legendary":
+                    try:
+                        _sp_ab = (st.read_battle(self.b) or {}).get("enemy", {}).get("species")
+                    except Exception:
+                        _sp_ab = None
+                    if self._legend_fight_still_winnable():
+                        self.log(f"   [engine] catch abandoned ({res}) on legendary but "
+                                 f"fight still winnable — NOT soft-reloading (LOUD)")
+                    else:
+                        self.log(f"   [engine] catch abandoned ({res}) on legendary — "
+                                 f"soft-reload (NEVER flee / MonFlewAway) (LOUD)")
+                        if self._try_legend_soft_reload(_sp_ab):
+                            return res
+                else:
+                    self.log(f"   [engine] catch abandoned ({res}) on a protected target — "
+                             f"fleeing first (never KO)")
+                    self.flee(max_seconds=45)
+                    if not st.in_battle(self.b):
+                        return res
+                self.log(f"   [engine] flee/soft-reload failed after {res} — WAR-MUST-ADVANCE: "
+                         f"fighting the battle out (LOUD)")
+            return self._resolve_open_battle(max_seconds=max(120, max_seconds))
+        if res == "chip_exhausted" and reason == "legendary":
+            # Soft-reload only when the catch is lost (0 balls / gate allows). A winnable
+            # live fight must NOT rewind here (Jonny 2026-08-06 evening).
+            self.log(f"   [engine] legendary chip_exhausted — no RUN "
+                     f"(deepen/keep-fighting owns a live chance) (LOUD)")
+            if (self._legend_fight_still_winnable()
+                    and getattr(self, "_legend_catch_reenter", 0) < 2):
+                self._legend_catch_reenter = getattr(self, "_legend_catch_reenter", 0) + 1
+                self.log("   [engine] !! chip_exhausted but fight still winnable — "
+                         "re-entering catch (NO soft-reload) (LOUD)")
+                return self.catch_pokemon(max_seconds=max(150, max_seconds), weaken=True,
+                                          ball_pref=_pref, allow_master=_master,
+                                          divert_reason=reason)
+            return res
+        if _never_ko:
+            if reason == "legendary":
+                try:
+                    _sp_fl = (st.read_battle(self.b) or {}).get("enemy", {}).get("species")
+                except Exception:
+                    _sp_fl = None
+                if (self._legend_fight_still_winnable()
+                        and getattr(self, "_legend_catch_reenter", 0) < 2):
+                    self._legend_catch_reenter = getattr(self, "_legend_catch_reenter", 0) + 1
+                    self.log(f"   [engine] !! legendary capture unfinished ({res}) — "
+                             f"still in fight with balls + live bird; NOT soft-reloading "
+                             f"(FINISH the catch) (LOUD)")
+                    self.emit(f"still got a shot at {foe_name} — not rewinding, finishing this.",
+                              beat=True, tier=2)
+                    return self.catch_pokemon(max_seconds=max(150, max_seconds), weaken=True,
+                                              ball_pref=_pref, allow_master=_master,
+                                              divert_reason=reason)
+                self.emit(f"I couldn't catch it ({res}) — rewinding, NOT letting "
+                          f"{foe_name} fly away.", beat=True, tier=3)
+                self.log(f"   [engine] {reason} capture failed ({res}) — soft-reload "
+                         f"(catch lost; NEVER flee / MonFlewAway) (LOUD)")
+                if self._try_legend_soft_reload(_sp_fl):
+                    return res
+                if not st.in_battle(self.b):
+                    return res
+                self.emit("can't rewind — finishing carefully, no KO.", beat=True, tier=2)
+            else:
+                self.emit(f"I couldn't catch it ({res}) — I am NOT killing a {reason}, I'm backing out.",
+                          beat=True, tier=3)
+                self.log(f"   [engine] {reason} capture failed ({res}) — fleeing to avoid KOing it")
+                fled = self.flee(max_seconds=60)
+                if not st.in_battle(self.b):
+                    return fled
+                if reason == "creator_catch_now" and not self._foe_blocks_flee():
+                    return "no_balls"
+                self.emit("can't run — finishing the fight carefully.", beat=True, tier=2)
+        return self._resolve_open_battle(max_seconds=max(120, max_seconds))
 
     def _enemy_live_remaining(self):
         """F-7(c): how many LIVE mons remain in gEnemyParty (valid species, HP > 0). The party
@@ -296,6 +937,72 @@ class BattleAgent:
             return n
         except Exception:
             return 99
+
+    def _decided_win(self):
+        """True when the fight is already OVER for us — last foe down, we still standing.
+        Used to forbid stuck/timeout aborts that make travel RE-ENTER the victory drain
+        (2026-08-02 Rock Tunnel chalk: win beat → rewind into last seconds of the fight)."""
+        try:
+            if self._we_fainted:
+                return False
+            if not (self._enemy_fainted or self._win_emitted):
+                return False
+            return self._enemy_live_remaining() == 0
+        except Exception:
+            return False
+
+    def _drain_decided_win(self, grace_s=120):
+        """Keep mashing the victory chain until the battle exits. NEVER return stuck/timeout
+        while the win is decided — those aborts are what travel re-enters as a 'fight reset'."""
+        t0 = time.time()
+        n = 0
+        self.log(f"   [engine] DECIDED-WIN DRAIN: last foe down — finishing victory chain "
+                 f"(grace {grace_s}s; will NOT abort mid-win for re-entry)")
+        while time.time() - t0 < grace_s:
+            if not st.in_battle(self.b):
+                return self._finish()
+            n += 1
+            # Escalate clears the same way as drain armor, but never bail to stuck.
+            if n == 40:
+                self.log("   [engine] decided-win drain: 40 advances — B-first pairs")
+                self._debug_snap("decided_win40")
+            elif n == 80:
+                self.log("   [engine] decided-win drain: 80 advances — START tap")
+                self._debug_snap("decided_win80")
+                self.b.press("START", 2, 14, self.render, owner=self.owner)
+                self._wait(16)
+            elif n > 0 and n % 120 == 0:
+                self.log(f"   [engine] decided-win drain still live at {n} advances — "
+                         f"keeping on (NOT stuck; win is decided)")
+                self._debug_snap(f"decided_win{n}")
+                self.b.press("START", 2, 14, self.render, owner=self.owner)
+                self._wait(16)
+            if n >= 40:
+                self.b.press("B", 2, 14, self.render, owner=self.owner)
+                self._wait(16)
+                self.b.press("A", 2, 14, self.render, owner=self.owner)
+                self._wait(16)
+            else:
+                self._advance_text(force_b=True)
+        # Grace spent but still in battle — one last hard mash, then finish as win if cleared.
+        self.log("   [engine] !! decided-win grace spent — hard mash then exit (LOUD)")
+        for _ in range(60):
+            if not st.in_battle(self.b):
+                return self._finish()
+            self.b.press("B", 2, 10, self.render, owner=self.owner)
+            self._wait(8)
+            self.b.press("A", 2, 10, self.render, owner=self.owner)
+            self._wait(8)
+        if not st.in_battle(self.b):
+            return self._finish()
+        # Still open: report win anyway so travel does NOT treat this as stuck and re-enter.
+        # The next tick's _wait_overworld / a fresh attach will keep draining; aborting as
+        # stuck is what caused the visible fight-reset loop on stream.
+        self.log("   [engine] !! decided-win still in_battle after hard mash — returning win "
+                 f"(refuse re-entry loop; in_battle={st.in_battle(self.b)})")
+        if not self._win_emitted:
+            self._win_emitted = True
+        return "win"
 
     # ── events + performance beats ─────────────────────────────────────────────
     def emit(self, summary, beat=False, tier=None):
@@ -374,6 +1081,15 @@ class BattleAgent:
             self._wait(3)
         return self.b.rd8(ram.GBATTLE_ACTION_CURSOR) == ram.ACT_RUN
 
+    def _foe_blocks_flee(self):
+        """True when the wild foe's ability makes RUN impossible (Diglett/Dugtrio = Arena Trap).
+        Fleeing then livelocks on 'Can't escape' + RUN spam (2026-08-02 Diglett chalk)."""
+        try:
+            esp = st.read_enemy_species(self.b, 0)
+            return esp in _DIGLETT_LINE
+        except Exception:
+            return False
+
     def flee(self, max_seconds=90):
         """RETREAT: flee a WILD battle (the wounded heal-return path - fighting our way back
         through the grass is what blacks us out). Forced TRAINER battles can't be fled, so we
@@ -399,26 +1115,54 @@ class BattleAgent:
                 self._prev = st.read_battle(self.b)
         if self._is_trainer_battle():                 # can't flee a trainer -> WIN it
             return self.run(max_seconds=max_seconds)
+        # ARENA TRAP (Diglett/Dugtrio): RUN never works — fight clear immediately. Do NOT spam RUN
+        # for `max_seconds` (live stream chalk: she narrated "running" and stuck in Diglett forever).
+        if self._foe_blocks_flee():
+            foe = st.SPECIES_NAME.get(st.read_enemy_species(self.b, 0), "Diglett")
+            self.log(f"   [engine] flee: {foe} has Arena Trap — Can't escape. FIGHTING to clear "
+                     f"(not RUN-spamming)")
+            self.emit(f"Arena Trap — you can't run from {foe}. finishing the fight.",
+                      beat=True, tier=2)
+            self._skip_catch_divert = True
+            try:
+                return self.run(max_seconds=max(120, max_seconds))
+            finally:
+                self._skip_catch_divert = False
         for _ in range(3):                            # ensure the ACTION menu, not the move list:
             if not self._in_move_list():              # _white_box can't tell them apart, so RUN nav
                 break                                 # from an open move-list fires a move + never
             self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)  # escapes (flee 'stuck'
             self._wait(10)                            # loop). Same class as the catch bag-nav bug.
+        cant_escape = 0
         for _ in range(40):
             if not st.in_battle(self.b):
                 return "fled"
             self._settle()
             if not st.in_battle(self.b):
                 return "fled"
+            # Ability / Mean Look class: if RUN keeps failing, stop spamming and fight clear.
+            if self._foe_blocks_flee() or cant_escape >= 2:
+                self.log(f"   [engine] flee: Can't escape (streak={cant_escape}) — FIGHTING clear")
+                self.emit("can't run from this one — fighting out.", beat=True, tier=2)
+                self._skip_catch_divert = True
+                try:
+                    return self.run(max_seconds=max(120, max_seconds))
+                finally:
+                    self._skip_catch_divert = False
             cur = st.read_battle(self.b)
             if cur and cur["ours"]["hp"] == 0:
                 return "loss"
             if self._white_box() and self._goto_run():
                 self._tap("RIGHT"); self._tap("DOWN") # engage (eaten-press; RUN stays at corner)
                 self._tap("A"); self._wait(20)        # confirm RUN -> "got away safely" / retry
+                if st.in_battle(self.b):
+                    cant_escape += 1                  # still in fight = Can't escape / failed flee
             else:
                 self._advance_text()                  # advance the escape/"can't escape" message
-        return "fled" if not st.in_battle(self.b) else "stuck"
+        if st.in_battle(self.b):
+            self.log("   [engine] flee: still in battle after RUN budget — FIGHTING clear (LOUD)")
+            return self._resolve_open_battle(max_seconds=max(120, max_seconds))
+        return "fled"
 
     # ── autonomous CATCH (real bag nav; the phantom-A bug that made this impossible was
     # fixed 2026-06-25 — see [[pokemon-battle-menu-nav-cracked]]). Flow, screenshot- and
@@ -427,36 +1171,199 @@ class BattleAgent:
     # ball) -> A selects -> "POKé BALL is selected. USE/CANCEL" (cursor on USE) -> A throws.
     # Then advance the catch sequence (B dismisses the "give a nickname?" Yes/No). We SETTLE
     # after the bag-open fade (acting mid-transition = eaten, the same quirk as the move list).
-    def _ball_count(self):
-        """REAL number of Poké Balls (item id 4) in the bag's balls pocket. Item ids are plain;
-        the QUANTITY is XOR-encrypted with the SaveBlock2 security key (FireRed: SaveBlock2+0xF20,
-        low 16 bits). Decrypting it lets callers gate on the true count (e.g. throw-until-caught,
-        out-of-balls handling) instead of mere presence. 0 -> can't throw."""
-        sb1 = self.b.rd32(ram.GSAVEBLOCK1_PTR)
-        key = self.b.rd32(self.b.rd32(ram.GSAVEBLOCK2_PTR) + 0xF20) & 0xFFFF
-        for i in range(16):
-            iid = self.b.rd16(sb1 + 0x430 + i * 4)
-            if iid == 0:
-                break
-            if iid == 4:
-                return self.b.rd16(sb1 + 0x430 + i * 4 + 2) ^ key
-        return 0
+    # BALL TIERS (2026-08-04, Jonny: 'catching mew or mewtwo as a final endgame project ...
+    # all cool legendaries'): everything here was hard-coded to plain Poké Ball (id 4) — a
+    # catch-rate-3 legendary with Poké Balls is <1% a throw, a guaranteed pocket-drain wedge.
+    # Gen-3 ball item ids: 1 Master, 2 Ultra, 3 Great, 4 Poké, 5 Safari, 6-12 specials.
+    _BALL_MASTER, _BALL_ULTRA, _BALL_GREAT, _BALL_POKE = 1, 2, 3, 4
+    _BALL_NAMES = {1: "Master Ball", 2: "Ultra Ball", 3: "Great Ball", 4: "Poké Ball",
+                   5: "Safari Ball", 6: "Net Ball", 7: "Dive Ball", 8: "Nest Ball",
+                   9: "Repeat Ball", 10: "Timer Ball", 11: "Luxury Ball", 12: "Premier Ball"}
+    _SPENDABLE_BALLS = (2, 3, 4, 6, 7, 8, 9, 10, 11, 12)   # throwable freely (Master/Safari out)
+    _BALL_ORDER_CHEAP = (4, 3, 2, 12, 11, 10, 9, 8, 7, 6)  # dex-push trash: weakest first
+    _BALL_ORDER_BEST = (2, 3, 12, 11, 10, 9, 8, 7, 6, 4)   # legendary/shiny: strongest first
 
-    def throw_ball(self, max_seconds=45):
-        """Throw a Poké Ball at a WILD foe via real menu nav. Returns 'caught' (party+1),
+    def _balls_pocket(self):
+        """The bag's Poké Balls pocket as [(item_id, qty)] rows in DISPLAY order. Ids are plain;
+        the QUANTITY is XOR-encrypted with the SaveBlock2 security key (SaveBlock2+0xF20 low16)."""
+        out = []
+        try:
+            sb1 = self.b.rd32(ram.GSAVEBLOCK1_PTR)
+            key = self.b.rd32(self.b.rd32(ram.GSAVEBLOCK2_PTR) + 0xF20) & 0xFFFF
+            for i in range(13):                          # FRLG balls pocket = 13 slots
+                iid = self.b.rd16(sb1 + 0x430 + i * 4)
+                if iid == 0:
+                    break
+                out.append((iid, self.b.rd16(sb1 + 0x430 + i * 4 + 2) ^ key))
+        except Exception:
+            pass
+        return out
+
+    def _ball_qty(self, iid):
+        return next((q for i, q in self._balls_pocket() if i == iid), 0)
+
+    def _ball_count(self):
+        """Throwable-ball total across the SPENDABLE tiers (Ultra/Great/Poké + specials). The
+        Master Ball is deliberately EXCLUDED — it is Mewtwo's, never a wild-catch statistic."""
+        return sum(q for iid, q in self._balls_pocket() if iid in self._SPENDABLE_BALLS)
+
+    def _hunt_pending(self):
+        """The Mart Ultra-stock doctrine's hunt-pending signal, mirrored (campaign._shop_list
+        2026-08-04): Surf is known (a legendary road is open) AND any of the four legendary
+        encounters is still alive (dex bit not owned, battled-away flag unset). Fail-closed
+        False — a read fault reverts to the pre-reserve spend-anything behavior rather than
+        ever wedging a catch."""
+        try:
+            import field_moves as _fm
+            if st.party_knows_move(self.b, 57, self.b.rd8(ram.GPLAYER_PARTY_CNT)) is None:
+                return False
+            return any(ram.pokedex_owns(self.b, sp) is not True
+                       and not _fm.read_flag(self.b, fl)
+                       for sp, fl in _HUNT_QUARRY)
+        except Exception:
+            return False
+
+    def _spendable_for_pref(self, pref="cheap"):
+        """RESERVE-AWARE _ball_count: how many balls THIS catch may actually spend. 'best'
+        (hunt/shiny targets) sees everything; 'cheap' excludes the whole Ultra tier while
+        any legendary hunt is pending (the 2026-08-05 Kindle Road law — see HUNT_BALL_RESERVE)."""
+        n = self._ball_count()
+        if HUNT_BALL_RESERVE and pref != "best" and self._hunt_pending():
+            n -= self._ball_qty(self._BALL_ULTRA)
+        return n
+
+    def _healthy_party_count(self):
+        """How many party mons can still fight — plaintext current-HP > 0 at +0x56 (the same
+        unencrypted read _healthy_reserve_slot trusts). Fail-OPEN (6): a read fault must keep
+        the pre-guard behavior — never suppress a catch off flaky RAM (the PARTY-WIPE GUARD
+        only bites on a VERIFIED thin party)."""
+        try:
+            cnt = min(self.b.rd8(ram.GPLAYER_PARTY_CNT), 6)
+            if not cnt:
+                return 6
+            return sum(1 for s in range(cnt)
+                       if self.b.rd16(ram.GPLAYER_PARTY + s * 100 + 0x56) > 0)
+        except Exception:
+            return 6
+
+    def _catch_our_down(self, state=None):
+        """FAINT-STATE AWARENESS for the catch flow (2026-08-05, the Magmar send-in wedge):
+        True iff OUR active battler is DOWN, i.e. the game is in (or headed into) the forced
+        send-in state — in FRLG the bag CANNOT open there, so every throw is a guaranteed
+        'bag would not open' abort. VERIFIED RAM only (the cursor-readback law's sibling —
+        never a lone state byte):
+          - singles: gBattleMons battler-0 HP == 0 (st.read_battle 'ours'), CROSS-CHECKED
+            against the party struct's plaintext HP for the seated mon (_true_active_party_hp
+            — pret Cmd_datahpupdate syncs the party copy on every damage write, so a REAL
+            faint reads 0 in BOTH structs; a stale display corpse [pitfall 26] or an HP tear
+            reads 0 in only one and stays 'standing' here);
+          - doubles: _dbl_our_down (either of OUR battler slots 0/2 fainted/absent — the
+            e4002d9 per-battler read; catch is singles-only, the check just keeps the truth).
+        Fail-CLOSED False — a read fault must never abandon a live catch."""
+        try:
+            if self._is_double() and self._dbl_our_down():
+                return True
+            s = state if state is not None else st.read_battle(self.b)
+            if not s or not s.get("ours", {}).get("maxhp"):
+                return False
+            if s["ours"]["hp"] > 0:
+                return False
+            php, _pmx = self._true_active_party_hp()
+            if php is None:
+                return True          # battle struct says down; party unreadable -> trust it
+            return php == 0
+        except Exception:
+            return False
+
+    def _note_throw_abort(self, why):
+        """Feed the CATCH-ABORT LATCH: consecutive throw_ball LOUD aborts in this battle
+        (bag would not open / pocket unreachable / no ball consumed — the same wedge family).
+        A ball actually leaving the bag resets the streak; CATCH_ABORT_MAX in a row latch the
+        catch OFF for the battle (mirrors HEAL-FAIL LATCH / POTION-BLOCK: proven-failure-
+        scoped, cleared at the next battle attach)."""
+        self._throw_bag_aborts = getattr(self, "_throw_bag_aborts", 0) + 1
+        self.log(f"   [catch] throw abort ({why}) — consecutive "
+                 f"{self._throw_bag_aborts}/{CATCH_ABORT_MAX} this battle")
+        if self._throw_bag_aborts >= CATCH_ABORT_MAX and not getattr(self, "_catch_abort", False):
+            self._catch_abort = True
+            self.log(f"   [catch] !! CATCH-ABORT LATCHED — the throw flow aborted "
+                     f"{CATCH_ABORT_MAX}x in a row this battle: no more throws, fight/flee "
+                     f"normally (clears when the battle ends)")
+
+    def _release_catch_order_loud(self, why, voice):
+        """ORDER HYGIENE (2026-08-05, requirement of the Magmar fix): a catch_now order that
+        WEDGED (catch-abort latch) or that a party-wipe risk makes unaffordable must not spin
+        'KEPT for retry' forever — release it LOUDLY (log + voice) so Jonny hears why his LAW
+        was let go."""
+        self.log(f"   [engine] !! catch_now RELEASED ({why}) — order will NOT retry")
+        self.emit(voice, beat=True, tier=3)
+        self._clear_creator_catch_order()
+
+    def _pick_ball(self, pref="cheap", allow_master=False):
+        """(item_id, display_row) of the ball to throw, or (None, None). 'cheap' spends weakest
+        first (dex push); 'best' spends strongest first (legendary/shiny). Master only when
+        explicitly allowed (the Mewtwo seat). THE LEGENDARY RESERVE (2026-08-05): while any
+        hunt is pending, 'cheap' skips the Ultra tier entirely — cheap must mean genuinely
+        cheap, and a bag holding only reserved Ultras returns (None, None) so the caller
+        REFUSES the catch instead of draining the hunt's stock."""
+        rows = self._balls_pocket()
+        if allow_master:
+            r = next((n for n, (i, q) in enumerate(rows) if i == self._BALL_MASTER and q > 0), None)
+            if r is not None:
+                return self._BALL_MASTER, r
+        order = self._BALL_ORDER_BEST if pref == "best" else self._BALL_ORDER_CHEAP
+        _hold_ultras = HUNT_BALL_RESERVE and pref != "best" and self._hunt_pending()
+        for want in order:
+            if want == self._BALL_ULTRA and _hold_ultras:
+                continue                              # the hunt's tier — never a trash throw
+            r = next((n for n, (i, q) in enumerate(rows) if i == want and q > 0), None)
+            if r is not None:
+                return want, r
+        return None, None
+
+    def throw_ball(self, max_seconds=45, pref="cheap", allow_master=False):
+        """Throw a ball at a WILD foe via real menu nav. Returns 'caught' (party+1),
         'broke_free' (battle continued/ended w/o catch), 'trainer' (can't catch), 'no_balls',
-        or 'stuck'. Assumes a fresh/settled action menu (turn start). Control-proven party+1."""
+        or 'stuck'. Assumes a fresh/settled action menu (turn start). Control-proven party+1.
+        `pref`/`allow_master`: the BALL TIER doctrine (2026-08-04) — 'cheap' spends weakest
+        first, 'best' strongest first, Master only when explicitly allowed (Mewtwo)."""
         t0 = time.time()
         if self._is_trainer_battle():
             return "trainer"
-        if self._ball_count() == 0:
-            self.log("   [engine] throw_ball: no Poké Balls in the bag")
+        ball_id, ball_row = self._pick_ball(pref=pref, allow_master=allow_master)
+        if ball_id is None:
+            if self._ball_count() > 0:
+                self.log("   [catch] RESERVE — ultras held for the hunt, skipping trash catch")
+            else:
+                self.log("   [engine] throw_ball: no throwable ball in the bag")
             return "no_balls"
+        # FAINT-STATE AWARENESS (2026-08-05, the Magmar wedge): our active battler DOWN means
+        # the forced send-in owns the screen and FRLG will NOT open the bag — every attempt
+        # is a guaranteed "bag would not open" abort. Refuse before touching a menu; the
+        # caller runs the send-in flow (catch_pokemon's gate / run()'s drain) and re-asks.
+        if self._catch_our_down():
+            self.log("   [catch] !! THROW REFUSED — our active battler is DOWN "
+                     "(forced send-in owns the screen; the bag cannot open here)")
+            return "our_down"
+        try:
+            # LOUD [catch] THROW line (2026-08-04): species + HP fraction + the ball tier, so
+            # soak reports confess the weaken-then-throw discipline per throw.
+            _s = st.read_battle(self.b)
+            _foe = (_s or {}).get("enemy", {})
+            self.log(f"   [catch] THROW {self._BALL_NAMES.get(ball_id, f'ball#{ball_id}')} "
+                     f"(x{self._ball_qty(ball_id)} left, pref={pref}) at "
+                     f"{st.SPECIES_NAME.get(_foe.get('species'), '?')} "
+                     f"hp={_hp_frac(_foe) if _foe.get('maxhp') else 1.0:.0%} "
+                     f"status={_decode_status(_foe.get('status1', 0)) or 'none'}")
+        except Exception:
+            pass
         if not self._white_box():
             self._reach_first_menu(t0, max_seconds)
         self._settle()
         p0 = self.b.rd8(ram.GPLAYER_PARTY_CNT)
-        balls_at_start = self._ball_count()           # baseline BEFORE the bag opens (throw-verify gate)
+        # baseline BEFORE the bag opens (throw-verify gate) — ALL tiers incl. Master, so a
+        # Master throw registers as _thrown() too
+        balls_at_start = sum(q for _i, q in self._balls_pocket())
         if os.environ.get("CATCH_RECON"):             # RECON: what menu are we actually on at throw-start?
             try:
                 _s = st.read_battle(self.b)
@@ -498,7 +1405,8 @@ class BattleAgent:
         # confirm. Selecting may itself throw (no USE prompt) or need one more A; re-checking before each
         # press never double-throws. Control-proven: Route 3 fail-state pocket 0->1->2, balls 5->1, caught.
         def _thrown():
-            return (self._ball_count() < balls_at_start or self.b.rd8(ram.GPLAYER_PARTY_CNT) > p0
+            return (sum(q for _i, q in self._balls_pocket()) < balls_at_start
+                    or self.b.rd8(ram.GPLAYER_PARTY_CNT) > p0
                     or not st.in_battle(self.b))
         # OPEN THE BAG and VERIFY it actually opened before trusting the pocket var: if the open-A is
         # eaten (we're not fully settled) we stay at the action menu and ram.GBAG_POCKET reads STALE
@@ -514,6 +1422,7 @@ class BattleAgent:
                 opened = True; break
         if not opened:
             self.log("   [engine] !! throw_ball: bag would not open (open-A eaten) — aborting LOUDLY")
+            self._note_throw_abort("bag would not open")
             return "stuck"
         on_balls_pocket = False
         for _ in range(8):                            # steer the live pocket index toward Poké Balls
@@ -527,12 +1436,23 @@ class BattleAgent:
                      f"on_balls_pocket={on_balls_pocket} item={self.b.rd16(ram.GSPECIALVAR_ITEMID)}")
         if not on_balls_pocket:
             self.log("   [engine] !! throw_ball: couldn't reach the Poké Balls pocket — aborting LOUDLY")
+            self._note_throw_abort("balls pocket unreachable")
             for _ in range(4):                        # leave the menu clean for the caller
                 if self._white_box():
                     break
                 self.b.press("B", 2, 12, self.render, owner=self.owner); self._wait(8)
             return "stuck"
-        self._tap("UP"); self._wait(8)                # top of the balls pocket = the ball
+        # BALL-TIER ROW WALK (2026-08-04): the old 'UP = top of pocket' threw whatever was
+        # row 0 — with Ultras stocked that could be the wrong tier either way. Blind clamp
+        # to the top (the list clamps, eaten taps are harmless), then DOWN to the chosen row.
+        n_rows = max(1, len(self._balls_pocket()))
+        for _ in range(n_rows + 2):
+            self._tap("UP"); self._wait(6)
+        for _ in range(int(ball_row)):
+            self._tap("DOWN"); self._wait(8)
+        if ball_row or n_rows > 1:
+            self.log(f"   [engine] throw_ball: aiming row {ball_row} = item {ball_id} "
+                     f"({'MASTER' if ball_id == 1 else 'ultra' if ball_id == 2 else 'great' if ball_id == 3 else 'poké/other'} ball, pref={pref})")
         # SELECT + THROW, then STOP the instant a ball leaves. Press A (select -> USE/throw); the throw
         # removes the ball from the bag IMMEDIATELY (count drops) — so after each A we POLL for the throw
         # to register and break the MOMENT it does. This is critical: if we kept mashing A, the extra
@@ -549,7 +1469,9 @@ class BattleAgent:
                 self.b.run_frame(); self.render()
         if not _thrown():
             self.log("   [engine] !! throw_ball: ball selected but no throw consumed a ball — aborting LOUDLY")
+            self._note_throw_abort("select did not consume a ball")
             return "stuck"
+        self._throw_bag_aborts = 0        # a ball actually left — the abort streak is broken
         self.emit("alright — throwing a Poké Ball", beat=True)
         while time.time() - t0 < max_seconds:
             if self.b.rd8(ram.GPLAYER_PARTY_CNT) > p0:
@@ -598,6 +1520,138 @@ class BattleAgent:
     _STATUS_MOVES = _SLEEP_MOVES | {77, 78, 86}     # + PoisonPowder, StunSpore, ThunderWave
     CATCH_WEAKEN_CEIL = 0.85   # if she CAN'T weaken (depleted PP) AND the foe is still above this HP
     #                            fraction, don't dump balls into a low-odds full-HP catch — flee + heal.
+    CATCH_READY_FRAC = 0.50    # weaken-then-throw (2026-08-04): at/below this HP fraction (or with
+    #                            ANY status up) the target is throw-READY — more weakening only risks
+    #                            the KO. Above it, weaken first when a safe chip exists.
+    CATCH_CHIP_TARGET = 0.30   # the chip loop aims the foe's HP here before committing to throws.
+    # SPECIES THAT ESCAPE ON THEIR FIRST FREE TURN (2026-07-30, Jonny live report: full-HP ball at an
+    # Abra, it Teleported). Wild Abra/Kadabra in FireRed know only Teleport — EVERY turn you spend
+    # weakening/switching hands it the exit. The only play is ball-on-sight; the throw itself resolves
+    # before the foe acts, so a break-free still costs the encounter but a weaken ALWAYS does.
+    _FLEES_ON_FREE_TURN = {63: "Teleport", 64: "Teleport"}          # Abra, Kadabra
+    # CHIPPER-SWITCH band (the 'weaken with NOT the ace' play): when the lead out-levels the wild by
+    # 10+ (any hit could KO) and no sleep move is up, switch to a teammate whose level sits within
+    # this margin ABOVE the foe — close enough that its gentlest move chips instead of one-shots.
+    CATCH_CHIPPER_MAX_OVER = int(os.getenv("POKEMON_CATCH_CHIPPER_OVER", "9"))
+
+    def _catch_chipper_slot(self, foe_level, legend=False, exclude=None, foe_types=None):
+        """Best party slot to do the CHIPPING when the lead would one-shot the catch target: alive,
+        >40% HP (it will eat one wild hit during the switch turn), level above the foe (it must win
+        the trade) but within CATCH_CHIPPER_MAX_OVER of it (its hits stay survivable). Prefers the
+        strongest in-band teammate. None = nobody fits (caller keeps the old full-HP-throw path).
+
+        LEGENDARY BAND (2026-08-05, Moltres): the generic band demands foe_level < lv — but a
+        legendary OUT-levels the whole bench (L50 vs Lapras L25 / Fearow L38), so nobody ever
+        qualified and the flow fell to the full-HP early throw. Against a legendary an UNDER-
+        leveled teammate is the gentle chipper by definition (level-ratio² shrinks its hits),
+        so the band drops the lower bound and keeps only the ceiling + health gate.
+
+        MATCHUP + EXCLUDE (2026-08-06 LIVE, soak 180943: ladder fielded Fearow into Moltres —
+        Fire STAB one-shot it — then kept "chipping" a fainted mon and threw at 75%): when
+        foe_types are known, prefer a chipper that RESISTS the foe's STAB (Lapras Water/Ice
+        into Fire/Flying beats Fearow Flying/Normal). `exclude` skips already-tried slots so
+        the ladder can walk the whole bench instead of one suicide switch."""
+        if not foe_level:
+            return None
+        exclude = set(exclude or ())
+        foe_types = list(foe_types or [])
+        cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+        best, best_key = None, None
+        for s in range(1, min(cnt, 6)):
+            if s in exclude:
+                continue
+            base = ram.GPLAYER_PARTY + s * 100
+            hp, maxhp = self.b.rd16(base + 0x56), self.b.rd16(base + 0x58)
+            if hp <= 0 or (maxhp and hp / maxhp <= 0.40):
+                continue
+            lv = self.b.rd8(base + 0x54)
+            floor_ok = legend or foe_level < lv
+            if not (floor_ok and lv <= foe_level + self.CATCH_CHIPPER_MAX_OVER):
+                continue
+            incoming = 1.0
+            if foe_types:
+                try:
+                    my_types = st.species_types(st.read_party_species(self.b, s)) or []
+                    for ft in foe_types:
+                        try:
+                            incoming = max(incoming, float(pol.effectiveness(ft, my_types)))
+                        except Exception:
+                            pass
+                except Exception:
+                    incoming = 1.0          # unread species -> neutral; still eligible by level
+            key = (incoming, -lv)   # lower incoming better; then higher level
+            if best_key is None or key < best_key:
+                best, best_key = s, key
+        return best
+
+    def _party_sleeper_slot(self):
+        """Party slot (1..5, never the active seat 0) holding a usable SLEEP move — the Sing/
+        Hypnosis carrier the LEGENDARY SLEEP RUNG may field. Gates: alive and >=35% HP (it
+        eats the foe's free hit during the switch turn). Moves via the decrypted substruct
+        read (st.read_party_moves — the same read the HM checks trust). Returns (slot,
+        move_id) or (None, None); any read fault reads as 'no sleeper' (fail-closed: a flaky
+        decrypt must never trigger a switch)."""
+        try:
+            cnt = min(self.b.rd8(ram.GPLAYER_PARTY_CNT), 6)
+            for s in range(1, cnt):
+                base = ram.GPLAYER_PARTY + s * 100
+                hp, maxhp = self.b.rd16(base + 0x56), self.b.rd16(base + 0x58)
+                if hp <= 0 or (maxhp and hp / maxhp < 0.35):
+                    continue
+                mid = next((m for m in st.read_party_moves(self.b, s)
+                            if m in self._SLEEP_MOVES), None)
+                if mid:
+                    return s, mid
+        except Exception:
+            pass
+        return None, None
+
+    def _legend_sleep_rung(self, state):
+        """THE SLEEP RUNG of the legendary doctrine — runs before EVERY throw. Foe carries no
+        status -> fire a sleep move from the ACTIVE mon (covers re-sleeping after it wakes
+        mid-throws), else switch ONCE to the party's sleeper (Lapras' Sing) so the next loop
+        iteration fires it. Bounded: LEGEND_RESLEEP_MAX total casts, one switch attempt, and
+        the switch is refused when <2 healthy mons stand (the wipe outranks the x2). Returns
+        True when it consumed the turn (caller `continue`s), False -> just throw."""
+        try:
+            foe = state["enemy"]
+            if foe.get("status1", 0) or foe.get("asleep"):
+                return False                       # status up — it multiplies the throw; go throw
+            if getattr(self, "_legend_sleeps", 0) >= LEGEND_RESLEEP_MAX:
+                return False
+            moves = state["ours"]["moves"]
+            si = next((i for i, m in enumerate(moves)
+                       if m.get("id", 0) in self._SLEEP_MOVES and m.get("pp", 0) > 0), None)
+            if si is not None:
+                self._legend_sleeps = getattr(self, "_legend_sleeps", 0) + 1
+                self.log(f"   [catch] LEGENDARY SLEEP — {moves[si].get('name', f'slot {si}')} "
+                         f"(x2 catch rate; cast {self._legend_sleeps}/{LEGEND_RESLEEP_MAX})")
+                self._fire_move(si)
+                return True
+            if getattr(self, "_legend_sleeper_tried", False):
+                return False                       # one switch attempt per encounter
+            self._legend_sleeper_tried = True
+            if self._healthy_party_count() < 2:
+                self.log("   [catch] LEGENDARY SLEEP — party too thin for a sleeper switch "
+                         "(<2 healthy); throwing without the multiplier")
+                return False
+            slot, mid = self._party_sleeper_slot()
+            if slot is None:
+                self.log("   [catch] LEGENDARY SLEEP — no sleep move anywhere in the party; "
+                         "the red-zone chip + balls carry it alone")
+                return False
+            _sl_nm = st.SPECIES_NAME.get(st.read_party_species(self.b, slot), "a teammate")
+            self.log(f"   [catch] LEGENDARY SLEEP — fielding slot {slot} ({_sl_nm}) to cast "
+                     f"move #{mid}; the ball math doubles while it sleeps")
+            if self._switch_to_slot(slot, state["ours"].get("species")) == "switched":
+                self.emit(f"{_sl_nm}, you're on — sing it to sleep. that doubles my odds.",
+                          beat=True, tier=2)
+                return True                        # next loop fires the sleep move
+            self.log("   [catch] LEGENDARY SLEEP — sleeper switch didn't confirm; "
+                     "throwing without the multiplier (fail-safe)")
+        except Exception:
+            pass
+        return False
 
     def _can_weaken(self, state):
         """True iff she has a move that can actually SOFTEN the foe — a usable status move OR a usable
@@ -623,27 +1677,255 @@ class BattleAgent:
                     return i
         return None
 
-    def _weaken_hp(self, target_frac=0.40, max_hits=4):
+    def _legend_ether_for_chip(self):
+        """FORCE Ether/Elixir on the active ace when a legendary catch has no safe chip
+        (2026-08-06 soak 083445: Bite:0, only Skull Bash ~115% OHKO — OVERKILL refused every
+        FIGHT, soft-reload of a dry pre-bank looped forever). The proven use_item path aims
+        the active (lead) and Ether's move box defaults to move 0 (Bite). Once per catch.
+        Returns True iff the item consumed AND chip_move_pick now finds a safe swing."""
+        if getattr(self, "_legend_ether_tried", False):
+            return False
+        self._legend_ether_tried = True
+        ether = next((i for i in _ETHER_ITEMS_PREF if self._items_count(i) > 0), None)
+        if ether is None:
+            self.log("   [catch] !! LEGEND ETHER — bag has NO Ether/Elixir; cannot restore "
+                     "Bite (soft-reload cannot mint PP) (LOUD)")
+            return False
+        self.log(f"   [catch] !!!! LEGEND ETHER — restoring ace chip PP with item {ether} "
+                 f"(Bite dry / only OHKO left — then chip, THEN throw at the floor) (LOUD)")
+        self.emit("Bite's empty — Ether first. then we chip this bird, then the Ultras.",
+                  beat=True, tier=2)
+        res = self.use_item_in_battle(ether, target="active")
+        if res != "used":
+            self.log(f"   [catch] !! legend Ether -> {res} — still no safe chip (LOUD)")
+            return False
+        state = st.read_battle(self.b)
+        if not state or not state.get("enemy", {}).get("maxhp"):
+            return False
+        ci, cest, csafe = pol.chip_move_pick(
+            state["ours"]["moves"], state["enemy"].get("types") or [],
+            state["ours"].get("level", 0), state["enemy"].get("level", 0),
+            foe_hp_frac=_hp_frac(state["enemy"]),
+            our_types=state["ours"].get("types"))
+        mv = ("none" if ci is None
+              else state["ours"]["moves"][ci].get("name", f"slot {ci}"))
+        self.log(f"   [catch] legend Ether landed — safe chip={bool(csafe and ci is not None)} "
+                 f"gentlest={mv} est={'n/a' if cest is None else f'{cest:.0%}'} (LOUD)")
+        return bool(csafe and ci is not None)
+
+    def _legend_fight_still_winnable(self):
+        """True while a legendary catch attempt should NOT soft-reload: live battle,
+        foe still standing, and at least one Ultra (or best-tier ball) left to throw.
+        LIVE 2026-08-06 Jonny: she rewound Moltres mid-fight while she still had a chance."""
+        try:
+            if not st.in_battle(self.b):
+                return False
+            foe = (st.read_battle(self.b) or {}).get("enemy") or {}
+            if int(foe.get("hp") or 0) <= 0:
+                return False
+            if self._spendable_for_pref("best") <= 0:
+                return False
+            return True
+        except Exception:
+            return False
+
+    def _try_legend_soft_reload(self, species=None):
+        """SOFT-RELOAD a static legendary WITHOUT pressing RUN (2026-08-06 LIVE, Jonny:
+        'walked up, ran, it flew away, now respawning'). Fleeing sets fought/hide and plays
+        MonFlewAway; free-retry then looks like a respawn. Loading 'pre-<key>' rewinds RAM
+        cleanly — bird live, balls back, no flew-away script. Bounded per BattleAgent.
+
+        HARD GATE (2026-08-06 evening): NEVER rewind a winnable live fight. Soft-reload is
+        for 0-balls / dead-bird / post-fight free-retry — not 'chip paused above 50% HP'."""
+        if self._legend_fight_still_winnable():
+            try:
+                balls = self._spendable_for_pref("best")
+                foe = (st.read_battle(self.b) or {}).get("enemy") or {}
+            except Exception:
+                balls, foe = "?", {}
+            self.log(f"   [catch] !! LEGEND SOFT-RELOAD REFUSED — still in fight with "
+                     f"{balls} Ultra(s) and foe hp={foe.get('hp', '?')}/"
+                     f"{foe.get('maxhp', '?')} (FINISH the catch; do not rewind a live "
+                     f"chance) (LOUD)")
+            return False
+        if species is None:
+            try:
+                species = (st.read_battle(self.b) or {}).get("enemy", {}).get("species")
+            except Exception:
+                species = None
+        key = _LEGEND_SOFT_KEYS.get(species)
+        hook = LEGEND_SOFT_RELOAD
+        if not key or not callable(hook):
+            self.log(f"   [catch] !! legend soft-reload unavailable "
+                     f"(key={key!r}, hook={'set' if hook else 'None'}) — NOT fleeing "
+                     f"(MonFlewAway would spend the bird) (LOUD)")
+            return False
+        n = getattr(self, "_legend_soft_reloads", 0)
+        if n >= 2:
+            self.log(f"   [catch] !! legend soft-reload budget spent ({n}/2) — NOT fleeing (LOUD)")
+            return False
+        self.log(f"   [catch] !!!! LEGEND SOFT-RELOAD — rewinding 'pre-{key}' WITHOUT RUN "
+                 f"(no MonFlewAway; catch truly lost / 0 balls) (LOUD)")
+        try:
+            ok = bool(hook(key))
+        except Exception as e:
+            self.log(f"   [catch] !! legend soft-reload raised ({e}) — NOT fleeing (LOUD)")
+            return False
+        if ok:
+            self._legend_soft_reloads = n + 1
+        return ok
+
+    def _legend_refuse_throw(self, foe_frac, why):
+        """HARD FLOOR refuse: deepen the ace chip. Soft-reload ONLY when the catch is
+        truly lost (0 balls). Returns:
+          None            — foe now at/under throw floor (caller throws)
+          'keep_chipping' — still above floor but fight winnable (caller loops weaken)
+          'chip_exhausted'— battle ended / 0-ball soft-reload / truly stuck
+          'fainted'       — bird KO'd during deepen
+          'no_balls'      — empty Ultra pocket after deepen
+        NEVER flee a static legendary. NEVER rewind a live chance (Jonny 2026-08-06)."""
+        self.log(f"   [catch] !! {why} — foe at {foe_frac:.0%} (floor "
+                 f"{CATCH_THROW_FLOOR_LEGEND:.0%}); deepening ACE chip, NEVER fleeing "
+                 f"(MonFlewAway spends the bird) (LOUD)")
+        if not st.in_battle(self.b):
+            return "chip_exhausted"
+        # Bite dry → OVERKILL → Ether first, then multiple deepen passes.
+        self._legend_ether_for_chip()
+        for deepen in range(5):
+            if not st.in_battle(self.b):
+                return "chip_exhausted"
+            balls = self._spendable_for_pref("best")
+            if balls <= 0:
+                self.log("   [catch] !! 0 Ultras mid-chip — soft-reload (catch lost) (LOUD)")
+                if self._try_legend_soft_reload():
+                    return "chip_exhausted"
+                return "no_balls"
+            self._weaken_hp(target_frac=CATCH_CHIP_TARGET_LEGEND, max_hits=LEGEND_CHIP_HITS,
+                            legend=True, desperate=True)
+            if not st.in_battle(self.b):
+                return "chip_exhausted"
+            after = st.read_battle(self.b)
+            if not after or not after.get("enemy", {}).get("maxhp"):
+                return "chip_exhausted"
+            if int(after["enemy"].get("hp") or 0) <= 0:
+                return "fainted"
+            frac = _hp_frac(after["enemy"])
+            if legend_throw_allowed(frac):
+                self.log(f"   [catch] !! ACE deepen reached throw floor "
+                         f"({frac:.0%}) — throws are legal now (LOUD)")
+                return None
+            self.log(f"   [catch] !! deepen pass {deepen + 1}/5 — foe still {frac:.0%} "
+                     f"(balls={balls}); KEEP FIGHTING — no soft-reload of a live chance "
+                     f"(LOUD)")
+        # Deepen budget spent, still above floor — if the fight is winnable, hand the
+        # catch loop another weaken cycle. Soft-reload only when the gate allows (0 balls).
+        if self._legend_fight_still_winnable():
+            self.log("   [catch] !! deepen budget spent but fight still winnable — "
+                     "keep_chipping (NO soft-reload) (LOUD)")
+            return "keep_chipping"
+        if self._try_legend_soft_reload():
+            return "chip_exhausted"
+        self.log("   [catch] !! still above hard floor and soft-reload refused/failed — "
+                 "keep_chipping (no RUN) (LOUD)")
+        return "keep_chipping"
+
+    def _weaken_hp(self, target_frac=None, max_hits=4, legend=False, desperate=False):
         """Chip the wild foe's HP into the catchable band so a HANDFUL of balls suffices (a status
-        alone leaves it near full HP -> 5 balls broke free). Fires the LOWEST-base-power damaging move
+        alone leaves it near full HP -> 5 balls broke free). Fires the GENTLEST damaging move
         one hit at a time, re-reading HP, and STOPS once HP <= target_frac (faint-guard: never swing
-        at an already-low foe; one-at-a-time re-check avoids overkill). Best-effort — a stray faint
-        just means catch_pokemon returns 'fainted' and the wander finds another wild."""
+        at an already-low foe; one-at-a-time re-check avoids overkill). Bounded by max_hits — never
+        loops forever. Best-effort — a stray faint just means catch_pokemon returns 'fainted' and
+        the wander finds another wild.
+
+        DAMAGE-AWARE (2026-07-30, Jonny live report: 'she KOs the ones she wants to catch'): the old
+        loop only checked hp > target_frac before swinging — a foe sitting just ABOVE the band (e.g.
+        45% after one chip that hit for 55%) took one more 'gentle' chip and died. Now each chip's
+        actual damage is MEASURED, and we refuse the next swing when the foe wouldn't clearly survive
+        a repeat of it (1.6x safety margin — crits happen). A catch thrown at 50% HP costs an extra
+        ball at worst; a KO'd keeper is gone forever.
+
+        ESTIMATE-AWARE (2026-08-04, weaken-then-throw discipline): 'gentlest' was a raw
+        base-power sort — blind to STAB, type-eff and the level gap, so a 'gentle' ace move
+        could still one-shot. The pick is now pol.chip_move_pick (lowest ESTIMATED hit), and
+        an unsafe estimate (likely KO from the foe's current HP) refuses the swing BEFORE the
+        first hit lands — the measured-damage guard stays as the belt.
+
+        PP-AWARE LADDER (2026-08-05 LIVE, the one-Bite Moltres ball-burn: Bite had 1 PP after
+        the volcano climb, one swing, then every remaining move read overkill-unsafe and she
+        threw at a barely-injured bird): PP is re-read from gBattleMons EVERY swing
+        (chip_move_pick skips PP<=0), and `legend=True` adds a second rung — when the gentlest
+        usable move fails the KO-safety margin, it may STILL swing while its estimate + 5%
+        headroom is under the foe's CURRENT HP fraction (a 60%-est hit at 100% HP cannot
+        faint). Returns a VERDICT the caller can act on: 'band' (target reached), 'guard'
+        (faint-guard stop — as deep as the active can safely go), 'no_pp' (the active has NO
+        damaging move with PP: switch a bench chipper in), 'hits' (swing budget spent),
+        'ended' (battle over / unreadable)."""
+        if target_frac is None:
+            target_frac = self.CATCH_CHIP_TARGET
+        last_dmg = None
         for _ in range(max_hits):
             state = st.read_battle(self.b)
             if not state or not st.in_battle(self.b):
-                return
+                return "ended"
             foe = state["enemy"]
             if not foe.get("maxhp") or foe["hp"] <= 0:
-                return
-            if foe["hp"] / foe["maxhp"] <= target_frac:
-                return                                  # already in the catchable band
-            cand = [(i, m.get("id", 0)) for i, m in enumerate(state["ours"]["moves"])
-                    if m.get("id", 0) and m.get("pp", 0) > 0 and m.get("id", 0) not in self._STATUS_MOVES]
-            if not cand:
-                return                                  # no damaging move with PP -> just throw
-            cand.sort(key=lambda im: st.move_info(self.b, im[1])[1] or 0)   # gentlest (lowest power)
-            self._fire_move(cand[0][0])
+                return "ended"
+            # OUR-DOWN GUARD (2026-08-06 LIVE, soak 180943): Fearow fainted to Moltres on the
+            # free turn after the switch; the loop kept firing Fury Attack into
+            # "FEAROW has no energy left to battle!" for the rest of the hit budget, foe HP
+            # frozen at 75%, then SANCTIONED early throw. A fainted active ends the chip
+            # phase — the ladder (or catch loop) must send the next mon, not puppet a corpse.
+            ours = state.get("ours") or {}
+            if ours.get("maxhp") and ours.get("hp", 1) <= 0:
+                self.log(f"   [catch] chip OUR-DOWN — active fainted mid-chip (foe still at "
+                         f"{foe['hp']}/{foe['maxhp']}); handing off (LOUD)")
+                return "our_down"
+            _frac = foe["hp"] / foe["maxhp"]
+            if _frac <= target_frac:
+                self.log(f"   [catch] chip done — foe at {_frac:.0%} HP (target "
+                         f"{target_frac:.0%}); throwing")
+                return "band"                           # already in the catchable band
+            if last_dmg and foe["hp"] <= last_dmg * 1.6:
+                self.log(f"   [catch] chip STOPPING — foe at {foe['hp']}/{foe['maxhp']} HP, "
+                         f"last chip hit for {last_dmg}; another swing risks a KO. Throwing now.")
+                return "guard"                          # next hit plausibly kills it — throw instead
+            ci, cest, csafe = pol.chip_move_pick(
+                state["ours"]["moves"], foe.get("types") or [],
+                state["ours"].get("level", 0), foe.get("level", 0),
+                foe_hp_frac=_frac, our_types=state["ours"].get("types"))
+            if ci is None:
+                if legend:
+                    self.log(f"   [catch] chip halting — the ACTIVE mon has no damaging move "
+                             f"with PP left (foe at {_frac:.0%}); ACE-ONLY / soft-reload owns it")
+                return "no_pp"                          # active's damaging PP is dry
+            _mv_nm = state["ours"]["moves"][ci].get("name", f"slot {ci}")
+            if not csafe:
+                if legend and cest is not None and (
+                        cest + 0.05 <= _frac or (desperate and cest < _frac)):
+                    # LADDER RUNG 2 / DESPERATE: over the polite margin, but the foe's current
+                    # HP clearly exceeds the estimate — this hit CANNOT faint from here.
+                    _tag = ("DESPERATE" if desperate and not (cest + 0.05 <= _frac)
+                            else "LADDER")
+                    self.log(f"   [catch] chip {_tag} — {_mv_nm} est {cest:.0%} vs foe at "
+                             f"{_frac:.0%} HP: cannot faint from this HP — swinging "
+                             f"(legendary depth, ace-only)")
+                else:
+                    self.log(f"   [catch] chip STOPPING — gentlest move {_mv_nm} est {cest:.0%} vs "
+                             f"foe at {_frac:.0%} HP; a swing risks the KO. Throwing now.")
+                    return "guard"
+            else:
+                self.log(f"   [catch] weaken — {_mv_nm} (est {cest:.0%}) at foe {_frac:.0%} HP")
+            hp_before = foe["hp"]
+            self._fire_move(ci)
+            after = st.read_battle(self.b)
+            if after and after.get("ours", {}).get("maxhp") and after["ours"].get("hp", 1) <= 0:
+                self.log(f"   [catch] chip OUR-DOWN — active fainted on the foe's reply "
+                         f"(foe at {after['enemy'].get('hp', '?')}/{after['enemy'].get('maxhp', '?')}); "
+                         f"handing off (LOUD)")
+                return "our_down"
+            if after and after["enemy"].get("hp") is not None and after["enemy"]["hp"] < hp_before:
+                last_dmg = hp_before - after["enemy"]["hp"]   # measure what a chip actually costs
+        return "hits"
 
     def _fire_move(self, idx):
         """Open the move list, navigate to slot idx, fire it + verify it executed (PP drop / HP
@@ -683,19 +1965,75 @@ class BattleAgent:
             self.b.run_frame(); self.render()
         return "stuck"
 
-    def catch_pokemon(self, max_seconds=150, weaken=True):
+    def _legend_chip_ladder(self, chip_tgt, chip_hits, chipper_tried):
+        """ACE-ONLY legendary chip + HARD THROW FLOOR (2026-08-06 LIVE, Jonny: 'she needs
+        Blastoise to handle Moltres entirely himself — pulling Spearow/Fearow just gets it
+        killed and the bird flies away'). Voluntary bench switches are OFF for legendaries:
+        the ace chips alone; above the hard floor the caller deepens the chip / soft-reloads
+        — NEVER flees (flee = MonFlewAway + fake respawn). Returns
+        (chipper_tried_set unused, refuse_throw)."""
+        tried = set(chipper_tried or ())
+        if not st.in_battle(self.b):
+            return tried, False
+        _s3 = st.read_battle(self.b)
+        if not _s3 or not _s3["enemy"].get("maxhp"):
+            return tried, False
+        _f3 = _hp_frac(_s3["enemy"])
+        if _f3 <= CATCH_READY_FRAC_LEGEND:
+            return tried, False
+        # Never tag in Fearow/Lapras/etc. on a legendary — one free Fire STAB and the
+        # encounter is spent. Loud so the soak report shows the policy, not a missing switch.
+        _ace = st.SPECIES_NAME.get((_s3.get("ours") or {}).get("species"), "the ace")
+        self.log(f"   [catch] chip LADDER — ACE-ONLY on legendaries ({_ace} stays in; "
+                 f"NO bench switch — Jonny: Blastoise handles Moltres himself) "
+                 f"(foe at {_f3:.0%})")
+        if _f3 > CATCH_THROW_FLOOR_LEGEND:
+            self.log(f"   [catch] !! ACE chip stopped above HARD FLOOR — foe still "
+                     f"at {_f3:.0%} HP (floor {CATCH_THROW_FLOOR_LEGEND:.0%}, band "
+                     f"{CATCH_READY_FRAC_LEGEND:.0%}): REFUSING the throw — deepen/"
+                     f"soft-reload owns recovery (NEVER flee / never dump Ultras) (LOUD)")
+            return tried, True
+        self.log(f"   [catch] !! ACE chip stopped at {_f3:.0%} HP "
+                 f"(at/under hard floor {CATCH_THROW_FLOOR_LEGEND:.0%}, above red band "
+                 f"{CATCH_READY_FRAC_LEGEND:.0%}): SANCTIONED throw (sleep rung still "
+                 f"applies) (LOUD)")
+        return tried, False
+
+    def catch_pokemon(self, max_seconds=150, weaken=True, ball_pref="cheap", allow_master=False,
+                      divert_reason=None):
         """Catch the WILD foe (the proven live flow, automated): optionally WEAKEN/STATUS it once to
-        boost the catch rate + stop it attacking, then THROW Poké Balls until caught. COMMITS - it
+        boost the catch rate + stop it attacking, then THROW balls until caught. COMMITS - it
         re-throws after a break instead of abandoning after one ball (the live Ekans flow). Returns
-        'caught' | 'no_balls' | 'trainer' | 'fled' | 'fainted' | 'stuck'. Gen-3 trainer mons can't
-        be caught (returns 'trainer')."""
+        'caught' | 'no_balls' | 'trainer' | 'fled' | 'fainted' | 'stuck' — plus the 2026-08-05
+        abandon verdicts 'catch_abort' (the CATCH-ABORT latch fired: throws are off this battle),
+        'party_risk' (<=1 healthy mon and not a legendary hunt: no catch is worth the wipe) and
+        'our_down' (our active fainted and the send-in did not seat — run()'s drain owns it).
+        Gen-3 trainer mons can't be caught (returns 'trainer'). ball_pref/allow_master: the BALL
+        TIER doctrine (2026-08-04) — legendaries get 'best' (Ultra-first) and Mewtwo alone may
+        spend the Master Ball. divert_reason: the _divert_wild_catch reason ('legendary'/'shiny'
+        exempt the PARTY-WIPE GUARD; the send-in gate outranks their throws regardless)."""
         t0 = time.time()
         if self._is_trainer_battle():
+            return "trainer"
+        if self._is_double():
+            # SINGLES-ONLY GATE (2026-08-04): FRLG wild battles are always singles (no wild
+            # doubles in grass/safari) and balls can't be thrown in trainer battles at all —
+            # a doubles context reaching here is by definition a no-catch context. Belt only;
+            # the doubles battle flow (e4002d9) stays untouched.
+            self.log("   [catch] DOUBLE battle — not a catch context (FRLG wilds are singles; "
+                     "a pair means trainers) — refusing the catch flow")
             return "trainer"
         self._started = True
         self._catching = True              # F-7(c): KOing a catch target is a FAILURE — the
         #                                    certain-win beat stays silent for this whole flow
         self._skip_streak = set()
+        # THE LEGENDARY CATCH DOCTRINE (2026-08-05): red-zone ready band, deep chip target,
+        # sleep rung before every throw. Per-encounter budgets reset here.
+        _legend = (divert_reason == "legendary")
+        self._legend_sleeps = 0
+        self._legend_sleeper_tried = False
+        _chip_tgt = CATCH_CHIP_TARGET_LEGEND if _legend else None
+        _chip_hits = LEGEND_CHIP_HITS if _legend else 4
         self._reach_first_menu(t0, max_seconds)
         self._prev = st.read_battle(self.b)
         p0 = self.b.rd8(ram.GPLAYER_PARTY_CNT)
@@ -707,12 +2045,70 @@ class BattleAgent:
         # when the foe is 10+ levels under the lead, never CHIP it (one hit would KO). But a pure SLEEP
         # move is damage-free with ZERO KO risk and x2 catch rate in Gen 3 — with a thin ball supply
         # that's the difference between "caught" and "the last ball broke free". Sleep-then-throw.
+        chipper_tried = set()
         try:
             _rb0 = st.read_battle(self.b)
-            if weaken and _rb0 and (_rb0["ours"].get("level", 0) - _rb0["enemy"].get("level", 0)) >= 10:
-                status_only = True
-                self.log("   [engine] catch: foe is 10+ levels under the lead — no chipping (would KO); "
-                         "SLEEP-then-throw if a sleep move is up")
+            # FLEE-ON-SIGHT SPECIES (Abra/Kadabra): every weaken/status/switch turn hands it the
+            # Teleport exit. Skip ALL softening and throw immediately — the deliberate, narrated
+            # version of what previously looked like a mistake.
+            _foe_sp0 = (_rb0 or {}).get("enemy", {}).get("species")
+            if _rb0 and _rb0.get("enemy", {}).get("maxhp"):
+                # LOUD [catch] HEADER: the soak report must confess the discipline per target.
+                self.log(f"   [catch] target={st.SPECIES_NAME.get(_foe_sp0, f'#{_foe_sp0}')} "
+                         f"L{_rb0['enemy'].get('level', '?')} hp={_hp_frac(_rb0['enemy']):.0%} "
+                         f"status={_decode_status(_rb0['enemy'].get('status1', 0)) or 'none'} "
+                         f"balls={self._ball_count()} pref={ball_pref}"
+                         + (f" LEGENDARY DOCTRINE (ready<={CATCH_READY_FRAC_LEGEND:.0%}, "
+                            f"chip->{CATCH_CHIP_TARGET_LEGEND:.0%}, sleep rung armed)"
+                            if _legend else ""))
+            if _foe_sp0 in self._FLEES_ON_FREE_TURN:
+                weaken = False
+                _fname = st.SPECIES_NAME.get(_foe_sp0, "this one")
+                self.log(f"   [engine] catch: {_fname} escapes ({self._FLEES_ON_FREE_TURN[_foe_sp0]}) "
+                         f"on its first free turn — skipping weaken, ball-on-sight")
+                self.emit(f"{_fname} teleports away the second it gets a turn — no time to weaken it, "
+                          f"I have to throw RIGHT NOW and pray.", beat=True, tier=1)
+            elif weaken and _rb0:
+                # WEAKEN-THEN-THROW DISCIPLINE (2026-08-04 LIVE, badge-8 stream: full-HP balls
+                # at every dex-push wild — wasted stock the legendary hunts need). The old
+                # trigger was a coarse level-gap check (lead 10+ over -> never chip, and with
+                # no sleep move / no in-band chipper that fell STRAIGHT to a full-HP throw).
+                # The overkill question is now asked PER-MOVE (pol.chip_move_pick: power ×
+                # STAB × type-eff × level-ratio² tiers, no damage calc): a safe chip exists ->
+                # the chip path weakens first; every usable move likely one-shots -> the
+                # status_only path (sleep, then chipper, else the SANCTIONED early throw —
+                # a wasted ball beats a dead target).
+                #
+                # LEGEND ETHER (2026-08-06 soak 083445): Bite:0 leaves only Skull Bash
+                # (OHKO) → OVERKILL → hard-floor refuse → soft-reload loop with ZERO FIGHT
+                # presses. Restore Bite with Ether BEFORE declaring status_only so the ace
+                # actually chips into the throw floor.
+                _ci, _cest, _csafe = pol.chip_move_pick(
+                    _rb0["ours"]["moves"], _rb0["enemy"].get("types") or [],
+                    _rb0["ours"].get("level", 0), _rb0["enemy"].get("level", 0),
+                    foe_hp_frac=_hp_frac(_rb0["enemy"]),
+                    our_types=_rb0["ours"].get("types"))
+                if (_legend and _foe_sp0 != 143 and (_ci is None or not _csafe)
+                        and self._legend_ether_for_chip()):
+                    _rb0 = st.read_battle(self.b) or _rb0
+                    _ci, _cest, _csafe = pol.chip_move_pick(
+                        _rb0["ours"]["moves"], _rb0["enemy"].get("types") or [],
+                        _rb0["ours"].get("level", 0), _rb0["enemy"].get("level", 0),
+                        foe_hp_frac=_hp_frac(_rb0["enemy"]),
+                        our_types=_rb0["ours"].get("types"))
+                if _foe_sp0 == 143 or _ci is None or not _csafe:
+                    # Snorlax stays a hard never-chip (Surf/Hydro from Blastoise OHKOs).
+                    status_only = True
+                    _mv_nm = ("none" if _ci is None
+                              else _rb0["ours"]["moves"][_ci].get("name", f"slot {_ci}"))
+                    self.log(f"   [catch] OVERKILL RISK — gentlest usable move={_mv_nm} "
+                             f"est={'n/a' if _cest is None else f'{_cest:.0%} of max HP'}"
+                             + (" (Snorlax: never chip)" if _foe_sp0 == 143 else "")
+                             + " — no safe chip; SLEEP/CHIPPER, else throw early (never KO)")
+                else:
+                    self.log(f"   [catch] weaken plan — chip with "
+                             f"{_rb0['ours']['moves'][_ci].get('name', f'slot {_ci}')} "
+                             f"(est {_cest:.0%}/hit) into the throw band")
         except Exception:
             pass
 
@@ -726,12 +2122,77 @@ class BattleAgent:
         while time.time() - t0 < max_seconds:
             if not st.in_battle(self.b):
                 return _ended()
-            if self._ball_count() <= 0:
-                self.emit("I'm out of Poké Balls - I'll come back for this one", beat=True)
-                # 2026-07-06 WEDGE FIX: never walk away from a LIVE battle — an abandoned battle gets
-                # re-detected by travel as a fresh encounter forever (south_run1: 'stuck' ×27 spin).
-                # Resolve it first (flee the wild), THEN report no_balls.
-                self.flee(max_seconds=45)
+            # ── THE SEND-IN GATE (2026-08-05, the Magmar wedge — catch_turn_gate) ─────────
+            # Checked FIRST every turn, before ball counts and before the white-box advance:
+            # a fainted active makes the "no energy left to battle!" dialogue + forced party
+            # screen own the game, and BOTH the B-advance below and throw_ball just spin on
+            # them (the 14:10 session-ending loop: "bag would not open" forever).
+            _verdict = catch_turn_gate(
+                self._catch_our_down(),
+                self._healthy_party_count(),
+                getattr(self, "_throw_bag_aborts", 0),
+                getattr(self, "_catch_abort", False),
+                divert_reason in ("legendary", "shiny"))
+            if _verdict == "abort":
+                self.log("   [catch] !! CATCH-ABORT latch is up — abandoning the catch "
+                         "(no more throws this battle; fight/flee normally)")
+                return "catch_abort"
+            if _verdict == "send_in":
+                self.log("   [catch] OUR ACTIVE IS DOWN mid-catch — abandoning this turn's "
+                         "throw; the forced send-in flow runs first (the bag cannot open "
+                         "in the send-in state)")
+                self.emit("hold the catch — my Pokémon just went down. next one up first.",
+                          beat=True, tier=2)
+                if self._force_switch():
+                    self._prev = st.read_battle(self.b)
+                    self.log("   [catch] send-in seated — re-asking whether the catch "
+                             "can resume (order still stands)")
+                    continue                 # gate re-checks with the fresh field/party
+                self.log("   [catch] !! send-in did not seat — handing the battle back "
+                         "(our_down); run()'s faint drain owns the recovery")
+                return "our_down"
+            if _verdict == "party_risk":
+                self.log(f"   [catch] PARTY-WIPE GUARD — {self._healthy_party_count()} "
+                         f"healthy mon left and this isn't a legendary hunt: abandoning "
+                         f"the catch (fight/flee instead)")
+                return "party_risk"
+            if self._spendable_for_pref(ball_pref) <= 0 and not (allow_master
+                                                and self._ball_qty(self._BALL_MASTER) > 0):
+                if self._ball_count() > 0:
+                    # Balls exist but they're the hunt's Ultras (mid-catch the cheap tier ran
+                    # dry) — same exit flow as genuinely empty, with the truth in the log.
+                    self.log("   [catch] RESERVE — ultras held for the hunt, skipping trash catch")
+                    self.emit("my Ultra Balls are spoken for — those are for the legendaries. "
+                              "backing off this one.", beat=True)
+                else:
+                    self.emit("I'm out of Poké Balls - I'll come back for this one", beat=True)
+                # NEVER fight-clear a catch_now / Snorlax / shiny / legendary — that was the
+                # 2026-08-02 LIVE KO of Jonny's ordered Snorlax (Blastoise Surf, zero balls).
+                _foe_sp = (st.read_battle(self.b) or {}).get("enemy", {}).get("species")
+                _protect = (self._peek_creator_catch_order()
+                            or _foe_sp in (143, 144, 145, 146, 150, 151)  # snorlax + legendaries
+                            or st.enemy_is_shiny(self.b))
+                if self._foe_blocks_flee() and not _protect:
+                    self.log("   [engine] catch no_balls + Arena Trap — FIGHTING clear (no RUN attempt)")
+                    self._skip_catch_divert = True
+                    try:
+                        self.run(max_seconds=120)
+                    finally:
+                        self._skip_catch_divert = False
+                elif _legend or (_foe_sp in _LEGEND_SOFT_KEYS):
+                    self.log("   [engine] catch no_balls on legendary — soft-reload "
+                             "(NEVER flee / MonFlewAway) (LOUD)")
+                    self._try_legend_soft_reload(_foe_sp)
+                else:
+                    self.log("   [engine] catch no_balls — FLEEING (protect catch target from KO)")
+                    self.flee(max_seconds=45)
+                    if st.in_battle(self.b) and not _protect:
+                        self.log("   [engine] catch no_balls: flee failed — fighting clear")
+                        self._resolve_open_battle(max_seconds=120)
+                    elif st.in_battle(self.b) and _protect:
+                        self.log("   [engine] !! catch no_balls + protected target still in battle "
+                                 "— refusing fight-clear KO; fleeing again")
+                        self.flee(max_seconds=30)
                 return "no_balls"
             self._settle()
             if not st.in_battle(self.b):
@@ -746,6 +2207,18 @@ class BattleAgent:
             state = st.read_battle(self.b)
             if state and state["enemy"]["hp"] <= 0:
                 return "fainted"                         # we KO'd it - can't catch a fainted foe
+            if weaken and not softened and state is not None and state["enemy"].get("maxhp"):
+                # ALREADY WEAK / STATUSED -> THROW NOW (weaken-then-throw discipline): any
+                # status multiplies the Gen-3 catch rate, and at/below the ready band another
+                # swing only risks the KO. Verified live RAM read (doubles-aware accessor).
+                # LEGENDARY: the RED ZONE alone decides (catch_ready) — a status never
+                # green-lights a near-full-HP throw on a 3/255 base rate.
+                _ef = _hp_frac(state["enemy"])
+                if catch_ready(_ef, state["enemy"].get("status1", 0), _legend):
+                    self.log(f"   [catch] target ready — hp={_ef:.0%} status="
+                             f"{_decode_status(state['enemy'].get('status1', 0)) or 'none'} "
+                             f"— THROWING (no more weakening)")
+                    softened = True
             if status_only and not softened and state is not None:
                 # BIG-LEVEL-GAP path: sleep is the ONLY safe soften (any hit could KO). Fire a sleep
                 # move (75%-acc powders miss — retry once), re-checking asleep each loop; then throw.
@@ -758,6 +2231,56 @@ class BattleAgent:
                         self.emit("let me put it to sleep first — easier to catch that way", beat=True)
                         self._fire_move(si)
                         continue
+                # CHIPPER SWITCH (2026-07-30, Jonny live report: 'she needs to weaken it with NOT the
+                # ace'): no sleep move up and the ace would one-shot the target — the real-player play
+                # is to field a CLOSE-LEVEL teammate whose hits chip instead of KO. Reuses the proven,
+                # fail-safe grind-switch actuation (_switch_to_slot: species-confirmed, B-out on any
+                # non-confirm -> we just fall through to the old full-HP throw). One attempt per catch;
+                # the wild's free turn during the switch is priced in (flee-risk species never reach
+                # here — they take the ball-on-sight path above).
+                # LEGENDARY: never voluntary-switch the bench in (Fearow into Moltres =
+                # free KO + bird spent). Ace chips alone; hard floor / free-retry owns thin PP.
+                if (not _legend and not chipper_tried
+                        and not state["enemy"].get("asleep")):
+                    ch = self._catch_chipper_slot(
+                        state["enemy"].get("level"), legend=False,
+                        foe_types=state["enemy"].get("types") or [])
+                    if ch is not None:
+                        chipper_tried.add(ch)
+                        _ch_nm = st.SPECIES_NAME.get(st.read_party_species(self.b, ch), "a teammate")
+                        _my_nm = st.SPECIES_NAME.get(state["ours"].get("species"), "my ace")
+                        self.log(f"   [engine] catch: CHIPPER SWITCH — {_my_nm} would one-shot it; "
+                                 f"fielding slot {ch} ({_ch_nm}) to chip it into the catchable band")
+                        if self._switch_to_slot(ch, state["ours"].get("species")) == "switched":
+                            self.emit(f"{_my_nm} hits way too hard for this — {_ch_nm}, you're up. "
+                                      f"soften it, don't finish it.", beat=True, tier=1)
+                            self._weaken_hp(target_frac=_chip_tgt, max_hits=_chip_hits,
+                                            legend=_legend)
+                            softened = True
+                            continue
+                        self.log("   [engine] catch: chipper switch didn't confirm — falling back to "
+                                 "the full-HP throw (fail-safe)")
+                if not softened and not state["enemy"].get("asleep"):
+                    # THE SANCTIONED EARLY THROW (weaken-then-throw rule 1): every usable move
+                    # likely one-shots, no sleep move, no in-band chipper — a wasted ball beats
+                    # a dead target. Loud so soak reports show it was a DECISION, not the bug.
+                    # LEGENDARY HARD FLOOR: above half HP this is a refuse, not a dump.
+                    _ef_early = _hp_frac(state["enemy"])
+                    if _legend and not legend_throw_allowed(_ef_early):
+                        _ref = self._legend_refuse_throw(
+                            _ef_early, "EARLY THROW BLOCKED by HARD FLOOR")
+                        if _ref == "keep_chipping":
+                            softened = False
+                            continue
+                        if _ref is not None:
+                            return _ref
+                        softened = True
+                        continue
+                    self.log(f"   [catch] EARLY THROW — overkill risk on every move, no sleep/"
+                             f"chipper; throwing at {_ef_early:.0%} HP rather "
+                             f"than KO the target")
+                    self.emit("no safe way to weaken this one — full-health throw it is. wish me luck.",
+                              beat=True)
                 softened = True
                 continue
             if weaken and not status_only and not softened and state is not None:
@@ -765,7 +2288,9 @@ class BattleAgent:
                 # depleted) and the foe is still near full HP, DON'T throw — a full-HP catch is low-odds
                 # and that's exactly how she burned her whole ball supply tonight. Flee (preserve the
                 # balls) and surface that she needs to restore PP (a Center tops up PP). Roam then heals.
-                if not self._can_weaken(state) and state["enemy"].get("maxhp") \
+                # LEGENDARY EXEMPT: fleeing a static sets the fought flag — the ACE-ONLY ladder
+                # below (hard floor refuse → deepen / soft-reload, never RUN) owns depleted PP.
+                if not _legend and not self._can_weaken(state) and state["enemy"].get("maxhp") \
                         and state["enemy"]["hp"] > state["enemy"]["maxhp"] * self.CATCH_WEAKEN_CEIL:
                     self.emit("I can't even dent it — I'm out of PP to weaken it, and I'm not burning my "
                               "Poké Balls on a full-health throw. Backing out to restore my moves first.",
@@ -778,15 +2303,61 @@ class BattleAgent:
                 if wi is not None:
                     self.emit("let me wear it down first", beat=True)
                     self._fire_move(wi)
-                self._weaken_hp()                    # chip HP into the catchable band (faint-guarded)
+                # chip HP into the catchable band (faint-guarded; legendary: red-zone target)
+                self._weaken_hp(target_frac=_chip_tgt, max_hits=_chip_hits, legend=_legend)
+                if _legend:
+                    chipper_tried, _refuse = self._legend_chip_ladder(
+                        _chip_tgt, _chip_hits, chipper_tried)
+                    if _refuse:
+                        _s_ref = st.read_battle(self.b) if st.in_battle(self.b) else None
+                        _ef_ref = (_hp_frac(_s_ref["enemy"])
+                                   if _s_ref and _s_ref.get("enemy", {}).get("maxhp") else 1.0)
+                        _ref = self._legend_refuse_throw(
+                            _ef_ref, "ACE chip stopped above HARD FLOOR")
+                        if _ref == "keep_chipping":
+                            softened = False
+                            continue
+                        if _ref is not None:
+                            return _ref
                 softened = True
                 continue
-            res = self.throw_ball(max_seconds=max(20, int(max_seconds - (time.time() - t0))))
+            # HARD THROW FLOOR (legendary): never dump Ultras above half HP — even if some
+            # other path latched softened=True early. Deepen / keep fighting — never RUN.
+            if _legend and state is not None and state["enemy"].get("maxhp"):
+                _ef_floor = _hp_frac(state["enemy"])
+                if not legend_throw_allowed(_ef_floor):
+                    _ref = self._legend_refuse_throw(
+                        _ef_floor, "HARD THROW FLOOR — REFUSING the Ultra dump")
+                    if _ref == "keep_chipping":
+                        softened = False
+                        continue
+                    if _ref is not None:
+                        return _ref
+                    continue
+            # THE SLEEP RUNG (legendary doctrine): before EVERY throw, a status-free legendary
+            # gets a sleep cast (or the one sleeper switch) — x2 on the ball math, and it
+            # covers the wake-up mid-throws. Bounded inside the rung; False -> just throw.
+            if _legend and state is not None and st.in_battle(self.b) \
+                    and self._legend_sleep_rung(state):
+                continue
+            res = self.throw_ball(max_seconds=max(20, int(max_seconds - (time.time() - t0))),
+                                  pref=ball_pref, allow_master=allow_master)
             if res == "no_balls" and st.in_battle(self.b):
-                self.flee(max_seconds=45)        # same wedge fix: resolve the live battle before reporting
+                # Legendary: soft-reload (never RUN — MonFlewAway). Others: flee to clear.
+                _sp_nb = (st.read_battle(self.b) or {}).get("enemy", {}).get("species")
+                if _legend or _sp_nb in _LEGEND_SOFT_KEYS:
+                    if self._try_legend_soft_reload(_sp_nb):
+                        return "no_balls"
+                    self.log("   [catch] !! no_balls on legendary + soft-reload failed — "
+                             "NOT fleeing (LOUD)")
+                else:
+                    self.flee(max_seconds=45)
             if res in ("caught", "no_balls", "trainer"):
                 return res
-            # 'broke_free' / 'stuck' -> the foe took its turn; loop and throw again (commit)
+            # 'broke_free' -> the foe took its turn; loop and throw again (commit).
+            # 'stuck' -> throw_ball already fed the CATCH-ABORT counter; the loop-top gate
+            # latches after CATCH_ABORT_MAX in a row (never the 14:10 infinite re-throw).
+            # 'our_down' -> the loop-top gate runs the forced send-in before any re-throw.
         return "stuck"
 
     # ── BATCH 2 PART B: USE A HEAL / CURE IN BATTLE (live-reconned recon_itemuse.py 2026-06-27) ────────
@@ -824,71 +2395,95 @@ class BattleAgent:
         return next((q for i, q in self._items_pocket() if i == item_id), 0)
 
     def _action_cursor_alive(self, probes=2):
-        """The run19 Lance livelock (2026-07-07): a dangling item message box on the in-battle
-        PARTY screen ("PERSIAN's HP was restored...") lights the SAME white-panel pixels as the
-        action menu, so every pixel-gated path believed a menu was up while the game waited for
-        a box-dismissing press — the directional walks (_goto_fight/_goto_pokemon) tapped into a
-        STALE GBATTLE_ACTION_CURSOR forever and the abort->re-enter cycle never pressed A/B.
-        Pixel truth is not enough: the action menu is only REAL if the cursor RESPONDS. Tap
-        toward a horizontal neighbour and demand the readback moves (retry — single taps get
-        eaten on this core). Leaves the cursor one step over; all callers walk by readback."""
-        c = self.b.rd8(ram.GBATTLE_ACTION_CURSOR)
-        if c not in (ram.ACT_FIGHT, ram.ACT_BAG, ram.ACT_POKEMON, ram.ACT_RUN):
-            return False
-        t = "RIGHT" if c in (ram.ACT_FIGHT, ram.ACT_POKEMON) else "LEFT"
-        for _ in range(probes):
-            self._tap(t); self._wait(5)
-            if self.b.rd8(ram.GBATTLE_ACTION_CURSOR) != c:
-                return True
-        return False
+        """DEPRECATED probe — NEVER tap d-pad here.
+
+        On this libmgba core the first d-pad at the action menu CONFIRMS FIGHT (opens the move
+        list). The old LEFT/RIGHT 'alive' probe WAS the Fight↔Bag / Fight↔moves stream thrash
+        (2026-08-02 LIVE). Truth is GBATTLE_MENU_UP==1, not cursor motion."""
+        return self._at_action_menu()
 
     def _settle_action_menu(self, tries=30):
-        """Reach the real ACTION menu using the PIXEL signals (menu_up RAM is stale on this core): action
-        menu = white panel AND NOT the move-list pixel, VERIFIED by cursor responsiveness — a dangling
-        message box / party screen / USE-CANCEL sub-box lights the same pixels (the run19 Lance livelock).
-        Impostors are drained with B (dismisses boxes, backs out of party/bag, no-op at the real menu).
-        Back out of the move list with B; advance text."""
-        self._settle()
+        """Reach the real ACTION menu via GBATTLE_MENU_UP (not d-pad probes / white_box alone).
+
+        Impostors (party/bag/text) drained with B. Move list left alone if we only need 'a menu'
+        — callers that need ACTION specifically see menu_up==1."""
+        self._settle(need=6, timeout=200)
         for _ in range(tries):
             if not st.in_battle(self.b):
                 return False
-            if self._in_move_list():
-                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner); self._wait(10)
-            elif not self._white_box():
-                self._advance_text()
-            elif self._action_cursor_alive():
-                return True
-            else:
-                self.log("   [engine] action-menu impostor (white box, DEAD cursor) -> B-drain "
-                         "(dangling box / party screen)")
+            if self._bag_screen() or self._party_screen():
                 self.b.press("B", self.hold, self.hold, self.render, owner=self.owner); self._wait(12)
-        return False
+                continue
+            if self._at_action_menu():
+                # A settled action menu is one a blind A may hit (anti-wedge floor, stall mash) —
+                # park the cursor on FIGHT so that A can never re-open the BAG/POKEMON screen
+                # (2026-08-03 Route-13 fisherman: cursor left on BAG = infinite Super-Potion loop).
+                if self.b.rd8(self._ac_addr()) != ram.ACT_FIGHT:
+                    self._poke_action_cursor(ram.ACT_FIGHT)
+                return True
+            if self._at_move_list():
+                # Back to action — ONE B only (don't A/B oscillate).
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner); self._wait(12)
+                continue
+            if not self._white_box():
+                self._advance_text()
+            else:
+                # White impostor (trainer prize / item text) — B drain, no d-pad.
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner); self._wait(12)
+        return self._at_action_menu()
+
+    def _poke_action_cursor(self, want):
+        """Write GBATTLE_ACTION_CURSOR and verify. On this libmgba core, d-pad from FIGHT can
+        CONFIRM Fight (open the move list) instead of moving the cursor — that was the
+        'alive Blastoise can't leave / switch loop' theater (2026-08-03 Jonny: Voltorb docks).
+        Returns True iff the byte reads back as `want` while still on the action menu."""
+        if not self._at_action_menu():
+            return False
+        _aca = self._ac_addr()                    # [dbl] the CHOOSING battler's cursor entry
+        try:
+            self.b.core.memory.u8.raw_write(_aca, int(want) & 0xFF)
+        except Exception as e:
+            self.log(f"   [engine] action-cursor write failed: {e}")
+            return False
+        self._wait(2)
+        return self._at_action_menu() and self.b.rd8(_aca) == want
 
     def _goto_bag(self, tries=10):
-        """Walk the action cursor to BAG (top-right, ACT_BAG=1) by READBACK, not a blind RIGHT — the
-        live look-ahead proved a blind _tap('RIGHT') gets EATEN on this long core, so A landed on FIGHT
-        and the bag never opened ('eaten RIGHT'), and she could never heal through a fight. Mirror of
-        _goto_pokemon: grid FIGHT(0,TL) BAG(1,TR) / POKEMON(2,BL) RUN(3,BR). Confirms ACT_BAG before A."""
+        """Park the action cursor on BAG (ACT_BAG=1). Prefer RAM write; d-pad is fallback only
+        and must B-out immediately if it opens the move list (Fight confirm)."""
         for _ in range(tries):
-            c = self.b.rd8(ram.GBATTLE_ACTION_CURSOR)
+            if self._at_move_list():
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(12)
+                continue
+            if not self._at_action_menu():
+                return False
+            c = self.b.rd8(self._ac_addr())
             if c == ram.ACT_BAG:
                 return True
+            if self._poke_action_cursor(ram.ACT_BAG):
+                return True
+            # Fallback d-pad once — if it confirmed FIGHT, B back next iter.
             if c == ram.ACT_FIGHT:
                 self._tap("RIGHT")
             elif c == ram.ACT_RUN:
                 self._tap("UP")
             elif c == ram.ACT_POKEMON:
-                self._tap("UP")                           # -> FIGHT, then RIGHT next iter -> BAG
+                self._tap("UP")
             else:
-                return False                              # not the action menu
+                return False
             self._wait(3)
-        return self.b.rd8(ram.GBATTLE_ACTION_CURSOR) == ram.ACT_BAG
+            if self._at_move_list():
+                self.log("   [engine] _goto_bag: d-pad confirmed FIGHT — B out, retry write")
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(12)
+        return self._at_action_menu() and self.b.rd8(self._ac_addr()) == ram.ACT_BAG
 
     def _goto_fight(self, tries=10):
         """Walk the action cursor to FIGHT (top-left, ACT_FIGHT=0) by readback. Mirror of _goto_bag;
         grid is FIGHT(0,TL) BAG(1,TR) / POKEMON(2,BL) RUN(3,BR)."""
         for _ in range(tries):
-            c = self.b.rd8(ram.GBATTLE_ACTION_CURSOR)
+            c = self.b.rd8(self._ac_addr())
             if c == ram.ACT_FIGHT:
                 return True
             if c == ram.ACT_BAG:
@@ -900,21 +2495,87 @@ class BattleAgent:
             else:
                 return False                              # not the action menu
             self._wait(3)
-        return self.b.rd8(ram.GBATTLE_ACTION_CURSOR) == ram.ACT_FIGHT
+        return self.b.rd8(self._ac_addr()) == ram.ACT_FIGHT
 
     def _struggle(self):
-        """ZERO PP anywhere in a can't-flee battle: A on FIGHT — the game substitutes Struggle
-        ("X has no moves left!"), which passes the turn and lets the battle actually resolve.
-        Returns 'done' if the confirm fired, else 'no_usable_move' (rides the anti-wedge floor)."""
+        """ZERO usable moves in a can't-flee battle: A on FIGHT — if ALL moves are truly dry the
+        game substitutes Struggle ("X has no moves left!") and the turn resolves. 2026-08-03
+        HARDENING (the Tackle-spam endgame): when OUR ledger says every slot is dry/exiled but
+        the game still OPENS the move list (our PP reads were the liars, not the game), the old
+        code returned 'done' having done NOTHING — a silent per-turn no-op that upgraded into the
+        anti-wedge A-mash. Now we do what a human does: WALK the list and try each slot (readback
+        nav), skipping exiled ones first; the game fires whichever really has PP. A slot the game
+        refuses gets exiled on the spot (text is truth). Only if every slot refuses do we return
+        'no_usable_move' (the anti-wedge floor owns it)."""
         if not self._settle_action_menu() or not self._goto_fight():
             return "no_usable_move"
         self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
         self._wait(30)
-        for _ in range(6):                                # drain the "no moves left!" text
-            if not st.in_battle(self.b) or self._white_box():
-                break
-            self._advance_text()
-        return "done"
+        if not self._at_move_list():
+            # FROZEN-DETECTOR GUARD (2026-08-03 11:49 logs: "ZERO PP anywhere -> FIGHT+A"
+            # spammed for minutes): moves=False here CAN be a lie — the battle-UI RAM block
+            # desyncs for whole battles. If pixels say a white menu is up, the list very
+            # likely opened (the game only opens it when SOMETHING has PP) — fall through
+            # to the slot walk below with BLIND nav instead of returning a silent no-op.
+            if not self._white_box():
+                for _ in range(6):                        # true zero-PP: drain "no moves left!" text
+                    if not st.in_battle(self.b) or self._white_box():
+                        break
+                    self._advance_text()
+                return "done"
+            self.log("   [engine] struggle-walk: RAM says no move list but pixels say white "
+                     "menu — BLIND-WALKING the slots (frozen-detector guard)")
+        # Move list opened — the game thinks something is usable. Try slots, least-refused first.
+        _ram_list = self._at_move_list()                  # False here = frozen detectors; go blind
+        order = sorted(range(4), key=lambda i: self._move_refused.get(i, 0))
+        for slot in order:
+            if not st.in_battle(self.b):
+                return "done"
+            if _ram_list and not self._at_move_list():
+                return "done"                             # something fired / battle moved on
+            if not _ram_list and not self._white_box():
+                return "done"                             # blind mode: white menu gone = resolved
+            # FUTILITY GATE (09:07): if the list has already proven itself a tar pit, bench-switch
+            # instead of feeding it more confirms.
+            if (getattr(self, "_amove_futile", 0) >= FUTILE_AMOVE_MAX
+                    and self._is_trainer_battle()):
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(14)
+                if self._futility_bench_switch():
+                    return "done"
+            # BLIND-FIRST (12:07 relapse): deterministic walk owns positioning; the RAM write
+            # runs after only as a correction when the byte is still readable and disagrees.
+            self._blind_goto_move(slot)
+            if _ram_list and self.b.rd8(self._mc_addr()) != slot:
+                self._goto_move(slot)
+            pressed = slot
+            before = self._bstate()
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(20)
+            for _fn in range(240):                        # ~4s: did the turn actually leave?
+                if not st.in_battle(self.b):
+                    return "done"
+                _bt = self._battle_text() if _fn % 12 == 0 else ""
+                if _bt and any(sn in _bt for sn in self._MOVE_REFUSAL_SNIPPETS):
+                    self._move_refused[pressed] = max(self._move_refused.get(pressed, 0), 2)
+                    self._amove_futile = getattr(self, "_amove_futile", 0) + 1
+                    self.log(f"   [engine] struggle-walk: game refused slot {pressed} — exiled, "
+                             f"trying the next (futility {self._amove_futile}/{FUTILE_AMOVE_MAX})")
+                    self._wait(20)                        # let the refusal box clear
+                    break
+                cur = st.read_battle(self.b)
+                if cur:
+                    hp = (cur["enemy"]["hp"], cur["ours"]["hp"])
+                    if before and hp != before:
+                        self.log(f"   [engine] struggle-walk: slot {slot} FIRED (the PP ledger "
+                                 f"was lying) — turn resolved")
+                        self._note_battle_progress(f"struggle-walk slot {slot}")
+                        return "done"
+                if not self._white_box():
+                    self.b.press("A", 2, 8, self.render, owner=self.owner)
+                self.b.run_frame(); self.render()
+        self.log("   [engine] struggle-walk: every slot refused — no_usable_move (LOUD)")
+        return "no_usable_move"
 
     def _open_bag(self, tries=4):
         """From the ACTION menu: cursor->BAG (verified by readback) -> A. The bag is open iff the white
@@ -938,51 +2599,298 @@ class BattleAgent:
         gated on the bag being GONE — the bag's USE/CANCEL box lights the same pixels (layer 8)."""
         for _ in range(10):
             if not st.in_battle(self.b) or (self._white_box() and not self._bag_screen()):
-                return
+                break
             self.b.press("B", 2, 12, self.render, owner=self.owner); self._wait(10)
+        self._rehome_fight_cursor()
+
+    def _rehome_fight_cursor(self):
+        """2026-08-03 THE FISHERMAN LOOP (Route 13 dock): after ANY bag/party trip the action-menu
+        cursor stays parked on BAG (FRLG remembers it), and the bag's list cursor stays on the last
+        item (Super Potion). Every later BLIND A — the anti-wedge floor's 'mash FIGHT+A', the wedge
+        bail, the stall mash — then RE-OPENS the bag on the potion: 'SUPER POTION is selected.' ->
+        'Use on which POKMON?' -> B-drain -> blind A -> forever, on stream, for minutes. Pitfall 13
+        applies to US too: never leave a cursor where a blind press detonates. Park it back on FIGHT
+        (RAM write + readback; d-pad fallback) every time we leave a bag/party screen."""
+        try:
+            if st.in_battle(self.b) and self._at_action_menu():
+                # RAM write ONLY — a d-pad fallback here can CONFIRM instead of move on this
+                # core (the _home_to_fight no-op lesson). A failed write just logs; the blind-A
+                # bans elsewhere still protect us.
+                if not self._poke_action_cursor(ram.ACT_FIGHT):
+                    self.log("   [engine] rehome-FIGHT: cursor write didn't verify (LOUD; "
+                             "blind-A bans still guard the bag)")
+        except Exception as e:
+            self.log(f"   [engine] rehome-FIGHT failed: {e} (LOUD)")
+
+    def _blind_menu_unwind(self, presses=8):
+        """2026-08-04 LIVE (the Hyper-Potion-forever golbat fight — 19 minutes on stream): every
+        screen classifier lied AT ONCE (bag=False party=False/True menu_up=1 white-box lit) while
+        the REAL screen was the bag list -> 'Use on which POKéMON?', so every screen-AWARE escape
+        (_war_advance_press, the party-thrash B-loop) consulted the same lying reads and pressed
+        the loop right back open. B is the one blind-safe key in FRLG battle menus — it only
+        cancels or advances text, NEVER confirms — so when the wedge signature shows, stop
+        trusting screens entirely: B-storm the whole menu stack down unconditionally, then park
+        the action cursor back on FIGHT so no later blind A can re-open the bag."""
+        for _ in range(presses):
+            if not st.in_battle(self.b):
+                return
+            self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(14)
+        self._rehome_fight_cursor()
+
+    def _true_active_party_hp(self):
+        """Tear-safe HP for the mon currently OUT: gPlayerParty[gBattlerPartyIndexes[0]].
+        gBattleMons HP can tear (looks hurt while the bar is full) and was the 2026-08-02
+        LIVE Super-Potion-on-full-ace loop. Returns (hp, maxhp) or (None, None)."""
+        try:
+            pi = self.b.rd16(ram.GBATTLER_PARTY_IDX)
+            if not (0 <= pi < 6):
+                return None, None
+            base = ram.GPLAYER_PARTY + pi * 100
+            hp = self.b.rd16(base + 0x56)
+            mx = self.b.rd16(base + 0x58)
+            if not (1 <= mx <= 999 and 0 <= hp <= mx):
+                return None, None
+            return hp, mx
+        except Exception:
+            return None, None
+
+    def _battle_text(self):
+        """Best-effort read of the ACTIVE game message (gStringVar3, the dialogue-reader
+        address — battle bag/refusal strings were observed flowing through it live).
+        Lowercased/normalized; '' when unreadable. GROUND TRUTH accelerant only — every
+        caller must also work when this returns '' (the struct-timeout path still counts
+        refusals)."""
+        try:
+            from dialogue_reader import decode, DialogueReader
+            s, junk = decode(self.b.read_bytes(DialogueReader.ACTIVE_MSG, 0xC0))
+            if not s or junk > 0.3:
+                return ""
+            return " ".join(s.lower().split())
+        except Exception:
+            return ""
+
+    # The game's own move-rejection strings — authoritative: the slot is DEAD this battle
+    # no matter what the (tear-prone) PP byte claims.
+    _MOVE_REFUSAL_SNIPPETS = ("no pp left", "is disabled")
+
+    def _war_advance_press(self):
+        """ONE screen-aware press for the war-must-advance paths (anti-wedge floor, menu-wedge
+        bail, stall mash). The 2026-08-03 Route-13 fisherman loop: those paths pressed BLIND A,
+        the action cursor was parked on BAG after an item trip, so every 'mash FIGHT' RE-OPENED
+        the bag on Super Potion — an infinite selected/Use-on-which cycle their own counters
+        kept resetting. Rule: NEVER a blind A. Bag/party -> B. Action menu -> cursor to FIGHT
+        (RAM write, readback) THEN A. Move list -> A (fires the highlighted move — resolution).
+        Anything else -> advance text."""
+        if self._bag_screen() or self._party_screen():
+            self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(12)
+            return "B"
+        if self._at_action_menu():
+            # FROZEN-DETECTOR GUARD (11:49 logs: action=True held for a WHOLE battle while the
+            # move list was open — every 'A@FIGHT' here actually confirmed the parked slot).
+            # Once the futility floor is breached, stop trusting this byte: blind-walk to the
+            # least-refused slot and A. Real action menu: worst case the walk confirms FIGHT
+            # and then navigates the list it opened — still fires the intended slot.
+            if getattr(self, "_amove_futile", 0) >= FUTILE_AMOVE_MAX:
+                _ref = getattr(self, "_move_refused", {})
+                _best = min(range(4), key=lambda i: _ref.get(i, 0))
+                self._blind_goto_move(_best)
+                self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(16)
+                self._amove_futile += 1
+                return f"A@blind{_best}"
+            if self.b.rd8(self._ac_addr()) != ram.ACT_FIGHT:
+                self._poke_action_cursor(ram.ACT_FIGHT)
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(14)
+            return "A@FIGHT"
+        if self._at_move_list():
+            # FUTILITY BREAKER (2026-08-03 09:07, the parked-on-Tackle photos): if the move list
+            # has already eaten FUTILE_AMOVE_MAX confirms this battle with zero real progress,
+            # one more A here is theater — the cursor readback is lying or every slot the game
+            # will actually select is dry. Stop touching the list: B out and bench-switch (the
+            # party path verifies by the active SPECIES flipping — move RAM can't lie to it).
+            if (getattr(self, "_amove_futile", 0) >= FUTILE_AMOVE_MAX
+                    and self._is_trainer_battle()):
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(14)
+                if self._futility_bench_switch():
+                    return "SWITCHED(futility)"
+                # no bench / didn't confirm -> fall through and A anyway (Struggle path)
+            self._amove_futile = getattr(self, "_amove_futile", 0) + 1
+            # Never confirm a slot the game already refused (the highlighted move IS the
+            # refused one after a refusal bounce) — steer to the least-refused slot first.
+            _ref = getattr(self, "_move_refused", {})
+            if _ref:
+                _best = min(range(4), key=lambda i: _ref.get(i, 0))
+                if _ref.get(self.b.rd8(self._mc_addr()), 0) > _ref.get(_best, 0):
+                    self._goto_move(_best)
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(16)
+            return "A@move"
+        self._advance_text()
+        return "text"
+
+    def _futility_bench_switch(self):
+        """LAST-RESORT resolver for a move list that eats every confirm (the 09:07 Tackle loop:
+        cursor readback said 'nav ok', the drawn cursor never left TACKLE, refusals tallied on
+        the WRONG slots, famine never tripped). Uses only reads proven live: party HP/species
+        from gPlayerParty and the species-flip-verified _switch_to_slot. Bounded per battle."""
+        if getattr(self, "_futility_switches", 0) >= 2:
+            return False
+        try:
+            pi = self.b.rd16(ram.GBATTLER_PARTY_IDX)
+            active_sp = st.read_party_species(self.b, pi) if 0 <= pi < 6 else None
+            cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+            best, best_lv = None, -1
+            for s in range(min(cnt, 6)):
+                if s == pi or self.b.rd16(ram.GPLAYER_PARTY + s * 100 + 0x56) <= 0:
+                    continue
+                sp = st.read_party_species(self.b, s)
+                if not sp or sp == active_sp:
+                    continue
+                lv = self.b.rd8(ram.GPLAYER_PARTY + s * 100 + 0x54)
+                if lv > best_lv:
+                    best, best_lv = s, lv
+            if best is None:
+                self.log("   [engine] FUTILITY BREAKER: no live bench mon — the move list is all "
+                         "we have (Struggle/whiteout owns it)")
+                return False
+            self._futility_switches = getattr(self, "_futility_switches", 0) + 1
+            self.log(f"   [engine] !! FUTILITY BREAKER: {self._amove_futile} fruitless move-list "
+                     f"confirms — the list is a tar pit (lying cursor/PP RAM). Benching the active "
+                     f"for party slot {best} (L{best_lv}) — switch verifies by species flip, "
+                     f"not move RAM (use {self._futility_switches}/2)")
+            if self._switch_to_slot(best, active_sp) == "switched":
+                self.emit("my moves are jammed — tagging in someone who can actually swing.",
+                          beat=True, tier=2)
+                self._note_battle_progress("futility bench switch")
+                self._skip_streak.clear()
+                return True
+            self.log("   [engine] FUTILITY BREAKER: switch did not confirm (fail-safe, fighting on)")
+        except Exception as e:
+            self.log(f"   [engine] FUTILITY BREAKER failed: {e} (LOUD)")
+        return False
+
+    def _true_active_party_status(self):
+        """Tear-safe STATUS for the mon currently OUT — gPlayerParty[gBattlerPartyIndexes[0]]
+        status u32 at +0x50, decoded to 'sleep'/'poison'/'burn'/'freeze'/'paralysis'/None.
+        2026-08-03 LIVE (the Antidote-on-paralyzed-Blastoise loop): gBattleMons status1 tore
+        and decoded as POISON while the game (and chat) knew he was PARALYZED — she confirmed
+        Antidote into 'It won't have any effect.' over and over. Same lying struct as the HP
+        tear; same cure: the party struct is the truth. Returns (decoded, ok) — ok=False means
+        the read failed and callers must NOT trust either source."""
+        try:
+            pi = self.b.rd16(ram.GBATTLER_PARTY_IDX)
+            if not (0 <= pi < 6):
+                return None, False
+            s = self.b.rd32(ram.GPLAYER_PARTY + pi * 100 + 0x50)
+            return _decode_status(s & 0xFF), True
+        except Exception:
+            return None, False
+
+    def _note_battle_progress(self, why=""):
+        """Real fight progress (not menu flicker) — resets the MENU WEDGE stall clock."""
+        self._last_battle_progress_t = time.time()
+        self._amove_futile = 0             # the move list produced something real again
+        self._immob_streak = 0             # real progress = the stillness streak is over too
+        if why:
+            self.log(f"   [engine] battle-progress: {why}")
 
     def use_item_in_battle(self, item_id, max_seconds=30, target=None):
         """Use one `item_id` from the Items pocket. Returns 'used' (count dropped) | 'no_item' |
-        'failed'. FAIL-SAFE: anything but 'used' leaves the battle fightable. `target` aims the
-        item's party screen: 'active' (the mon that is OUT — always menu row 0, the lead panel)
-        or 'fainted' (the strongest downed mon — Revive). The row is resolved by CONTENT at MENU
-        TIME (_menu_rows order law): run14 frame-proof — a Revive aimed at a PRE-menu slot index
-        confirmed the healthy active mon's panel, ate 'It won't have any effect.' boxes all night,
-        and never consumed. None keeps the legacy un-aimed walk; aim taps are party-screen-gated
-        (pixel truth) so a lagging party open never taps into the bag's USE/CANCEL sub-box."""
+        'failed' | 'no_effect'. FAIL-SAFE: anything but 'used' leaves the battle fightable. `target`
+        aims the item's party screen: 'active' (the mon that is OUT — always menu row 0, the lead
+        panel) or 'fainted' (the strongest downed mon — Revive). The row is resolved by CONTENT at
+        MENU TIME (_menu_rows order law): run14 frame-proof — a Revive aimed at a PRE-menu slot
+        index confirmed the healthy active mon's panel, ate 'It won't have any effect.' boxes all
+        night, and never consumed. None keeps the legacy un-aimed walk; aim taps are
+        party-screen-gated (pixel truth) so a lagging party open never taps into the bag's
+        USE/CANCEL sub-box."""
         ids = [i for i, _ in self._items_pocket()]
         if item_id not in ids:
             self.log(f"   [engine] use_item: item {item_id} NOT in pocket {ids[:8]} — no_item (LOUD)")
             return "no_item"
         row = ids.index(item_id)
         cnt0 = self._items_count(item_id)
+        _is_heal = item_id in _HEAL_ITEMS_PREF
+        _is_cure = item_id in set(_STATUS_CURE_ITEM.values()) | {_FULL_HEAL}
         if not self._settle_action_menu():
             self.log("   [engine] use_item: couldn't reach the action menu — keep fighting (LOUD)")
             return "failed"
         if not self._open_bag():
             self.log("   [engine] use_item: bag wouldn't open (eaten RIGHT?) — keep fighting (LOUD)")
             self._exit_bag(); return "failed"
-        for _ in range(8):                                   # steer GBAG_POCKET to the Items pocket (0)
-            if self.b.rd8(ram.GBAG_POCKET) == 0:
-                break
+        # POCKET LIVENESS PROBE (2026-08-03 13:01 — 'hovering over Teachy TV and Helix Fossil
+        # mid fight'): Teachy TV/Helix Fossil live in the KEY ITEMS pocket. The pocket byte
+        # read 0 (Items) while the REAL pocket was Key Items — frozen-RAM disease — so zero
+        # LEFTs were pressed and the row walk selected key items. A healthy byte must RESPOND
+        # to a d-pad press before steering trusts it (the START-menu open-verify doctrine);
+        # a mute byte = frozen -> BLIND clamp: LEFT x4 (the pocket strip clamps at Items).
+        _p0 = self.b.rd8(ram.GBAG_POCKET)
+        self._tap("RIGHT"); self._wait(12)
+        _live = self.b.rd8(ram.GBAG_POCKET) != _p0
+        if not _live:
             self._tap("LEFT"); self._wait(12)
-        if self.b.rd8(ram.GBAG_POCKET) != 0:
-            self.log("   [engine] use_item: couldn't reach the Items pocket — keep fighting (LOUD)")
-            self._exit_bag(); return "failed"
+            _live = self.b.rd8(ram.GBAG_POCKET) != _p0
+        if _live:
+            for _ in range(8):                               # steer GBAG_POCKET to the Items pocket (0)
+                if self.b.rd8(ram.GBAG_POCKET) == 0:
+                    break
+                self._tap("LEFT"); self._wait(12)
+            if self.b.rd8(ram.GBAG_POCKET) != 0:
+                self.log("   [engine] use_item: couldn't reach the Items pocket — keep fighting (LOUD)")
+                self._exit_bag(); return "failed"
+        else:
+            # 2026-08-04 LIVE (Gary, Blastoise at 12/170): pocket byte MUTE *and* zero bag/
+            # white pixels on screen = the bag very likely never opened despite _open_bag's
+            # white-gone pass (mid-transition frame). Blind LEFTs at a NON-bag screen are
+            # poison — on this core a d-pad press at the action menu can CONFIRM. Re-check
+            # once after a settle; still nothing -> bail fightable instead of spraying keys.
+            if not self._bag_screen() and not self._white_box() and not self._bag_menu_cb2():
+                self._wait(40)
+                if not self._bag_screen() and not self._white_box() and not self._bag_menu_cb2():
+                    self.log("   [engine] use_item: pocket byte MUTE + NO bag/white pixels + "
+                             "callback2 not the bag — bag never opened; keep fighting "
+                             "(LOUD, no blind taps fired)")
+                    self._exit_bag(); return "failed"
+            self.log("   [engine] use_item: pocket byte is MUTE (frozen RAM) — BLIND clamp "
+                     "LEFT x4 to the Items pocket")
+            for _ in range(4):
+                self._tap("LEFT"); self._wait(12)
         def _sel():
             # TRUE selection = cursor + scrollOffset (the mart-list law, recon_bagscroll-verified).
             # The raw cursor byte alone LIES after any scrolled visit — the list remembers both.
             return self.b.rd8(BAG_CURSOR) + self.b.rd16(BAG_SCROLL)
-        for _ in range(14):                                  # nav to the item's TRUE row (cursor+scroll)
-            if _sel() == row:
-                break
-            self._tap("DOWN" if _sel() < row else "UP"); self._wait(10)
-        self._wait(8)                                        # settle scroll animation, then re-verify
-        if _sel() != row:
-            self.log(f"   [engine] use_item: couldn't reach true row {row} "
-                     f"(cursor={self.b.rd8(BAG_CURSOR)} scroll={self.b.rd16(BAG_SCROLL)}) — "
-                     f"keep fighting (LOUD)")
-            self._exit_bag(); return "failed"
+        if _live:
+            for _ in range(14):                              # nav to the item's TRUE row (cursor+scroll)
+                if _sel() == row:
+                    break
+                self._tap("DOWN" if _sel() < row else "UP"); self._wait(10)
+            self._wait(8)                                    # settle scroll animation, then re-verify
+        # Mute pocket byte = the whole bag RAM block is suspect: a frozen _sel() that happens
+        # to equal `row` would FALSE-PASS and select the wrong item — skip readback nav
+        # entirely and let the blind walk below own positioning.
+        if not _live or _sel() != row:
+            # BLIND BAG WALK (2026-08-03 12:07: 'couldn't reach true row 4 (cursor=1 scroll=0)'
+            # killed the one Ether attempt of the whole loop): the bag cursor/scroll bytes have
+            # the same frozen-RAM disease as the battle cursors. The list CLAMPS at the top, so
+            # UP x (row+6) homes to row 0 from any position even with eaten presses, then
+            # DOWN x row lands the true row with zero RAM trust. Count-drop stays the only
+            # consume-truth, and a mis-select just exhausts the A-walk -> 'failed' (fail-safe).
+            if row <= 8:
+                self.log(f"   [engine] use_item: RAM says row {_sel()} wanted {row} — bytes may "
+                         f"be frozen; BLIND bag walk (clamp-home + DOWN x{row})")
+                for _ in range(row + 6):
+                    self._tap("UP"); self._wait(8)
+                for _ in range(row):
+                    self._tap("DOWN"); self._wait(8)
+            else:
+                self.log(f"   [engine] use_item: couldn't reach true row {row} "
+                         f"(cursor={self.b.rd8(BAG_CURSOR)} scroll={self.b.rd16(BAG_SCROLL)}) — "
+                         f"too deep for a blind walk; keep fighting (LOUD)")
+                self._exit_bag(); return "failed"
         # CONFIRMED in the Items pocket on the right row -> A walks select->USE->target->apply.
         # A#0 selects the item, A#1 hits USE (party screen opens); then AIM ONCE — focus the
         # list, resolve the row by MENU-TIME CONTENT ('active' = row 0, the lead panel IS the
@@ -993,27 +2901,97 @@ class BattleAgent:
         # Count drop is the only truth; a mis-aim just exhausts the walk -> 'failed' ->
         # keep fighting (fail-safe, never a wedge).
         aimed = target is None                             # no aim requested = nothing to do
-        for n in range(10):
+        # Cap raised 4->6 (2026-08-04 Gary): frozen-frame battles burn 2-3 laps before the
+        # party screen even registers, so a 4-lap budget died the instant aiming started.
+        # The wrong-aim A-spam risk that set the old cap is now closed by the no_effect
+        # aborts BEFORE the confirm.
+        for n in range(6):
             if self._items_count(item_id) < cnt0:
                 break
-            if not aimed and self._party_screen():
+            if not aimed and (self._party_screen() or self._party_menu_cb2()):
+                # ^ pixel OR callback2 truth (2026-08-04, the Revive insta-click: on frozen
+                # frames the pixel classifier missed the freshly-opened target screen, this
+                # block never ran, and the bare walk-A below confirmed the HOME cursor — the
+                # alive lead. gMain.callback2 IS the party menu while it owns input.)
                 self._wait(8)                              # let the screen finish drawing
-                if not self._party_focus():
-                    self.log("   [engine] use_item: party list never took focus (fail-safe)")
+                # 2026-08-04 LIVE (the Gary wipe — FOUR Revives 'selected', ZERO consumed,
+                # full team down): _party_focus()'s eaten-tap retry presses B, and on the
+                # item-target screen ("Use on which POKéMON?") B CANCELS back to the bag
+                # list — the follow-up goto taps then scrolled the BAG cursor instead
+                # ('REVIVE is selected.' -> 'NUGGET is selected.') and the confirm A
+                # inspected a Nugget, every attempt, while the team bled out. The target
+                # screen always opens with the cursor HOME (lead panel), so no focus probe
+                # is needed: dismiss a stray sub-box, then aim by border readback — and if
+                # the orange border can't be seen (fade/half-drawn frames), walk BLIND from
+                # the clamped home. NEVER press B inside this block.
+                if self._party_submenu():
+                    self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                    self._wait(16)
                 rows = self._menu_rows()
                 if isinstance(target, int):                # an EXACT party slot (revive routing)
                     _row = target
                 elif target == "fainted":
                     _row = next((r["row"] for r in sorted(rows, key=lambda r: -r["level"])
-                                 if r["hp"] == 0), 0)
+                                 if r["hp"] == 0), None)
+                    if _row is None:
+                        # No fainted row visible at menu time (torn/frozen party block) —
+                        # confirming the healthy default row 0 is the "won't have any
+                        # effect" A-loop. Abort BEFORE the confirm instead.
+                        self.log("   [engine] use_item: no fainted row at menu time — "
+                                 "aborting revive (no_effect; fail-safe)")
+                        self._exit_bag()
+                        return "no_effect"
                 else:                                      # 'active' -> the lead panel
                     _row = 0
-                if not self._party_goto_slot(_row):
-                    self.log(f"   [engine] use_item: aim couldn't reach menu row {_row} "
-                             f"— confirming where the cursor is (fail-safe)")
+                    # 2026-08-02 LIVE: heal aimed at FULL ace (torn gBattleMons said hurt) —
+                    # "It won't have any effect." A-spam forever. Abort BEFORE confirming.
+                    if _is_heal and rows:
+                        lead = next((r for r in rows if r["row"] == 0), rows[0])
+                        if lead.get("maxhp") and lead.get("hp", 0) >= lead["maxhp"]:
+                            self.log(f"   [engine] use_item: lead {st.SPECIES_NAME.get(lead.get('species'), '?')} "
+                                     f"is FULL HP ({lead['hp']}/{lead['maxhp']}) — aborting potion "
+                                     f"(no_effect; was the full-ace Super Potion loop)")
+                            self._exit_bag()
+                            return "no_effect"
+                    # Cure verification at MENU TIME (party struct first — the tear-safe truth):
+                    # (a) no status at all -> the Awakening re-open loop; (b) WRONG MEDICINE —
+                    # 2026-08-03 LIVE: Antidote confirmed on a PARALYZED Blastoise, "It won't
+                    # have any effect." forever. The item must treat the LIVE status (exact
+                    # match or Full Heal) or we abort before the confirm.
+                    if _is_cure:
+                        _cur_status, _sok = self._true_active_party_status()
+                        if not _sok:
+                            _st = st.read_battle(self.b) or {}
+                            _cur_status = _decode_status((_st.get("ours") or {}).get("status1", 0) or 0)
+                        if not _cur_status:
+                            self.log("   [engine] use_item: active has NO status — aborting cure "
+                                     "(no_effect; was the Awakening re-open loop)")
+                            self._exit_bag()
+                            return "no_effect"
+                        _needed = _STATUS_CURE_ITEM.get(_cur_status)
+                        if item_id != _FULL_HEAL and item_id != _needed:
+                            self.log(f"   [engine] use_item: WRONG MEDICINE — item {item_id} does not "
+                                     f"treat {_cur_status!r} (needs {_needed} or Full Heal {_FULL_HEAL}) "
+                                     f"— aborting BEFORE the confirm (no_effect; was the Antidote-on-"
+                                     f"paralysis loop)")
+                            self.emit(f"wrong medicine — that won't fix {_cur_status}. fighting on.",
+                                      beat=True, tier=2)
+                            self._exit_bag()
+                            return "no_effect"
+                _seen = (self._party_cursor_slot() is not None
+                         or self._party_cursor_on_lead())
+                if not _seen or not self._party_goto_slot(_row):
+                    # Border readback blind (fade frames / frozen pixels) or the closed-loop
+                    # walk couldn't confirm — walk BLIND from the clamped home (LEFT clamps
+                    # the lead panel; RIGHT + DOWN×(row-1) lands any right-column row). Only
+                    # d-pad taps: on this screen a stray B cancels, a stray A confirms.
+                    self.log(f"   [engine] use_item: cursor unreadable/unreached for row {_row} "
+                             f"— BLIND party walk (LEFT home, RIGHT + DOWN x{max(0, _row - 1)})")
+                    self._party_blind_goto(_row)
                 aimed = True
             self.log(f"   [engine] use_item walk n={n}: party={self._party_screen()} "
                      f"bag={self._bag_screen()} white={self._white_box()} "
+                     f"cb2party={self._party_menu_cb2()} cb2bag={self._bag_menu_cb2()} "
                      f"pcur={self._party_cursor_slot()} lead={self._party_cursor_on_lead()}")
             self.b.press("A", self.hold, self.hold, self.render, owner=self.owner); self._wait(16)
             if not st.in_battle(self.b):
@@ -1021,6 +2999,7 @@ class BattleAgent:
         if self._items_count(item_id) < cnt0:
             self.log(f"   [engine] use_item: USED item {item_id} (count {cnt0}->{self._items_count(item_id)})")
             self.emit("used an item — that's better", beat=True)
+            self._note_battle_progress(f"item {item_id} consumed")
             # LAYER 8 FIX: close the BAG first — the old drain exited on _white_box(), but the bag's
             # USE/CANCEL sub-box LIGHTS those pixels, so 'used' could return with the bag still open
             # and the next turn's presses landed in it forever (caterpie 7/40, walk 3).
@@ -1030,7 +3009,17 @@ class BattleAgent:
             # lights those pixels, so 'used' returned with the box still up and the turn loop
             # wedged against it forever (the run19 Lance livelock). _settle_action_menu now
             # demands cursor responsiveness and B-drains impostors, so route through it.
-            self._settle_action_menu(tries=12)
+            if not self._settle_action_menu(tries=12):
+                # 2026-08-04 LIVE (the Hyper-Potion golbat loop): the settle came back UNCONFIRMED
+                # — the bag/target screen was still up but invisible to every classifier, and the
+                # next turn's 'move commit' re-confirmed the parked potion forever. Don't return
+                # 'used' on a lying screen: blind B-unwind the whole stack first.
+                self.log("   [engine] use_item: post-use settle NOT confirmed — blind B-unwind "
+                         "(the bag can sit open invisible to every classifier)")
+                self._blind_menu_unwind(8)
+            # Cursor is parked on BAG after any item trip — re-home to FIGHT so no later
+            # blind A can re-open the bag (the Route-13 fisherman Super-Potion loop).
+            self._rehome_fight_cursor()
             return "used"
         self.log(f"   [engine] use_item: pocket={self.b.rd8(ram.GBAG_POCKET)} cursor={self.b.rd8(BAG_CURSOR)} "
                  f"scroll={self.b.rd16(BAG_SCROLL)} row={row} — selected but item {item_id} NOT consumed "
@@ -1054,7 +3043,23 @@ class BattleAgent:
         # cleared per battle, per species, only after a PROVEN failure (a working heal never latches).
         if HEAL_FAIL_LATCH and (ours.get("species") in self._heal_failed):
             return False
+        if getattr(self, "_potion_blocked", False):
+            # Still allow cure/revive/ether below — only potions are blocked after no_effect.
+            pass
         frac = _hp_frac(ours)
+        # 2026-08-02 LIVE: gBattleMons HP tore (looked crit) while party + HUD said FULL —
+        # she opened Super Potion on the ace forever. Trust party struct over battle mons.
+        _php, _pmx = self._true_active_party_hp()
+        if _pmx and _php is not None:
+            _party_frac = _php / _pmx
+            if _party_frac >= 0.99 and frac < 0.99:
+                self.log(f"   [engine] HP-TEAR GUARD: gBattleMons says {ours.get('hp')}/{ours.get('maxhp')} "
+                         f"but party active is FULL {_php}/{_pmx} — trusting party (no potion)")
+                frac = _party_frac
+            elif abs(frac - _party_frac) >= 0.20:
+                self.log(f"   [engine] HP-TEAR GUARD: battle frac={frac:.2f} vs party "
+                         f"{_php}/{_pmx} ({_party_frac:.2f}) — trusting party")
+                frac = _party_frac
         offers, plan = {}, {}
         # MATCHUP-AWARE HEAL THRESHOLD (general, E4-critical): a foe that hits us SUPER-EFFECTIVELY can
         # 2HKO from high HP, so the 30% crit floor heals too LATE (one more hit faints us). Against such a
@@ -1092,24 +3097,73 @@ class BattleAgent:
         foe_mx = foe.get("maxhp") or 0
         foe_frac = (foe.get("hp", 0) / foe_mx) if foe_mx else 1.0
         finishable = foe_frac <= 0.25 and frac > BATTLE_CRIT_FRAC
-        if frac <= heal_frac and not finishable:
-            heal = next((i for i in _HEAL_ITEMS_PREF if self._items_count(i) > 0), None)
-            if heal is not None:
-                plan["use_potion"] = (heal, aim)
-                offers["use_potion"] = (f"use a healing item — you're at {ours['hp']}/{ours['maxhp']} HP, "
-                                        f"about to faint, and you HAVE one in the bag")
+        # Status of the mon actually OUT — decoded HERE (above the potion branch) so the
+        # right-sized potion picker can prefer a Full Restore on a hurt+statused ace.
+        # gBattleMons decode CROSS-CHECKED against the party struct (STATUS-TEAR GUARD,
+        # 2026-08-03: torn status1 decoded POISON on a PARALYZED Blastoise -> Antidote
+        # confirmed into 'It won't have any effect.' forever).
+        status = _decode_status((state.get("ours") or {}).get("status1", 0) or 0)
+        _pstatus, _pok = self._true_active_party_status()
+        if _pok and _pstatus != status:
+            self.log(f"   [engine] STATUS-TEAR GUARD: gBattleMons says {status!r} but the party "
+                     f"struct says {_pstatus!r} — trusting party (anti wrong-medicine loop)")
+            status = _pstatus
+        if (frac <= heal_frac and not finishable
+                and not getattr(self, "_potion_blocked", False)):
+            # ACE-FIRST POTION ECONOMY (2026-07-31, the Misty chalk Jonny watched): the aim is
+            # always the ACTIVE mon (correct — never a bench row), but after the ace faints the
+            # game FORCE-SWITCHES fodder in, and this offer then spent the whole potion stock
+            # keeping L8-13 bench mons alive while the L28 carry lay dead (no Revive in the bag
+            # that early = no counter-offer). A real player never potions fodder: if the active
+            # mon is out-leveled by a party member (alive OR fainted) by 8+, the heals are the
+            # ACE's — suppress the offer LOUD and let the fodder fight/faint. The ace (or any
+            # mon within 8 of the top) still heals exactly as before.
+            _fodder = False
+            try:
+                _top_lv = 0
+                for _pi in range(min(self.b.rd8(ram.GPLAYER_PARTY_CNT) or 0, 6)):
+                    if st.read_party_species(self.b, _pi):
+                        _top_lv = max(_top_lv, self.b.rd8(ram.GPLAYER_PARTY + _pi * 100 + 0x54))
+                _fodder = bool(_ours_lv and _top_lv and (_top_lv - _ours_lv) >= 8)
+            except Exception:
+                _fodder = False
+            if _fodder:
+                self.log(f"   [engine] ACE-FIRST POTIONS: active L{_ours_lv} is fodder next to the "
+                         f"team's L{_top_lv} carry — NOT offering a heal on it (the potions are "
+                         f"for the ace, not L8-13 bench mons)")
+            else:
+                _missing = max(0, int(round((1.0 - frac) * (ours.get("maxhp") or 0))))
+                heal = self._pick_heal_item(_missing, status)
+                if heal is not None:
+                    plan["use_potion"] = (heal, aim)
+                    offers["use_potion"] = (f"use {ITEM_QTY_NAMES.get(heal, 'a healing item')} — "
+                                            f"you're at {ours['hp']}/{ours['maxhp']} HP, about to "
+                                            f"faint, and it's sized to the damage")
         elif finishable and frac <= heal_frac:
             self.log(f"   [engine] FINISH-THE-FOE: foe at {int(foe_frac*100)}% (<=25%), us {int(frac*100)}% "
                      f"(> crit) -> no heal, land the KO instead")
-        # Status of the mon actually OUT (gBattleMons ground truth via read_battle) — the old
-        # _lead_status read gPlayerParty[0], so post-switch a sleep-locked FODDER never got a
-        # cure offer while the dead ace's 'none' was consulted instead (run16 attempts 2+).
-        status = _decode_status((state.get("ours") or {}).get("status1", 0) or 0)
-        if status:
+        # CURE TIMING (2026-08-03 13:04 'she doesn't know WHEN to use antidotes'): a status
+        # cure costs the turn. Against a nearly-dead foe, landing the KO beats curing —
+        # UNLESS the status stops her from acting at all (sleep/freeze; full-para is a
+        # gamble but she can still move). Poison/burn chip is survivable for one finishing hit.
+        _cure_now = status and not getattr(self, "_cure_blocked", False)
+        if _cure_now and finishable and status not in ("sleep", "freeze"):
+            self.log(f"   [engine] CURE TIMING: {status} can wait — foe at {int(foe_frac*100)}% "
+                     f"is one hit from down; KO first, cure after (or the Center does it free)")
+            _cure_now = False
+        if _cure_now:
             cure = self._STATUS_CURE_for(status)
+            # HURT + STATUSED = the Full Restore case (one turn fixes both). Only when
+            # genuinely hurt — a Full Restore on a scratched-but-paralyzed mon is a waste.
+            if frac <= 0.65 and self._items_count(19) > 0:
+                cure = 19
             if cure is not None:
                 plan["use_cure"] = (cure, aim)
-                offers["use_cure"] = f"use the cure for {status} — it's hurting you and you have the item"
+                offers["use_cure"] = (f"use {ITEM_QTY_NAMES.get(cure, 'the cure')} for {status} — "
+                                      f"it's hurting you and you have the item")
+        elif status and getattr(self, "_cure_blocked", False):
+            self.log(f"   [engine] CURE-BLOCK: status={status} but cures latched off this battle "
+                     f"(anti Awakening re-open loop)")
         # REVIVE INSTINCT (night shift #13): the fallen-ace case that killed e4_run3 at Lance —
         # Revives rode the bag unused while bench-warmers tanked on. Offer resurrection only when
         # the fainted mon out-levels everything still standing (fodder fainting never triggers it).
@@ -1156,13 +3210,51 @@ class BattleAgent:
                     plan["use_ether"] = (ether, aim)
                     offers["use_ether"] = ("restore PP with your Ether — you're out of moves that can "
                                            "hit this foe and it puts your best move back in the fight")
+        # REFUSAL-PROVEN FAMINE (2026-08-03 12:07): the PP bytes can lie (frozen-RAM battles
+        # read pp>0 on slots the game refuses every turn), so the RAM famine gate above can
+        # miss the exact fight that needs the Ether most. If the GAME ITSELF has refused
+        # confirms past the futility floor, the famine is proven by behavior — offer it.
+        _refusal_famine = (getattr(self, "_amove_futile", 0) >= FUTILE_AMOVE_MAX
+                           and sum(1 for v in getattr(self, "_move_refused", {}).values()
+                                   if v >= 2) >= 1)
+        if "use_ether" not in plan and _refusal_famine:
+            ether = next((i for i in _ETHER_ITEMS_PREF if self._items_count(i) > 0), None)
+            if ether is not None:
+                plan["use_ether"] = (ether, aim)
+                offers["use_ether"] = ("restore PP with your Ether — the game keeps refusing your "
+                                       "attacks (out of PP); this is the only way to keep hitting")
         if not offers:
             return False
         offers["keep_fighting"] = "keep attacking — push through it"
         ctx = {"hp": f"{ours['hp']}/{ours['maxhp']}", "status": status or "none",
                "foe": st.SPECIES_NAME.get(state["enemy"]["species"], "the foe")}
+        if "use_ether" in plan:
+            ctx["pp"] = ("OUT OF PP — the game is refusing your attacks; you CANNOT keep "
+                         "attacking without restoring PP or switching out")
         self.log(f"   [engine] ITEM-INSTINCT offer: {list(offers)} ctx={ctx}")
-        pick = self.choose("battle_item", offers, ctx)
+        # FORCED PICK (12:07 logs): her oracle chose 'keep_fighting' FIFTEEN times in a row
+        # ("saving the Ether for Koga") while zero of her attacks could fire — the persona
+        # can flavor the line, but it doesn't get to veto physics. Refusal-proven famine +
+        # an Ether in the bag = the Ether gets used, no vote.
+        if "use_ether" in plan and _refusal_famine:
+            pick = "use_ether"
+            self.log("   [engine] ITEM-INSTINCT FORCED -> use_ether (refusal-proven famine; "
+                     "oracle bypassed — she cannot attack at all)")
+            self.emit("okay, no more juice in my moves — Ether time, no debate.", beat=True, tier=1)
+        # FORCED POTION (2026-08-03 12:42 — the crucial gym-road battle lost with potions in
+        # the bag): a potion offer only exists when the active mon is genuinely hurt AND not
+        # fodder next to the carry (ace-first economy already filtered that). If it's ALSO at
+        # the hard crit floor, one more hit ends the fight — that heal is physics, not a
+        # persona choice. The oracle keeps its vote in the 30-50% early-heal comfort zone;
+        # below the floor the potion just happens.
+        elif "use_potion" in plan and frac <= BATTLE_CRIT_FRAC:
+            pick = "use_potion"
+            self.log(f"   [engine] ITEM-INSTINCT FORCED -> use_potion (active at {int(frac*100)}% "
+                     f"<= crit floor {int(BATTLE_CRIT_FRAC*100)}% — a faint loses the fight; "
+                     f"oracle bypassed)")
+            self.emit("nope, I'm about to drop — potion FIRST, pride later.", beat=True, tier=1)
+        else:
+            pick = self.choose("battle_item", offers, ctx)
         if pick and pick in plan:
             item, kind = plan[pick]
             self.log(f"   [engine] ITEM-INSTINCT pick -> {pick} (item {item}, aim={kind})")
@@ -1176,6 +3268,16 @@ class BattleAgent:
                     self.log(f"   [engine] HEAL-FAIL LATCH: item {item} did not consume ({res}) -> "
                              f"suppressing further in-battle item offers for species {sp} this battle "
                              f"(anti bag-USE/CANCEL livelock — fight/faint, let the next mon resolve it)")
+                # Full-ace / no_effect: block ALL potions this battle (species latch alone didn't
+                # stop the loop when gBattleMons kept lying about a different "hurt" reading).
+                if pick == "use_potion" or (res == "no_effect" and pick == "use_potion"):
+                    self._potion_blocked = True
+                    self.log("   [engine] POTION-BLOCK: no more heal-item offers this battle "
+                             "(full-HP / no_effect abort)")
+                if pick == "use_cure" or (res == "no_effect" and pick == "use_cure"):
+                    self._cure_blocked = True
+                    self.log("   [engine] CURE-BLOCK: no more status-cure offers this battle "
+                             "(already-clear / no_effect abort)")
             return res == "used"
         self.log(f"   [engine] ITEM-INSTINCT pick -> {pick!r} (keep fighting)")
         return False
@@ -1249,6 +3351,23 @@ class BattleAgent:
                 return best[0]
         return None
 
+    def _pick_heal_item(self, missing_hp, status=None):
+        """RIGHT-SIZED POTION (2026-08-03 13:04 'she doesn't know WHEN to use super potions...
+        I want her OP'): Bulbapedia-nerd item economics. Hurt AND statused -> Full Restore
+        (one turn fixes both, the endgame play). Otherwise the SMALLEST potion that covers
+        the missing HP — a Potion on a 15-HP dent, a Hyper on a 150-HP crater — so the big
+        bottles survive for the fights that need them. Nothing covers it fully -> the biggest
+        bottle in the bag (max value for the turn). None = bag has no heals at all."""
+        if status and self._items_count(19) > 0:
+            return 19
+        for iid in (13, 22, 21, 20, 19):                    # smallest sufficient tier
+            if self._items_count(iid) > 0 and _POTION_HEALS[iid] >= missing_hp:
+                return iid
+        for iid in (19, 20, 21, 22, 13):                    # nothing covers -> biggest available
+            if self._items_count(iid) > 0:
+                return iid
+        return None
+
     def _STATUS_CURE_for(self, status):
         """The cure item id for a status that's actually in the bag (specific cure, else Full Heal)."""
         spec = _STATUS_CURE_ITEM.get(status)
@@ -1310,6 +3429,21 @@ class BattleAgent:
                 hits += 1
         return hits >= 3
 
+    def _party_menu_cb2(self):
+        """gMain.callback2 says the PARTY/target-select screen owns input right now. RAM truth
+        the frozen-frame disease can't touch (the Revive insta-click class). Fail-closed."""
+        try:
+            return self.b.rd32(ram.GMAIN_CB2) in _CB2_PARTY_MENU
+        except Exception:
+            return False
+
+    def _bag_menu_cb2(self):
+        """gMain.callback2 says the BAG list owns input right now. Fail-closed."""
+        try:
+            return self.b.rd32(ram.GMAIN_CB2) in _CB2_BAG_MENU
+        except Exception:
+            return False
+
     # The BAG SCREEN (layer 8, the caterpie-7/40 wedge, frame stage_l8.png): an in-battle item flow
     # can leave/return the battle to the open bag, and EVERY state byte lies there (MENU_MODE reads a
     # stale 2, GBATTLE_MENU_UP a stale 1, and the USE/CANCEL sub-box lights the white-panel pixels) —
@@ -1348,16 +3482,68 @@ class BattleAgent:
             self._wait(14)
         return not self._bag_screen()
 
+    def _menu_up(self):
+        """GBATTLE_MENU_UP (0x02023E86): 1 = action menu (FIGHT/BAG/POKEMON/RUN), 0 otherwise.
+        Verified signal (firered_ram) — NOT the free-running GBATTLE_PHASE counter."""
+        try:
+            return self.b.rd8(ram.GBATTLE_MENU_UP) == 1
+        except Exception:
+            return False
+
+    def _at_action_menu(self):
+        """TRUE FIGHT/BAG/POKEMON/RUN menu. menu_up==1 is authoritative; _white_box alone is
+        shared with the move list (the thrash root — treating both as 'action' then probing).
+        [dbl] In a DOUBLE, menu_up (gBattleCommunication[4] = ACTIONS_CONFIRMED_COUNT) reads 2-3
+        while her menus are up — never 1 — so the truth is the choosing battler's controller
+        func (HandleInputChooseAction), the GMAIN_CB2 ground-truth class."""
+        if self._bag_screen() or self._party_screen():
+            return False
+        if self._is_double():
+            try:
+                b = st.double_chooser(self.b)
+                return (b is not None and self.b.rd32(
+                    ram.GBATTLER_CONTROLLER_FUNCS + 4 * b) == ram.HANDLE_INPUT_CHOOSE_ACTION
+                    and self._white_box())
+            except Exception:
+                return False
+        return self._menu_up() and self._white_box()
+
+    def _at_move_list(self):
+        """FIGHT move list is up. menu_up==0 + white panel (or MENU_MODE==2). Never d-pad probe.
+        [dbl] In a DOUBLE the singles bytes lie (MENU_MODE is battler 0's state only, and it
+        stays 2 through TARGET-SELECT too) — key off the choosing battler's controller func:
+        only HandleInputChooseMove counts (target-select is deliberately NOT a move list, so
+        the verify loop can never book its wait as a move refusal)."""
+        if self._bag_screen() or self._party_screen():
+            return False
+        if self._is_double():
+            try:
+                b = st.double_chooser(self.b)
+                return b is not None and self.b.rd32(
+                    ram.GBATTLER_CONTROLLER_FUNCS + 4 * b) == ram.HANDLE_INPUT_CHOOSE_MOVE
+            except Exception:
+                return False
+        if self._menu_up():
+            return False
+        try:
+            if self.b.rd8(MENU_MODE) == 2:
+                return True
+        except Exception:
+            pass
+        return self._white_box() and self._in_move_list()
+
     def _home_to_fight(self):
-        """Park the action cursor on FIGHT (top-left) WITHOUT reading the stale cursor latch:
-        UP then LEFT are absorbed at the top/left boundary, so from ANY of the 4 cells they net
-        the top-left corner = FIGHT. Reliable now that input is clean (no phantom-A confirm)."""
-        self._tap("UP"); self._tap("LEFT"); self._wait(4)
+        """NO-OP on this libmgba core (2026-08-02 LIVE ROOT CAUSE).
+
+        firered_ram CATCH-ARC finding: the FIRST d-pad press at the action menu CONFIRMS FIGHT
+        (menu_up 1→0, opens the move list). UP/LEFT 'homing' was the stream look — endless
+        Fight↔move / Fight↔Bag theater. Default cell IS FIGHT; just press A when menu_up==1."""
+        return
 
     def _nav_move(self, idx):
         """Move the move-list cursor from slot 0 (where the list opens) to slot idx in the 2x2
         grid: TL=0 TR=1 / BL=2 BR=3 (RIGHT = column, DOWN = row). Settles after so the confirm-A
-        isn't eaten mid cursor-move (the slot-2 lesson)."""
+        isn't eaten mid cursor-move (the slot-2 lesson). ONLY call when _at_move_list()."""
         if idx == 1:
             self._tap("RIGHT")
         elif idx == 2:
@@ -1367,47 +3553,33 @@ class BattleAgent:
         self._wait(14)
 
     def _movelist_open(self):
-        """RAM truth for 'the FIGHT move list is open' (MENU_MODE == 2), OR the pixel check — either
-        suffices. The RAM signal is what survives the long-running core (the pixel detect intermittently
-        fails there, the keystone wedge)."""
-        try:
-            if self.b.rd8(MENU_MODE) == 2:
-                return True
-        except Exception:
-            pass
-        return self._in_move_list()
+        """True iff the FIGHT move list is open — menu_up==0 path, never a d-pad probe."""
+        return self._at_move_list()
 
     def _movelist_open_verified(self):
-        """_movelist_open + a CURSOR-RESPONSE cross-check. THE immortal-Ekans wedge (2026-07-05 look-ahead):
-        after an in-battle ITEM use, MENU_MODE reads a STALE 2, so the open-check short-circuited True
-        BEFORE the FIGHT-opening A was ever pressed — the move list was never open, _goto_move's presses
-        landed on the action menu, MOVE_CURSOR never moved, the flee also failed against the phantom
-        state, and travel re-entered the SAME battle ~50x (ekans 27/27 every time). Doctrine (the
-        cursor-desync lesson): trust CURSOR-RESPONSE, not a state byte. The list counts as open only if
-        MOVE_CURSOR actually responds to a probe press (probe toward a neighbor, readback, restore).
-        Known edge: a 1-move mon's cursor can't move (probe reads as closed) → the caller presses A,
-        which on a truly-open 1-move list just fires slot 0 — the only move, harmless.
-        2026-07-06 (run-14, the post-item-use A/B livelock): the byte can be stale LOW just as it was
-        stale HIGH — gating the probe on _movelist_open() made a GENUINELY-open list read as closed,
-        so the caller's wrong-submenu B closed it, the next A reopened it, ×12 → 'stuck' forever at
-        the Route-6 gauntlet. The RESPONSE PROBE alone is the ground truth — no byte gate either way.
-        (A stray probe on the ACTION menu just nudges its cursor; the caller re-homes with UP+LEFT.)"""
-        cur = self.b.rd8(MOVE_CURSOR)
-        probe = "RIGHT" if cur % 2 == 0 else "LEFT"
-        back = "LEFT" if probe == "RIGHT" else "RIGHT"
-        self._tap(probe); self._wait(8)
-        if self.b.rd8(MOVE_CURSOR) == cur:            # cursor didn't respond -> not open (or 1-move edge)
-            return False
-        self._tap(back); self._wait(8)                # restore the cursor (readback nav re-verifies anyway)
-        return True
+        """Alias of _at_move_list — kept for call sites. Zero taps. Ever."""
+        return self._at_move_list()
 
     def _goto_move(self, idx, tries=12):
-        """Walk the move-list cursor to slot idx by RAM READBACK of MOVE_CURSOR (0..3 in the 2x2 grid:
-        index = row*2 + col), VERIFYING each press actually moved the cursor — an eaten d-pad press on
-        the long core is simply retried (it can never silently land on the wrong move). Mirrors
-        _goto_bag/_mart_goto_row. Returns True on arrival."""
+        """Park the move-list cursor on slot idx. 2026-08-03 11:43 (the third parked-on-Tackle
+        photo set): d-pad walking this cursor was observed NOT MOVING IT for minutes at a time
+        (eaten presses and/or a read that already claimed arrival) — every confirm fired the
+        drawn slot (Tackle, 0 PP) forever. The action cursor had the IDENTICAL disease and the
+        proven cure is a RAM WRITE + readback (_poke_action_cursor, verified live): the game's
+        confirm reads gMoveSelectionCursor — the byte IS the selection, whatever the pixels
+        show. Write first; d-pad walk only as fallback; return False LOUD (callers attribute
+        refusals to the cursor byte, never assume arrival)."""
+        _mca = self._mc_addr()                    # [dbl] the CHOOSING battler's cursor entry
+        try:
+            if self.b.rd8(_mca) != idx:
+                self.b.core.memory.u8.raw_write(_mca, int(idx) & 0xFF)
+                self._wait(2)
+            if self.b.rd8(_mca) == idx:
+                return True
+        except Exception as e:
+            self.log(f"   [engine] move-cursor write failed: {e} (falling back to d-pad)")
         for _ in range(tries):
-            cur = self.b.rd8(MOVE_CURSOR)
+            cur = self.b.rd8(_mca)
             if cur == idx:
                 return True
             cr, cc = cur // 2, cur % 2
@@ -1417,7 +3589,24 @@ class BattleAgent:
             else:
                 self._tap("RIGHT" if tc > cc else "LEFT")
             self._wait(8)
-        return self.b.rd8(MOVE_CURSOR) == idx
+        return self.b.rd8(_mca) == idx
+
+    def _blind_goto_move(self, idx):
+        """Move-list navigation with ZERO RAM trust (2026-08-03: the frozen-detector battle —
+        MENU_MODE/cursor bytes desynced for a whole fight; every readback-based layer failed
+        while the real list sat open on screen). The FRLG move grid is 2x2 with NO wraparound,
+        so clamping makes doubled presses idempotent: LEFT,LEFT,UP,UP homes to slot 0 from any
+        start even if half the presses are eaten; DOWN,DOWN / RIGHT,RIGHT then reach any slot
+        deterministically. Safe everywhere: on a text box d-pads are no-ops; on the action menu
+        the worst case is confirming FIGHT (which opens the list this walk then navigates)."""
+        for d in ("LEFT", "LEFT", "UP", "UP"):
+            self._tap(d)
+            self._wait(6)
+        steps = {0: (), 1: ("RIGHT", "RIGHT"), 2: ("DOWN", "DOWN"),
+                 3: ("DOWN", "DOWN", "RIGHT", "RIGHT")}.get(int(idx) & 3, ())
+        for d in steps:
+            self._tap(d)
+            self._wait(6)
 
     def _goto_party_slot(self, slot, tries=10):
         """Walk the in-battle party-list cursor to `slot` by RAM READBACK of PARTY_CURSOR (gPartyMenu.slotId)
@@ -1440,11 +3629,38 @@ class BattleAgent:
         Vine Whip), not a pre-swapped slot 0. We never press B at the action menu (that flees a
         wild battle); B is only used to back out of a wrongly-opened submenu."""
         ours, enemy = state["ours"], state["enemy"]
-        idx, desc, low = pol.choose_move(ours["moves"], enemy["types"], _hp_frac(ours))
+        _our_types = [t for t in (ours.get("types") or []) if t and t != "???"]
+        # [dbl] PIN the choosing battler for this whole commit: slot 2's action/move cursors
+        # live at array entry +2 (the ARRAY TRUTH note) and the post-commit PP audit must read
+        # THAT battler's gBattleMons entry — the doubles-aware read_battle flips "ours" to the
+        # partner the moment the chooser changes, so never re-derive mid-commit. None = singles
+        # (every address below resolves to the historical +0 byte — byte-identical old flow).
+        _dblb = None
+        if self._is_double():
+            _dblb = st.double_chooser(self.b)
+            if _dblb is None:
+                _dblb = int(state.get("ours_battler", 0) or 0)
+            self.log(f"   [dbl] battler {_dblb} is choosing — "
+                     f"{st.SPECIES_NAME.get(ours.get('species'), '?')} vs foe battler "
+                     f"{state.get('enemy_battler', 1)} "
+                     f"{st.SPECIES_NAME.get(enemy.get('species'), '?')}")
+        _mca = MOVE_CURSOR + (_dblb or 0)
+        _aca = ram.GBATTLE_ACTION_CURSOR + (_dblb or 0)
+        idx, desc, low = pol.choose_move(
+            ours["moves"], enemy["types"], _hp_frac(ours), our_types=_our_types)
 
-        def _usable(i):                                # a real move with PP
+        def _usable(i):                                # a real move with PP the game hasn't disproven
             m = ours["moves"][i]
+            # A slot the GAME refused >=2 times is dry whatever its (tear-prone) PP byte says —
+            # the Tackle re-fire loop: stale pp>0 + war-must-advance streak-clear = forever.
+            if self._move_refused.get(i, 0) >= 2:
+                return False
             return m.get("id", 0) != 0 and m.get("pp", 0) > 0
+
+        def _dmg_score(i):
+            # STAB × type × accuracy — same yardstick as choose_move (2026-08-02).
+            return pol.move_score(ours["moves"][i], enemy["types"], _our_types)
+
         if not (0 <= idx < 4) or not _usable(idx) or idx in self._skip_streak:
             # FIX 1 — REPETITION-AVERSE move pick: exclude EVERY move that already failed to fire this
             # streak (not just the last one), so she pivots through her whole moveset and NEVER re-spams
@@ -1453,8 +3669,7 @@ class BattleAgent:
             # so a working move is never permanently benched (the PoisonPowder-spam lesson).
             cands = [i for i in range(4) if _usable(i) and i not in self._skip_streak]
             if cands:
-                idx = max(cands, key=lambda i: max(ours["moves"][i].get("power", 0), 1)
-                          * _eff(ours["moves"][i], enemy))
+                idx = max(cands, key=_dmg_score)
                 desc = ours["moves"][idx].get("name", desc)
             else:
                 # Every usable move has already failed to fire this streak (or none are usable at all —
@@ -1472,8 +3687,7 @@ class BattleAgent:
                         # prefer moves that can CONNECT (status counts); immune-damaging is last resort
                         1 if (ours["moves"][i].get("power", 0) == 0
                               or _eff(ours["moves"][i], enemy) > 0) else 0,
-                        max(ours["moves"][i].get("power", 0), 1)
-                        * _eff(ours["moves"][i], enemy)))
+                        _dmg_score(i)))
                     desc = ours["moves"][idx].get("name", desc)
                     self.log(f"   [engine] MOVES EXHAUSTED in a TRAINER battle -> war-must-advance: "
                              f"re-firing {desc} (idling never resolves a can't-flee fight)")
@@ -1496,14 +3710,13 @@ class BattleAgent:
         # matchup) / else flees. Capability-not-script: she still chooses among the moves that work.
         def _useful(i):
             m = ours["moves"][i]
-            if m.get("id", 0) == 0 or m.get("pp", 0) <= 0 or i in self._skip_streak:
+            if not _usable(i) or i in self._skip_streak:
                 return False
             return not (m.get("power", 0) > 0 and _eff(m, enemy) == 0)
         if 0 <= idx < 4 and ours["moves"][idx].get("power", 0) > 0 and eff == 0:
             _uc = [i for i in range(4) if _useful(i)]
             if _uc:
-                idx = max(_uc, key=lambda i: max(ours["moves"][i].get("power", 0), 1)
-                          * _eff(ours["moves"][i], enemy))
+                idx = max(_uc, key=_dmg_score)
                 desc = ours["moves"][idx].get("name", desc)
                 eff = _eff(ours["moves"][idx], enemy)
                 self.log(f"   [engine] avoided a type-immune move -> {desc} (eff x{eff:g}) instead")
@@ -1609,119 +3822,259 @@ class BattleAgent:
                         self.log(f"   [engine] STATUS STRATEGY: damage resisted (best x{best_dmg_eff:g}) "
                                  f"-> {desc} (type-independent chip/neutralise past the wall)")
                         break
-        self.log(f"   [engine] action menu: {desc} -> slot {idx} (eff x{eff:g}) vs "
-                 f"{st.SPECIES_NAME.get(enemy['species'], '?')} {enemy['hp']}/{enemy['maxhp']}")
-        # OPEN THE MOVE LIST ROBUSTLY: home to FIGHT, A, pixel-confirm the list opened; retry the
-        # A if it was eaten (still at the white action menu); if a wrong submenu opened (bag/
-        # POKEMON - NOT the white action panel) back out with B and re-home. Bounded.
-        def _open_move_list():
-            self._home_to_fight()
-            for _ in range(12):
-                # VERIFIED open (cursor-response, not just the MENU_MODE byte): a stale-2 byte after an
-                # item use short-circuited this check before A was ever pressed = the immortal-Ekans wedge.
-                if self._movelist_open_verified():
-                    return True
-                self._home_to_fight()                 # a failed probe may have nudged the ACTION cursor
-                #                                       (RIGHT lands on BAG) — re-home so A opens FIGHT
-                self.b.press("A", self.hold, self.hold, self.render, owner=self.owner); self._wait(10)
-                if self._movelist_open_verified():
-                    return True
-                if not (self._white_box() or self._movelist_open()):   # a wrong submenu opened -> back out
-                    self.b.press("B", self.hold, self.hold, self.render, owner=self.owner); self._wait(10)
-                    self._home_to_fight()
-            return False
-        opened = _open_move_list()
-        if not opened:
-            # WHITE-BOX IMPOSTOR (2026-07-12, the Diglett's-Cave livelock): _white_box() is True but the
-            # move list won't open after 12 A-tries -> a dangling message/animation box masks as the action
-            # menu (same white pixels, DEAD action cursor). Every press A just re-advances the box, so the
-            # foe HP never moves ("move#N logged, diglett 30/30 forever") -> 3 unresolved turns -> a WILD
-            # flee that ALSO can't navigate the impostor -> eternal 'stuck', 0 map-transitions (trapped in
-            # the cave). ROOT-KILL: drain the impostor to the REAL menu with the proven B-drainer, then
-            # retry the open ONCE. Byte-inert on a normal menu (this whole block only runs after the open
-            # already FAILED); bounded (settle tries=30, one open retry) so it can never itself livelock.
-            if self._settle_action_menu():
-                opened = _open_move_list()
-        if not opened:
-            return "stuck"                            # still can't open -> clean retry (re-settle)
-        if not self._goto_move(idx):                  # RAM-readback nav (verify each press moved the cursor)
-            self.log(f"   [engine] move-cursor didn't reach slot {idx} (now {self.b.rd8(MOVE_CURSOR)}) "
-                     f"-> clean retry")
-            return "stuck"
-        pp0 = ours["moves"][idx].get("pp", 0)
+        # LOUD scoreboard of all 4 FIGHT slots (TL=0 TR=1 BL=2 BR=3) so a missed STAB
+        # / wrong-column pick is visible in the soak without a frame dump.
+        try:
+            _board = []
+            for _i, _m in enumerate(ours["moves"]):
+                if not _m.get("id"):
+                    continue
+                _sc = pol.move_score(_m, enemy["types"], _our_types)
+                # pp= is the LIE DETECTOR (2026-08-03): print what the decision function BELIEVES
+                # each slot's PP is, next to ref= (times the game refused it). A slot with pp>0
+                # and ref>=2 in the same line is gBattleMons caught lying, in the soak report,
+                # with no phone photos needed.
+                _board.append(
+                    f"[{_i}]{_m.get('name','?')}(p{_m.get('power',0)}"
+                    f"{'*STAB' if pol.stab_mult(_m.get('type'), _our_types) > 1 else ''}"
+                    f",pp={_m.get('pp', '?')},ref={self._move_refused.get(_i, 0)}"
+                    f",sc={_sc:g})")
+            self.log(f"   [engine] action menu: {desc} -> slot {idx} (eff x{eff:g}) vs "
+                     f"{st.SPECIES_NAME.get(enemy['species'], '?')} "
+                     f"{enemy['hp']}/{enemy['maxhp']} | {' '.join(_board)}")
+        except Exception:
+            self.log(f"   [engine] action menu: {desc} -> slot {idx} (eff x{eff:g}) vs "
+                     f"{st.SPECIES_NAME.get(enemy['species'], '?')} {enemy['hp']}/{enemy['maxhp']}")
+        # STREAM COMMIT (2026-08-02 LIVE ROOT): ZERO d-pad on the action menu.
+        # menu_up==1 → A opens the move list (default cell is FIGHT). Already on move list →
+        # nav + A. Never UP/LEFT/RIGHT at action (those CONFIRM FIGHT / scroll forever on this core).
+        self.log(f"   [engine] STREAM COMMIT: {desc} slot {idx} "
+                 f"(menu_up={int(self._menu_up())} action={self._at_action_menu()} "
+                 f"moves={self._at_move_list()})")
+        if (self._bag_screen() or self._party_screen()
+                or self._bag_menu_cb2() or self._party_menu_cb2()):
+            self.b.press("B", self.hold, self.hold, self.render, owner=self.owner); self._wait(12)
+        if self._at_action_menu():
+            # FORCE FIGHT FIRST (2026-08-04 LIVE, the mid-fight 'Teachy TV / Helix Fossil'
+            # inspections Jonny watched): the action-cursor byte PERSISTS wherever the last
+            # flow parked it (BAG after an item turn, POKéMON after a switch prompt) — the
+            # 'default cell is FIGHT' assumption below only holds on a fresh battle. A@BAG
+            # opens the bag on the REMEMBERED pocket (Key Items after any TeachFlow errand),
+            # and the blind move-walk then d-pads INSIDE the bag and inspects key items for
+            # whole turns. Same cure as the move list: the byte IS the selection — write it.
+            try:
+                if self.b.rd8(_aca) != ram.ACT_FIGHT:
+                    self._poke_action_cursor(ram.ACT_FIGHT)
+            except Exception:
+                pass
+            # ONE A — opens move list. Do NOT d-pad first.
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner); self._wait(16)
+            # STRAY-BAG RESCUE: the A opened the BAG/party anyway (the byte lied or the write
+            # missed) — B out once, re-force FIGHT, re-open. One bounded lap, never a loop;
+            # a still-open bag after this falls through to the verify loop's failure branch.
+            if (self._bag_screen() or self._party_screen()
+                    or self._bag_menu_cb2() or self._party_menu_cb2()):
+                self.log("   [engine] STREAM COMMIT: A opened the BAG/PARTY instead of FIGHT "
+                         "(parked action cursor) — B out + re-forcing FIGHT")
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(16)
+                try:
+                    self._poke_action_cursor(ram.ACT_FIGHT)
+                except Exception:
+                    pass
+                if self._at_action_menu():
+                    self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+                    self._wait(16)
+        elif not self._at_move_list() and self._white_box():
+            # Ambiguous white — try A once (opens fight or confirms if already on list).
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner); self._wait(16)
+        # BLIND-FIRST NAV (2026-08-03 12:07 relapse): the RAM-verified path re-poisons the
+        # whole battle the moment the cursor byte lies while the detector says fine — the
+        # write-then-readback "verifies" against dead memory, A fires the parked slot, and
+        # the refusal is tallied on the slot we INTENDED (ledger poisoning, round 3). The
+        # blind walk is deterministic with ZERO RAM trust (2x2 grid, no wrap, doubled taps
+        # clamp), so it is now the PRIMARY nav on every commit; the RAM write runs after
+        # only as a correction when it can still be read (healthy RAM: both agree, no-op).
+        self._blind_goto_move(idx)
+        if self._at_move_list() and self.b.rd8(_mca) != idx:
+            self.log(f"   [engine] STREAM COMMIT: RAM cursor disagrees after blind walk "
+                     f"(reads {self.b.rd8(_mca)}, want {idx}) — RAM-correcting")
+            self._goto_move(idx)
+        # ATTRIBUTION (2026-08-03 12:07, blind-first era): the blind walk is deterministic —
+        # the real cursor IS on `idx` regardless of what the byte claims (frozen-RAM battles
+        # read garbage here; trusting the byte was ledger-poisoning round 3). Attribute
+        # refusals to idx. A disagreeing byte is now a frozen-RAM SIGNAL, not the truth.
+        _pressed = idx
+        _byte = self.b.rd8(_mca)
+        if self._at_move_list() and 0 <= _byte < 4 and _byte != idx:
+            self.log(f"   [engine] !! CURSOR BYTE DISAGREES post-blind-walk (byte={_byte}, "
+                     f"blind={idx}) — RAM block likely frozen; trusting the blind walk")
+        # FORCE-WRITE THE SELECTION (2026-08-04 LIVE, the Silph 'Tackle theater': engine chose
+        # Water Pulse every turn vs Pidgeot while TACKLE's PP drained 30->26 — eaten blind-walk
+        # taps left the REAL cursor on slot 0, the byte read 0 truthfully, and the 12:07 rule
+        # above trusted the walk over the byte, so A confirmed Tackle for a whole fight).
+        # The game's confirm reads gMoveSelectionCursor — the byte IS the selection (the
+        # _goto_move doctrine, action-cursor-proven). A raw WRITE lands on real memory even
+        # when the READ path is frozen, so writing idx right before A is correct in BOTH
+        # failure classes: eaten-taps (fixes the desync) and frozen reads (harmless no-op
+        # on an already-right cursor). Best-effort; a write fault never blocks the confirm.
+        try:
+            self.b.core.memory.u8.raw_write(_mca, int(idx) & 0xFF)
+            self._wait(2)
+        except Exception as _wf:
+            self.log(f"   [engine] move-cursor force-write failed ({_wf}) — blind walk only")
+        pp0 = ours["moves"][idx].get("pp", 0) if 0 <= idx < 4 else 0
+        # Full PP snapshot for the post-turn WRONG-SLOT AUDIT below (menu-time state).
+        _pp_all0 = [int((m or {}).get("pp", 0) or 0) for m in (ours.get("moves") or [])]
         before = self._bstate()
         self.b.press("A", self.hold, self.hold, self.render, owner=self.owner); self._wait(10)
-        self._last_desc, self._last_eff = desc, eff   # narrated when the hit actually lands
-        # VERIFY the move EXECUTED. The old fixed 220-frame window was TOO SHORT for a full trainer
-        # turn (when we're slower, our hit lands AFTER the foe's move + animations) -> it timed out
-        # on WORKING moves and (with benching) exiled them, losing winnable fights. Now we wait for
-        # the TURN TO RESOLVE: a PP drop or ANY HP change = it fired (damage dealt or taken means a
-        # move went off); battle ending = it fired (KO). Only if the turn settles back at the menu
-        # with NO PP drop and NO HP change is it a true non-fire (Disable / can't-act).
+        self._last_desc, self._last_eff = desc, eff
         result = None
         last_hp, stable = before, 0
-        for _ in range(900):
+        for _vn in range(600):                        # was 900 — shorter wait, faster retry if miss
             if not st.in_battle(self.b):
-                result = "done"; break                # battle ended (KO) = our move resolved
+                result = "done"; break
+            # GAME-TEXT REFUSAL (2026-08-03, the Tackle spam): "There's no PP left..." /
+            # "X is disabled!" is the game itself vetoing this slot — exile INSTANTLY
+            # (don't burn the 600-frame timeout twice before the famine switch can fire).
+            if _vn % 12 == 0:
+                _bt = self._battle_text()
+                if _bt and any(sn in _bt for sn in self._MOVE_REFUSAL_SNIPPETS):
+                    self._move_refused[_pressed] = max(self._move_refused.get(_pressed, 0), 2)
+                    self._amove_futile = getattr(self, "_amove_futile", 0) + 1
+                    self.log(f"   [engine] GAME REFUSED slot {_pressed} ({_bt[:48]!r}) -> instant "
+                             f"exile this battle (text is truth; PP byte was lying; "
+                             f"futility {self._amove_futile}/{FUTILE_AMOVE_MAX})")
+                    break                             # result stays None -> failure branch
+            # [dbl] a doubles commit detours through TARGET-SELECT (single-target move vs two
+            # live foes) and NEVER drops PP before the PARTNER also acts — the old loop read
+            # both as "the move refused", exiled the whole moveset, and looped the battle.
+            # Answer the target step; then a comm-state 3/4 for OUR battler (action confirmed,
+            # battle_main.c HandleTurnActionSelectionState) or the chooser flipping to the
+            # partner = the commit was ACCEPTED — the PP audit happens at turn resolution.
+            if _dblb is not None:
+                if self._dbl_at_target_select():
+                    self._dbl_confirm_target()
+                try:
+                    _stb = self.b.rd8(ram.GBATTLE_COMM + _dblb)
+                except Exception:
+                    _stb = None
+                if _stb in (3, 4):
+                    self.log(f"   [dbl] battler {_dblb} action COMMITTED (comm state {_stb})")
+                    result = "done"; break
+                _ch = st.double_chooser(self.b)
+                if _ch is not None and _ch != _dblb:
+                    self.log(f"   [dbl] partner battler {_ch} is choosing now — commit accepted")
+                    result = "done"; break
             cur = st.read_battle(self.b)
             if cur:
                 self._emit_diffs(self._prev, cur); self._prev = cur
-                if cur["ours"]["moves"][idx].get("pp", 0) < pp0:      # our chosen move's PP dropped
-                    result = "done"; break
+                try:
+                    # [dbl] PP audit pinned to the committing battler's gBattleMons entry —
+                    # cur["ours"] flips to the partner once the chooser changes.
+                    if _dblb is not None:
+                        _ppnow = self.b.rd8(st.GBATTLE_MONS + _dblb * st.MON_SIZE
+                                            + st.F_PP + idx)
+                    else:
+                        _ppnow = cur["ours"]["moves"][idx].get("pp", 0)
+                    if 0 <= idx < 4 and _ppnow < pp0:
+                        result = "done"; break
+                except Exception:
+                    pass
                 hp = (cur["enemy"]["hp"], cur["ours"]["hp"])
-                if before and hp != before:           # ANY HP moved this turn -> a move executed
+                if before and hp != before:
+                    # WRONG-SLOT AUDIT (2026-08-04, the Silph Tackle theater): an HP change
+                    # proves A turn ran — NOT that the CHOSEN move ran. When the cursor
+                    # desynced, Tackle fired, HP moved, this branch said 'done', and the
+                    # wrong-fire stayed INVISIBLE for a whole fight. Compare the PP vector:
+                    # a different slot consumed while the chosen one didn't = the confirm
+                    # landed elsewhere. The force-write above should make this extinct;
+                    # if it still fires, it's LOUD evidence (never a silent pass again).
+                    try:
+                        if _dblb is not None:      # [dbl] audit the COMMITTING battler's PP
+                            _ppv = [self.b.rd8(st.GBATTLE_MONS + _dblb * st.MON_SIZE
+                                               + st.F_PP + j) for j in range(4)]
+                        else:
+                            _ppv = [int((m or {}).get("pp", 0) or 0)
+                                    for m in (cur["ours"].get("moves") or [])]
+                        _drop = [j for j, (a, c) in enumerate(zip(_pp_all0, _ppv)) if c < a]
+                        if _drop and idx not in _drop:
+                            self._wrong_fires = getattr(self, "_wrong_fires", 0) + 1
+                            self.log(f"   [engine] !! WRONG SLOT FIRED: chose {idx} but slot "
+                                     f"{_drop[0]} was consumed (cursor desync survived the "
+                                     f"force-write; wrong-fires {self._wrong_fires}) — LOUD")
+                    except Exception:
+                        pass
                     result = "done"; break
                 stable = stable + 1 if hp == last_hp else 0
                 last_hp = hp
-                if self._white_box() and stable >= 30:   # settled back at the menu, nothing happened
-                    break                                 # = the move never fired (Disabled/blocked)
+                # Back at ACTION menu (menu_up==1) with no change = turn didn't leave.
+                if self._at_action_menu() and stable >= 20:
+                    break
+                # Parked back at the MOVE LIST with no change = the game REFUSED the pick
+                # ("no PP left" bounce). Don't burn the whole 600-frame budget per refusal —
+                # that made the (working) exile->famine->switch ladder take minutes on stream
+                # (2026-08-03 08:56: "the exact same loop"). Bail fast; the failure branch
+                # counts the refusal.
+                if self._at_move_list() and stable >= 30:
+                    break
+            # Advance text without B while white (B flees / closes menus).
+            if not self._white_box():
+                self.b.press("A", 2, 8, self.render, owner=self.owner)
             self.b.run_frame(); self.render()
         if result == "done":
-            self._skip_streak.clear()                  # a move FIRED -> whole moveset eligible again
-            #                                            (resets the streak; never permanently benches)
-            self._immob_streak = 0                     # a resolved turn breaks any paralysis-spin count
+            self._skip_streak.clear()
+            self._immob_streak = 0
         else:
-            # 2026-07-06 THE BUTTERFREE SLEEP WEDGE: if OUR mon is ASLEEP/FROZEN/paralysis-skipped, the
-            # turn RESOLVED — we just didn't act (no PP drop, and a Sleep-Powder/Harden foe changes no
-            # HP either). Counting that as "didn't fire" benched every move, aborted the unfleeable
-            # trainer battle, and travel re-entered it forever (Route 6, Butterfree 54/54 ×∞). An
-            # immobilized turn is a REAL turn: report it resolved, keep the moveset eligible, and let
-            # the fight continue — she wakes in 1-4 turns and Peck ends it.
             try:
                 cur = st.read_battle(self.b)
                 st1 = (cur or {}).get("ours", {}).get("status1", 0)
             except Exception:
                 st1 = 0
-            # IMMOBILIZATION vs a MASKED FAILURE (2026-07-10, night shift 8 — the S.S. Anne Gary
-            # paralysis LIVELOCK): a set status bit does NOT prove THIS turn failed BECAUSE of it.
-            # Paralysis (0x40) immobilizes only ~25% of turns, so a move that never fires while merely
-            # paralysis-FLAGGED is really failing for another reason — almost always 0-PP (a PP-famine
-            # move masked by the bit). VERIFIED: 183 turns of "fully paralyzed" vs a full-HP Kadabra
-            # with 0 damage was a 0-PP Tackle spinning forever, because the paralysis branch swallowed
-            # the 0-PP rotation. TWO GUARDS: (a) if the chosen move had 0 PP it CANNOT have fired
-            # regardless of status -> it's a 0-PP non-fire, rotate; (b) cap CONSECUTIVE paralysis
-            # attributions — >6 in a row is statistically impossible for real 25% paralysis, so stop
-            # trusting the bit and rotate/flee. Sleep(0x07)/freeze(0x20) legitimately immobilize many
-            # turns in a row, so they keep the old trust-indefinitely behaviour (guard (a) still applies).
-            _slp_frz = st1 & 0x27                      # sleep | freeze — legitimately multi-turn
-            _par = st1 & 0x40                          # paralysis — at most ~25%/turn
+            _slp_frz = st1 & 0x27
+            _par = st1 & 0x40
             _ims = getattr(self, "_immob_streak", 0)
-            _real_immob = pp0 > 0 and (_slp_frz or (_par and _ims < 6))
+            # PARALYSIS MASK (2026-08-03 08:50 live — "paralyzed + no PP + won't swap"): a MENU
+            # REFUSAL ("There's no PP left...") bounces straight back to the MOVE LIST — the turn
+            # never ran, the foe never acted. A real immobilization RUNS the turn (animations,
+            # foe attacks) and never parks us back on the move list. The old classifier called
+            # every non-fire on a paralyzed mon "immobilization" for 6 laps, so NO refusal was
+            # counted, NO exile, NO famine switch — 70+ seconds of dead-move spam while the
+            # rescue sat armed. Back-at-the-move-list = refusal, whatever the status byte says.
+            _at_list = self._at_move_list()
+            # BOUNDED for ALL statuses (09:04 photos: the 08:54 session STILL emitted 'fully
+            # paralyzed' repeats — the at-list probe can miss while the refusal box is up, and
+            # sleep/freeze had NO cap, so a lying status byte could eat laps forever). Six
+            # zero-change "immobilizations" in a row is not a thing a real battle produces;
+            # past that every non-fire counts as a refusal and feeds the futility breaker.
+            _real_immob = pp0 > 0 and not _at_list and (_slp_frz or _par) and _ims < 6
             if _real_immob:
                 self._immob_streak = _ims + 1
+                # An "immobilization" here means the 600-frame verify saw ZERO change (a real
+                # full-para turn almost always moves HP — the foe attacks). It's evidence-free
+                # stillness, so it ALSO feeds the futility breaker (soak 091711: WP/Bite immob
+                # emits interleaved with refusal laps for minutes — the breaker must converge
+                # on total dead laps, not on how each lap got classified).
+                self._amove_futile = getattr(self, "_amove_futile", 0) + 1
                 why = "asleep" if st1 & 0x07 else ("frozen" if st1 & 0x20 else "fully paralyzed")
                 self.log(f"   [engine] turn resolved by IMMOBILIZATION ({why}) — not a dead move; "
-                         f"fighting on (she'll come around)")
+                         f"fighting on (futility {self._amove_futile}/{FUTILE_AMOVE_MAX})")
                 self.emit(f"no — {desc} didn't happen, I'm {why}! hang in there…", beat=True, tier=1)
                 return "done"
-            self._immob_streak = 0                     # not (or no longer) a trusted immobilization
-            # didn't fire (no PP drop, no HP change) = 0-PP / Disabled / couldn't act: add to the streak
-            # so the NEXT pick rotates to a move she hasn't tried — and once all are tried, she flees
-            # rather than re-spamming. The streak is per-no-progress-run, cleared on any successful fire.
+            # DO NOT reset _immob_streak here (2026-08-03 11:24 forensics): refusal laps and
+            # immob laps INTERLEAVE (WP-immob, Bite-refusal, WP-immob...), and the old reset
+            # re-armed the immob classifier every time a refusal lap landed between — the 6-lap
+            # cap never engaged and 'fully paralyzed' theater ran for minutes. The streak only
+            # resets when a move REALLY fires (the result=='done' branch above).
             self._skip_streak.add(idx)
-            self.log(f"   [engine] move slot {idx} didn't fire (0-PP / disabled / blocked) -> rotating "
-                     f"to an untried move (streak now {sorted(self._skip_streak)})")
-        return result or "stuck"
+            self._move_refused[_pressed] = self._move_refused.get(_pressed, 0) + 1
+            self._amove_futile = getattr(self, "_amove_futile", 0) + 1
+            self.log(f"   [engine] move slot {_pressed} didn't fire (0-PP / disabled / blocked) -> "
+                     f"rotating to an untried move (streak now {sorted(self._skip_streak)}, "
+                     f"refusals {self._move_refused}, futility {self._amove_futile}/{FUTILE_AMOVE_MAX})")
+            # Always 'done' to the outer loop — never 'stuck' (stuck re-settles and re-probes).
+            return "done"
+        return result or "done"
 
     def _advance_text(self, force_b=False):
         """Advance battle dialogue/animation SAFELY. Diagnosed 2026-06-23: (a) mashing A
@@ -1896,76 +4249,224 @@ class BattleAgent:
             cur = 0
         return cur == target
 
+    def _party_blind_goto(self, target):
+        """Best-effort party-list walk without trusting pixel/RAM cursors: LEFT homes the lead
+        panel, RIGHT enters the right column, DOWN*(target-1) lands the row. Used when orange-
+        border readback can't see the selection (half-dead benches, fade frames)."""
+        self._tap("LEFT"); self._wait(12)
+        if target == 0:
+            return True
+        self._tap("RIGHT"); self._wait(12)
+        for _ in range(max(0, int(target) - 1)):
+            self._tap("DOWN"); self._wait(12)
+        return True
+
     def _force_switch(self):
         """Lead fainted with a healthy reserve -> the 'Choose a POKéMON' party menu is up.
-        Walk the cursor CLOSED-LOOP (border readback) to the first healthy slot and confirm
-        SEND OUT (the select submenu defaults to SEND OUT). Returns True once a healthy mon
-        is active. Last-resort attempts fall back to the legacy blind DOWN*slot walk (covers
-        a palette/geometry miss on the readback — it logs which path ran)."""
+        Walk to a HEALTHY row and confirm SEND OUT. CRITICAL (2026-08-02 gym chalk): never press
+        the confirm-A unless the SEND OUT submenu is actually open — A on a corpse just loops
+        "X has no energy left to battle!" for 60–180s while 1–2 bench mons are still alive.
+        Returns True once a healthy mon is active.
+
+        2026-08-02 docks chalk: pixel submenu false-negatives + 10 retries still looked like a
+        60–90s party scroll. Hard wall-clock budget; on expiry do ONE blind send of the strongest
+        live row (LEFT/RIGHT/DOWN*n, A, A) and return."""
         if self._healthy_reserve_slot() is None:
             return False
-        _tried = set()                                    # SPECIES that failed 2x -> rotate past them
-        _fails = {}                                       # (species-keyed: display rows move between
-        #                                                    menu opens, species identity doesn't)
-        for _attempt in range(8):
+        # Only legal opener of the POKEMON menu this battle (voluntary paths are banned).
+        self._allow_pokemon_menu = True
+        _skip_rows = set()                                # rows that refused SEND OUT this menu
+        _tried_sp = set()                                 # species that got submenu but didn't swap
+        # [dbl] the LIVE partner is already on the field — picking its row gets "X is already
+        # in battle!" forever. Pre-seed it as tried so the candidate filter skips it.
+        if self._is_double():
+            try:
+                absent = self.b.rd8(ram.GABSENT_BATTLER_FLAGS)
+                for _b in (0, 2):
+                    if absent & (1 << _b):
+                        continue
+                    _base = st.GBATTLE_MONS + _b * st.MON_SIZE
+                    _sp = self.b.rd16(_base + st.F_SPECIES)
+                    if 1 <= _sp <= 411 and self.b.rd16(_base + st.F_HP) > 0:
+                        _tried_sp.add(_sp)
+                        self.log(f"   [dbl] fswitch: {st.SPECIES_NAME.get(_sp, _sp)} is already "
+                                 f"on the field (battler {_b}) — excluded from send-in")
+            except Exception:
+                pass
+        _t0 = time.time()
+        try:
+            return self._force_switch_inner(_skip_rows, _tried_sp, _t0)
+        finally:
+            self._allow_pokemon_menu = False
+
+    def _force_switch_inner(self, _skip_rows, _tried_sp, _t0):
+        for _attempt in range(10):
+            if time.time() - _t0 >= FSWITCH_BUDGET_S:
+                self.log(f"   [engine] fswitch: BUDGET {FSWITCH_BUDGET_S:.0f}s hit — "
+                         f"blind-sending strongest live (anti 60–90s party theater)")
+                break
             cur = st.read_battle(self.b)
-            if cur and cur["ours"]["hp"] > 0:
+            # [dbl] "ours" reads the LIVE partner in a double (always hp>0 while one stands) —
+            # seated truth is BOTH player slots standing again (_dbl_our_down clears).
+            if cur and cur["ours"]["hp"] > 0 and not (self._is_double()
+                                                      and self._dbl_our_down()):
+                self._note_battle_progress("force-switch seated")
                 return True                               # a healthy mon is active -> switched
-            self._wait(18)                                # let the party menu settle
+            self._wait(10)                                # let the party menu settle
             if not self._party_screen():
                 self._advance_text()                      # faint text still playing -> drain a beat
                 continue
+            # Sub-menu or "no energy" box still up from a prior miss — B it clear FIRST.
+            if self._party_submenu():
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(14)
             # LIST FOCUS first (sub-menu/message tap-eaters), then resolve the target row by
             # CONTENT at menu time — the order law: row i IS gPlayerParty[i] only while the
             # menu is open; any slot picked before it opened is in a different order.
             if not self._party_focus():
                 self.log("   [engine] fswitch: party list never regained focus -> retry")
-                self._debug_snap(f"fswitch_nofocus{_attempt}")
+                # Don't burn the whole budget on focus — blind-B and continue.
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(12)
                 continue
             rows = self._menu_rows()
-            live = [r for r in rows if r["row"] > 0 and r["hp"] > 0
-                    and r["species"] not in _tried]
-            if not live:
-                _tried.clear()
-                live = [r for r in rows if r["row"] > 0 and r["hp"] > 0]
-                if not live:
+            live = [r for r in rows if r["hp"] > 0 and r["row"] not in _skip_rows
+                    and r["species"] not in _tried_sp]
+            # Prefer the right-column bench (row>0); allow row 0 only if it's the sole survivor.
+            bench = [r for r in live if r["row"] > 0]
+            cands = bench if bench else live
+            if not cands:
+                _skip_rows.clear()
+                _tried_sp.clear()
+                cands = [r for r in rows if r["hp"] > 0 and r["row"] > 0] or \
+                        [r for r in rows if r["hp"] > 0]
+                if not cands:
                     return False                          # nothing standing on the bench
-            tgt = max(live, key=lambda r: r["level"])     # send the strongest thing standing
-            if _attempt >= 1:                             # retry forensics
+            tgt = max(cands, key=lambda r: r["level"])     # send the strongest thing standing
+            # Prefer RAM party cursor match over pixel border when available.
+            _ram_cur = self.b.rd8(PARTY_CURSOR)
+            if _attempt >= 1:
                 self.log(f"   [engine] fswitch retry {_attempt}: target row {tgt['row']} "
-                         f"sp={tgt['species']} menu_rows="
+                         f"sp={tgt['species']} skip_rows={sorted(_skip_rows)} "
+                         f"party_cur={_ram_cur} menu_rows="
                          f"{[(r['species'], r['hp']) for r in rows]}")
-                self._debug_snap(f"fswitch_retry{_attempt}")
-            _fails[tgt["species"]] = _fails.get(tgt["species"], 0) + 1
-            if _fails[tgt["species"]] > 2:
-                _tried.add(tgt["species"])
-            if not self._party_goto_slot(tgt["row"]):
-                self.log(f"   [engine] fswitch: cursor readback couldn't reach row {tgt['row']} "
-                         f"(cursor={self._party_cursor_slot()}) -> retry")
+            reached = self._party_goto_slot(tgt["row"])
+            if not reached and self.b.rd8(PARTY_CURSOR) != tgt["row"]:
+                self.log(f"   [engine] fswitch: border goto missed row {tgt['row']} "
+                         f"(cursor={self._party_cursor_slot()} ram={self.b.rd8(PARTY_CURSOR)}) "
+                         f"-> blind walk")
+                self._party_blind_goto(tgt["row"])
+            # Re-check content at the row we're about to A — never knowingly pick a corpse.
+            rows = self._menu_rows()
+            if tgt["row"] >= len(rows) or rows[tgt["row"]]["hp"] <= 0:
+                self.log(f"   [engine] fswitch: row {tgt['row']} is dead at confirm — skip")
+                _skip_rows.add(tgt["row"])
                 continue
-            self.log(f"   [engine] fswitch: cursor confirmed on row {tgt['row']} "
-                     f"(sp={tgt['species']}, menu-time content)")
+            self.log(f"   [engine] fswitch: selecting row {tgt['row']} "
+                     f"(sp={tgt['species']} L{tgt['level']} hp={rows[tgt['row']]['hp']})")
             self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)  # select mon
-            for _ in range(8):                            # WAIT for the sub-menu to draw — an early
-                if self._party_submenu():                 # 2nd A used to land back on the LIST and
-                    break                                 # leave the sub-menu dangling (run14 churn)
-                self._wait(8)
-            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)  # -> SEND OUT
-            self._wait(20)
-            cur = st.read_battle(self.b)
-            if cur and cur["ours"]["hp"] > 0:
-                return True
-            self._advance_text()                          # send-out text -> drain a beat, re-check
+            submenu = False
+            for _ in range(12):                           # WAIT for the SEND OUT sub-menu
+                if self._party_submenu():
+                    submenu = True
+                    break
+                # RAM-cursor path: if we selected a live row and party cursor stuck on it,
+                # a second A often IS Send Out even when pixels miss the submenu.
+                self._wait(6)
+            if not submenu:
+                # Live-row second chance: one confirm-A if RAM cursor still on the live target
+                # (pixel submenu false-negative). Corpse rows stay skipped (hp check above).
+                if self.b.rd8(PARTY_CURSOR) == tgt["row"] and rows[tgt["row"]]["hp"] > 0:
+                    self.log(f"   [engine] fswitch: no pixel submenu but RAM cursor on live "
+                             f"row {tgt['row']} — one SEND OUT confirm-A")
+                    self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+                    self._wait(16)
+                    for _ in range(14):
+                        cur = st.read_battle(self.b)
+                        if cur and cur["ours"]["hp"] > 0:
+                            self._note_battle_progress("force-switch seated (ram confirm)")
+                            return True
+                        self._advance_text()
+                        self._wait(6)
+                # CORPSE / cursor-miss: "has no energy left" — do NOT keep confirm-A (that was the
+                # 60–180s loop). Skip this row, B-dismiss the message, try the next alive mon.
+                self.log(f"   [engine] fswitch: no SEND OUT submenu after A on row {tgt['row']} "
+                         f"sp={tgt['species']} — corpse/miss, skipping (NOT confirm-A)")
+                _skip_rows.add(tgt["row"])
+                for _ in range(5):
+                    if self._party_submenu():
+                        self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                        self._wait(12)
+                        break
+                    if not self._party_screen():
+                        break
+                    self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                    self._wait(12)
+                continue
+            # Submenu is up — confirm SEND OUT (default top row).
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(16)
+            for _ in range(14):
+                cur = st.read_battle(self.b)
+                if cur and cur["ours"]["hp"] > 0:
+                    self._note_battle_progress("force-switch seated")
+                    return True
+                self._advance_text()
+                self._wait(6)
+            # Submenu confirmed but swap didn't take — don't hammer the same species forever.
+            _tried_sp.add(tgt["species"])
+            self.log(f"   [engine] fswitch: SEND OUT on sp={tgt['species']} didn't seat a "
+                     f"healthy active -> rotate")
+        # BUDGET / attempt exhaust — ONE blind send of strongest live (stream must move).
+        try:
+            if self._party_screen():
+                rows = self._menu_rows()
+                live = [r for r in rows if r["hp"] > 0 and r["row"] > 0] or \
+                       [r for r in rows if r["hp"] > 0]
+                if live:
+                    tgt = max(live, key=lambda r: r["level"])
+                    self.log(f"   [engine] fswitch BLIND: row {tgt['row']} "
+                             f"{st.SPECIES_NAME.get(tgt['species'], '?')} L{tgt['level']}")
+                    self._party_blind_goto(tgt["row"])
+                    self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+                    self._wait(14)
+                    self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+                    self._wait(20)
+                    for _ in range(20):
+                        cur = st.read_battle(self.b)
+                        if cur and cur["ours"]["hp"] > 0:
+                            self._note_battle_progress("force-switch seated (blind)")
+                            return True
+                        self._advance_text()
+                        self._wait(6)
+        except Exception as e:
+            self.log(f"   [engine] fswitch blind path error: {e}")
         cur = st.read_battle(self.b)
         return bool(cur and cur["ours"]["hp"] > 0)
 
     # ── B-1: TYPE-MATCHUP AWARENESS + VOLUNTARY SWITCH (the E4-critical verb) ────
     def _goto_pokemon(self, tries=10):
-        """Walk the action cursor to POKEMON (bottom-left, ACT_POKEMON=2). Mirror of _goto_run; grid is
-        FIGHT(0,TL) BAG(1,TR) / POKEMON(2,BL) RUN(3,BR). Returns True only when confirmed on POKEMON."""
+        """Park the action cursor on POKEMON (ACT_POKEMON=2). Prefer RAM write over d-pad —
+        DOWN from FIGHT on this core can confirm Fight and open the move list, which looks
+        exactly like 'she's trying to switch but keeps checking attacks' (stream-end docks).
+
+        2026-08-03 NUCLEAR: refused unless BATTLE_SWITCH is armed OR `_allow_pokemon_menu`
+        (force-switch path). Default env is OFF — that was the Pokemon→Blastoise thrash."""
+        if not BATTLE_SWITCH_ENABLED and not getattr(self, "_allow_pokemon_menu", False):
+            self.log("   [engine] POKEMON menu BANNED (POKEMON_BATTLE_SWITCH=0 — "
+                     "anti Blastoise thrash). Faint→force-switch still works.")
+            return False
         for _ in range(tries):
+            if self._at_move_list():
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(12)
+                continue
+            if not self._at_action_menu():
+                return False
             c = self.b.rd8(ram.GBATTLE_ACTION_CURSOR)
             if c == ram.ACT_POKEMON:
+                return True
+            if self._poke_action_cursor(ram.ACT_POKEMON):
                 return True
             if c == ram.ACT_FIGHT:
                 self._tap("DOWN")
@@ -1974,9 +4475,13 @@ class BattleAgent:
             elif c == ram.ACT_RUN:
                 self._tap("LEFT")
             else:
-                return False                              # not the action menu
+                return False
             self._wait(3)
-        return self.b.rd8(ram.GBATTLE_ACTION_CURSOR) == ram.ACT_POKEMON
+            if self._at_move_list():
+                self.log("   [engine] _goto_pokemon: d-pad confirmed FIGHT — B out, retry write")
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(12)
+        return self._at_action_menu() and self.b.rd8(ram.GBATTLE_ACTION_CURSOR) == ram.ACT_POKEMON
 
     @staticmethod
     def _matchup_def(my_types, enemy_types):
@@ -2016,7 +4521,12 @@ class BattleAgent:
         _dmg = [_eff(m, state.get("enemy") or {})
                 for m in (state.get("ours", {}).get("moves") or [])
                 if m.get("id", 0) and m.get("pp", 0) > 0 and m.get("power", 0) > 0]
-        best_move_eff = max(_dmg) if _dmg else 1.0
+        # EMPTY DAMAGING SET = CAN'T HIT AT ALL (2026-07-31, the Teleport-only Abra hole): the old
+        # `else 1.0` scored a moveless mon as NEUTRAL, so the matchup trigger never saw a reason to
+        # pull it — it sat active failing its status move forever. 0.0 reads as the hardest possible
+        # resist, so trigger 1 fields a reserve that can actually fight (famine usually fires first;
+        # this is the backstop when it's spent).
+        best_move_eff = max(_dmg) if _dmg else 0.0
         # NEVER ABANDON A SUPER-EFFECTIVE ATTACKER (ns14 anti-churn): if the active mon's best
         # damaging move is >=2x, it's winning the exchange — pulling it out for a defensive matchup
         # just churns. The infinite loop this kills: Kadabra's Psybeam is 2x into Agatha's Poison
@@ -2151,8 +4661,13 @@ class BattleAgent:
         on the wrong mon after any earlier switch). A = select -> sub-menu (cursor defaults to SHIFT),
         A = SHIFT -> the swap; then PURE-A advance the "Come back X! / Go Y!" text until the active
         SPECIES flips to the TARGET (the ground-truth success signal)."""
+        # NUCLEAR: voluntary POKEMON off unless operator armed BATTLE_SWITCH (or force-switch allow).
+        if not BATTLE_SWITCH_ENABLED and not getattr(self, "_allow_pokemon_menu", False):
+            return False
         want_sp = st.read_party_species(self.b, slot)             # identity survives the reorder
         if not want_sp or want_sp == before_sp:
+            self.log(f"   [engine] switch: refused — want_sp={want_sp} is already active "
+                     f"(before={before_sp}); never 'switch Blastoise for Blastoise'")
             return False
         if not self._settle_action_menu():
             self.log("   [engine] switch: couldn't reach a clean action menu")
@@ -2167,14 +4682,39 @@ class BattleAgent:
                 break
             self._wait(8)
         if not self._party_screen() or not self._party_focus():
+            # BLIND POKEMON FALLBACK (2026-08-03 12:07: frozen-RAM battles — _goto_pokemon
+            # "verified" against a dead cursor byte, A opened the MOVE LIST instead, and
+            # every switch path died here). B back to the action menu, then DOWN,DOWN + A:
+            # DOWN is NOT in the confirm-hazard set (only UP/LEFT/RIGHT confirm FIGHT on
+            # this core) and the 2x2 grid clamps, so from the FIGHT home this deterministically
+            # lands POKEMON. Worst case (cursor was in the right column) it lands RUN and the
+            # game answers "Can't escape!" — drained below, harmless. _party_screen() is
+            # pixel truth, so the success check works even when every RAM byte lies.
+            self.log("   [engine] switch: party didn't open via RAM nav — BLIND fallback "
+                     "(B out, DOWN DOWN A)")
+            for _ in range(3):
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(12)
+            for d in ("DOWN", "DOWN"):
+                self._tap(d); self._wait(8)
+            self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)
+            self._wait(30)
+            for _ in range(8):
+                if self._party_screen():
+                    break
+                self._wait(8)
+        if not self._party_screen() or not self._party_focus():
             self.log("   [engine] switch: party screen never took focus -> B out (fail-safe)")
             self._exit_bag()
             return False
+        # NEVER row 0 — after rearrange that panel IS the mon already out. Picking it is the
+        # 'switch him out for himself' loop Jonny described (alive but can't fight).
         row = next((r["row"] for r in self._menu_rows()
-                    if r["species"] == want_sp and r["hp"] > 0), None)
+                    if r["species"] == want_sp and r["hp"] > 0 and r["row"] != 0), None)
         self.log(f"   [engine] switch: target party slot {slot} sp={want_sp} -> menu row {row}")
-        if row is None or row == 0 or not self._party_goto_slot(row):
-            self.log("   [engine] switch: target row unreachable -> B out (fail-safe)")
+        if row is None or not self._party_goto_slot(row):
+            self.log("   [engine] switch: target row unreachable (or only on active panel) "
+                     "-> B out (fail-safe)")
             for _ in range(4):
                 self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
                 self._wait(12)
@@ -2182,10 +4722,21 @@ class BattleAgent:
                     break
             return False
         self.b.press("A", self.hold, self.hold, self.render, owner=self.owner)   # select -> sub-menu
-        for _ in range(8):
+        submenu = False
+        for _ in range(12):
             if self._party_submenu():
+                submenu = True
                 break
-            self._wait(8)
+            self._wait(6)
+        if not submenu:
+            # Same corpse-loop class as _force_switch: A without SEND OUT/SHIFT just eats time.
+            self.log("   [engine] switch: no SHIFT submenu after select -> B out (fail-safe)")
+            for _ in range(4):
+                self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                self._wait(12)
+                if self._white_box() and not self._party_screen():
+                    break
+            return False
         self.b.press("A", self.hold, self.hold, self.render, owner=self.owner); self._wait(18)  # confirm SHIFT
         for _adv in range(16):                                    # advance swap text until the SPECIES flips
             cur = st.read_battle(self.b)
@@ -2258,16 +4809,57 @@ class BattleAgent:
 
     def _voluntary_switch(self, state):
         """Mid-battle switch to a better-matchup reserve. GATED + FAIL-SAFE. Returns 'switched' or False."""
+        # FAIL LATCH (2026-08-02 LIVE): ONE failed party-menu attempt = stop. Party-list DOWN
+        # probes look like "scrolling forever" on stream; two tries was still unwatchable.
+        if getattr(self, "_switch_fail_n", 0) >= 1:
+            return False
+        # LEVEL-DOMINANCE (stream): Blastoise L48 vs Route-12 trash must NOT open POKEMON to
+        # "optimize" — just Surf. Crushing lead = fight, no menu theater.
+        try:
+            _al = (state.get("ours") or {}).get("level") or 0
+            _fl = (state.get("enemy") or {}).get("level") or 0
+            if _al and _fl and _al >= _fl + 8 and _hp_frac(state.get("ours") or {}) > 0.35:
+                return False
+        except Exception:
+            pass
         slot = self._best_switch_slot(state)
         if slot is None:
             return False
         self.log(f"   [engine] MATCHUP SWITCH: active is out-typed -> trying party slot {slot}")
         r = self._switch_to_slot(slot, state.get("ours", {}).get("species"))
         if r == "switched":
-            self.emit("switching it up — this is a better matchup", beat=True, tier=2)
+            self._switch_fail_n = 0
+            # SAY THE TYPE MATH (2026-07-31, Jonny: "she needs to know what's good vs what — and
+            # SAY it"): name who's coming in and WHY in type-chart terms, from the same reads the
+            # scorer used — so the stream hears "Spearow eats bugs for breakfast", not a vague
+            # "better matchup". Fail-safe: any read hiccup falls back to the plain line.
+            try:
+                _in_nm = st.SPECIES_NAME.get(st.read_party_species(self.b, slot), "my pick")
+                _foe = state.get("enemy") or {}
+                _foe_ty = "/".join(t for t in (_foe.get("types") or []) if t) or "mystery"
+                _re = 0.0
+                for _mid in st.read_party_moves(self.b, slot):
+                    if _mid:
+                        _mt, _mp = st.move_info(self.b, _mid)
+                        if _mp and _mp > 0:
+                            _re = max(_re, _eff({"type": _mt or "normal"}, _foe))
+                if _re >= 4.0:
+                    _ln = (f"{_in_nm}, you're up — that's a {_foe_ty} type and you hit it "
+                           f"DOUBLE super-effective. this is just bullying.")
+                elif _re >= 2.0:
+                    _ln = (f"{_in_nm} eats {_foe_ty} types for breakfast — super-effective, "
+                           f"switching in. the type chart never lies.")
+                else:
+                    _ln = (f"{_in_nm} takes this one — the {_foe_ty} typing is chewing through "
+                           f"who I had out there.")
+                self.emit(_ln, beat=True, tier=2)
+            except Exception:
+                self.emit("switching it up — this is a better matchup", beat=True, tier=2)
             self._skip_streak.clear()
             return "switched"
-        self.log("   [engine] matchup switch did not confirm -> fighting instead (fail-safe, no wedge)")
+        self._switch_fail_n = getattr(self, "_switch_fail_n", 0) + 1
+        self.log(f"   [engine] matchup switch did not confirm "
+                 f"(fail {self._switch_fail_n}/1) -> fighting instead (fail-safe, no wedge)")
         return False
 
     def _active_pp_famine(self, state):
@@ -2277,10 +4869,78 @@ class BattleAgent:
         move (e4_run7 Agatha: Venusaur with only Normal-type PP vs Gengar burned ~10
         war-must-advance turns + 2 Full Restores while Persian's Bite sat on the bench —
         immune-only PP is famine vs THIS foe, and the famine switch is the only winning line).
-        Unknown foe types count as connecting (never over-trigger)."""
+        Unknown foe types count as connecting (never over-trigger).
+        2026-08-03: a slot the GAME refused >=2 times counts as DRY whatever its (tear-prone)
+        PP byte says — that's what lets the famine switch rescue the stale-PP Tackle loop."""
         mv = (state.get("ours") or {}).get("moves") or []
         return not any(m.get("id") and m.get("pp", 0) > 0 and m.get("power", 0) > 0
-                       and self._move_connects(m, state) for m in mv)
+                       and getattr(self, "_move_refused", {}).get(i, 0) < 2
+                       and self._move_connects(m, state) for i, m in enumerate(mv))
+
+    def _crushing_lead(self, state):
+        """True when the active massively out-levels the foe and still has a connecting attack.
+        2026-08-03 Voltorb chalk: L48 Blastoise vs Electric fodder does NOT need matchup-switch,
+        potion-bag theater, or must-leave — JUST FIGHT. Hierarchy gate for the whole turn loop."""
+        ours = state.get("ours") or {}
+        enemy = state.get("enemy") or {}
+        # A crushing level lead means nothing when the move list eats every confirm — the 11:43
+        # loop: L49 vs L25 kept _just_fight True (stale PP said Bite/WP usable), which skipped
+        # the must-leave/famine hierarchy forever. Futility overrides chalk.
+        if getattr(self, "_amove_futile", 0) >= FUTILE_AMOVE_MAX:
+            return False
+        act_lv = ours.get("level") or 0
+        foe_lv = enemy.get("level") or 0
+        if not (act_lv and foe_lv and act_lv >= foe_lv + 8):
+            return False
+        mv = ours.get("moves") or []
+        return any(m.get("id") and m.get("pp", 0) > 0 and m.get("power", 0) > 0
+                   and getattr(self, "_move_refused", {}).get(i, 0) < 2
+                   and self._move_connects(m, state) for i, m in enumerate(mv))
+
+    def _must_leave_active(self, state):
+        """Alive but shouldn't stay in — sleep/freeze lock, or true PP famine (no connecting damage).
+
+        2026-08-03 FIX: do NOT treat skip_streak exhaustion as must-leave. Menu thrash marks every
+        move 'failed to fire' without spending PP → skip_streak full → we opened the party and
+        looked like 'switching Blastoise for no reason' vs Voltorb with no status. Skip-streak
+        belongs to war-must-advance / Struggle, not a voluntary switch."""
+        ours = state.get("ours") or {}
+        if (ours.get("hp") or 0) <= 0:
+            return False
+        # Crushing lead: stay in and swing (unless hard-locked by sleep/freeze).
+        status = _decode_status(ours.get("status1", 0) or 0)
+        if status in ("sleep", "freeze"):
+            return True
+        # FUTILITY (2026-08-03 09:07): the move list has eaten FUTILE_AMOVE_MAX confirms with zero
+        # progress — whatever the per-slot ledger/PP bytes claim, staying in cannot win. This is the
+        # turn-loop's route to the same bench switch the war paths reach via the futility breaker.
+        if getattr(self, "_amove_futile", 0) >= FUTILE_AMOVE_MAX:
+            return True
+        if self._crushing_lead(state):
+            return False
+        if self._active_pp_famine(state):
+            return True
+        return False
+
+    def _alive_bench_slot(self, state):
+        """Strongest HP>0 party member that is NOT the active species. Never returns the mon
+        already out — that was the 'switch him for himself' failure mode."""
+        active_sp = (state.get("ours") or {}).get("species")
+        cnt = self.b.rd8(ram.GPLAYER_PARTY_CNT)
+        best, best_lv = None, -1
+        for s in range(min(cnt, 6)):
+            if self.b.rd16(ram.GPLAYER_PARTY + s * 100 + 0x56) <= 0:
+                continue
+            try:
+                sp = st.read_party_species(self.b, s)
+            except Exception:
+                continue
+            if not sp or sp == active_sp:
+                continue
+            lv = self.b.rd8(ram.GPLAYER_PARTY + s * 100 + 0x54)
+            if lv > best_lv:
+                best, best_lv = s, lv
+        return best
 
     def _move_connects(self, m, state):
         """Can this move DAMAGE the current foe at all? (_eff = type chart + the ability layer;
@@ -2337,7 +4997,15 @@ class BattleAgent:
         self-correcting: a wild within the margin still gets the ace-protect switch. Byte-inert (False) OFF."""
         if not SOLO_OVERLEVEL_GRIND or state is None:
             return False
-        our_lv = (state.get("ours") or {}).get("level") or 0
+        ours = state.get("ours") or {}
+        # MOVELESS GUARD (2026-07-31, the Abra shotgun-seat): a lead with zero damaging PP can
+        # never solo ANYTHING regardless of the level gap (Teleport one-shots nothing) — dropping
+        # the ace switch for it would strand it spamming a failing move. The whole point of
+        # fielding a moveless mon is the participation switch; never suppress it.
+        if not any(m.get("id") and m.get("pp", 0) > 0 and m.get("power", 0) > 0
+                   for m in (ours.get("moves") or [])):
+            return False
+        our_lv = ours.get("level") or 0
         foe_lv = (state.get("enemy") or {}).get("level") or 0
         return bool(our_lv and foe_lv and our_lv >= foe_lv + SOLO_OVERLEVEL_MARGIN)
 
@@ -2444,10 +5112,23 @@ class BattleAgent:
         self._grind_switched = False       # GRIND SWITCH: protect-lead switch fires at most once per battle
         self._status_played = False        # STATUS STRATEGY: one status move per foe (reset per foe below)
         self._sleep_casts = 0              # SLEEP-LOCK whiff cap, reset per foe
-        self._famine_tried = set()         # PP-FAMINE SWITCH: active species already offered a famine
-        # switch this battle (one shot per species — a forced re-entry retries once, never churns).
+        self._famine_tried = {}            # PP-FAMINE SWITCH: species -> attempts this battle (bounded
+        # by FAMINE_SWITCH_TRIES; a try only counts when the nav actually ran — never an infinite churn,
+        # but one flaky menu nav no longer dooms a moveless mon to spam its failing move all battle).
         self._heal_failed = set()          # HEAL-CONSUME-FAILED LATCH: active species whose in-battle
         # item use PROVED it won't consume this battle (bag USE/CANCEL non-consume) -> stop re-offering.
+        self._potion_blocked = False       # 2026-08-02 LIVE: Super Potion on FULL ace forever —
+        # any no_effect/failed heal this battle kills ALL further potion offers (not just one species).
+        self._cure_blocked = False         # same class: Awakening spam after already awake (stream end)
+        self._throw_bag_aborts = 0         # CATCH-ABORT LATCH (2026-08-05, the Magmar wedge):
+        # consecutive throw_ball aborts; a real throw resets, CATCH_ABORT_MAX in a row latch below.
+        self._catch_abort = False          # latched -> no more throws this battle; battle-scoped
+        # exactly like the HEAL-FAIL LATCH above (a fresh battle attach clears it here).
+        self._last_battle_progress_t = time.time()  # MENU WEDGE: stall clock, NOT battle-start clock
+        self._menu_wedge_n = 0                     # re-armable, bounded (was a one-shot latch)
+        self._must_leave_tried = {}        # species -> tries: alive-but-stuck voluntary switch
+        self._allow_pokemon_menu = False   # NUCLEAR: only force-switch (faint) may open POKEMON
+        self._party_thrash_n = 0           # consecutive unexpected party-screen sightings
         self._whiff_streak = 0             # WHIFF-SPIRAL: consecutive fired-but-no-damage (missed) turns
         self._whiff_recovering = None      # ace species we switched OUT to reset accuracy (switch back next)
         self._whiff_recoveries = 0         # bounded accuracy-resets this battle (never a switch-loop)
@@ -2459,6 +5140,22 @@ class BattleAgent:
         # all are exhausted. CLEARED on any successful fire -> a working move is never permanently exiled
         # (the PoisonPowder-spam lesson: don't permanently bench a move, just rotate off it this streak).
         # Cleared the instant any move fires.
+        self._move_refused = {}            # 2026-08-03 (the Tackle re-fire loop): slot -> times the GAME
+        # refused it ("There's no PP left..." — no PP drop, no HP change). gBattleMons PP can read STALE
+        # (the same lying struct as the HP/status tears), so a truly-dry move can look usable forever;
+        # skip_streak alone can't hold it because war-must-advance CLEARS the streak when it's the only
+        # candidate. >=2 refusals = EXILED for this battle whatever its PP byte says: dropped from move
+        # picks AND counted as dry by the famine test (so the famine switch — the real rescue — fires).
+        self._amove_futile = 0             # 2026-08-03 09:07 (the parked-on-Tackle photos): count EVERY
+        # fruitless move-list confirm this battle, whoever pressed it (turn loop, struggle-walk, war
+        # paths). The per-slot ledger can be poisoned when the cursor readback and the DRAWN cursor
+        # disagree (nav "succeeds", A fires TACKLE, the refusal is tallied on the slot we INTENDED) —
+        # then Tackle never exiles, famine never trips, and every escape path steers back to the
+        # "least-refused" slot: Tackle, forever, on stream. This counter doesn't care WHICH slot lied:
+        # >= FUTILE_AMOVE_MAX fruitless confirms = the move list itself is a tar pit -> STOP touching
+        # it and bench-switch (party nav is verified by species-flip, not by move RAM). Reset only by
+        # _note_battle_progress (real progress).
+        self._futility_switches = 0        # bounded uses of the futility bench switch per battle
         self._prev = st.read_battle(self.b)
         # 2026-07-06 RE-ENTRY CORPSE GUARD (the Route-6 gauntlet livelock): a previous engagement can
         # abort mid-faint (budget/stuck), and travel re-enters the SAME battle with the foe already at
@@ -2477,9 +5174,17 @@ class BattleAgent:
         state = st.read_battle(self.b) or self._prev
         if state:
             foe = st.SPECIES_NAME.get(state["enemy"]["species"], "a wild pokemon")
-            self.emit(f"a battle started against {foe}", beat=True)
+            _lead = st.SPECIES_NAME.get(state["ours"].get("species"), None)
+            self.emit(f"a battle started against {foe}"
+                      + (f" — your {_lead} is up front" if _lead else ""), beat=True)
             self._prev = state
             self._note_foe(state)
+        if self._is_double():
+            self.log("   [dbl] DOUBLE BATTLE detected (gBattleTypeFlags bit0 + battlers=4) — "
+                     "attack-only policy: both slots pick via move_score, target-select armed, "
+                     "items/voluntary switches PUNTED (forced faint send-ins still on)")
+            self.emit("hold on — this is a DOUBLE battle. two of mine are out there at once.",
+                      beat=True, tier=2)
 
         # ── BIG-MOMENT RECOGNITION (Batch 3 Phase 2D): situational SIGNIFICANCE ───────────────────────
         # SHINY is the most clippable moment the game can produce — treating one as normal is a tragedy.
@@ -2492,27 +5197,87 @@ class BattleAgent:
             self._bigmoment_done = True
             esp = state["enemy"]["species"]
             foe = st.SPECIES_NAME.get(esp, "this Pokémon")
+            _wild = not self._is_trainer_battle()
             if st.enemy_is_shiny(self.b):
                 self.emit(f"WAIT — STOP. that {foe} is SHINY. chat, do you SEE this — you can play this "
                           f"game for five years and never see one. this is real, this is happening.",
                           beat=True, tier=3)
-                if not self._is_trainer_battle():
-                    self.log(f"   [engine] ✨✨ SHINY wild {foe} — diverting to CAREFUL CAPTURE "
-                             f"(weaken+catch, never KO)")
-                    res = self.catch_pokemon(max_seconds=max(150, max_seconds), weaken=True)
-                    # SAFETY: if the catch failed (no balls / broke out / timed out) and the shiny is
-                    # STILL on the field, FLEE rather than fight — never KO a shiny (the tragedy), and
-                    # never leave the battle hanging (a wedge). A clean catch ends the battle -> return.
-                    if res != "caught" and st.in_battle(self.b):
-                        self.emit(f"I couldn't catch it ({res}) — I am NOT killing a shiny, I'm backing "
-                                  f"out. that hurts.", beat=True, tier=3)
-                        self.log(f"   [engine] shiny capture failed ({res}) — fleeing to avoid KOing it")
-                        return self.flee(max_seconds=60)
-                    return res
+                if _wild:
+                    return self._divert_wild_catch("shiny", foe, max_seconds)
                 self.log(f"   [engine] ✨ SHINY trainer {foe} — uncatchable, fighting (freak-out only)")
             elif esp in _LEGENDARY_SPECIES:
                 self.emit(f"that's a {foe}. a LEGENDARY. okay — okay, do NOT mess this up.",
                           beat=True, tier=3)
+                # Wild legendaries (Moltres/Articuno/Zapdos/Mewtwo) are CATCH moments — never KO on sight
+                # (2026-08-02 Jonny: "what if she finds the fire bird and just kills it").
+                if _wild:
+                    self.emit(f"balls out. weaken it carefully — we are NOT knocking out a legendary.",
+                              beat=True, tier=3)
+                    return self._divert_wild_catch("legendary", foe, max_seconds)
+            elif (_wild and self._peek_creator_catch_order()
+                    and not getattr(self, "_skip_catch_divert", False)
+                    and not BALL_RESTOCK_MODE
+                    and not getattr(getattr(self, "camp", None), "_ball_restock_mode", False)):
+                # Creator LAW (2026-08-02 Diglett chalk): "catch that!" must divert THIS battle — the
+                # conversational OK without a harness latch was the kill-loop. One battle only
+                # (_divert clears the latch); never re-ball every Diglett on the walk out.
+                # WAR-CHEST TRUCE (2026-08-06 LIVE): mid-ferry catch_now flees/reserves Ultras
+                # and wedges Kindle→One — fight/flee trash normally until the Mart returns
+                # (BALL_RESTOCK_MODE / camp._ball_restock_mode).
+                self.emit(f"catch order — switching to balls on this {foe}. weaken, don't KO.",
+                          beat=True, tier=2)
+                return self._divert_wild_catch("creator_catch_now", foe, max_seconds)
+            elif _wild and esp in _DIGLETT_LINE and not getattr(self, "_skip_catch_divert", False):
+                # Diglett's Cave: catch the FIRST unowned Diglett/Dugtrio ONLY (dex bit = party∪box).
+                # Arena Trap makes flee impossible — after one is owned, FIGHT the rest.
+                try:
+                    import travel as _tv
+                    mid = tuple(_tv.map_id(self.b))
+                except Exception:
+                    mid = (0, 0)
+                _already = (self._dex_owns_species(50) or self._dex_owns_species(51)
+                            or self._party_owns_species(50) or self._party_owns_species(51))
+                if mid in _DIGLETT_CAVE_MAPS and not _already \
+                        and self._spendable_for_pref("cheap") > 0:
+                    self.emit(f"a {foe} — Diglett's Cave keeper. catching ONE for the Ground slot, "
+                              f"then we're done balling Digletts.",
+                              beat=True, tier=2)
+                    return self._divert_wild_catch("diglett_keeper", foe, max_seconds)
+            elif _wild and not getattr(self, "_skip_catch_divert", False) and 1 <= esp <= 151:
+                # DEX PUSH DIVERT (2026-08-04, Jonny: 'she is not catching enough pokemon for
+                # the exp share thing' — the dex sat at 13/50 while the catch-every-new-species
+                # doctrine lived ONLY in the strategist brief, a text hint this fight engine
+                # never read). The Route 15 aide pays the EXP. SHARE at 50 CAUGHT species, so
+                # every KO'd new species is a wasted bar tick. Programmatic now: an UNOWNED
+                # wild species is a CATCH, not a fight, while badges>=5, the aide's flag is
+                # unclaimed, the bar is short, and there are balls to spare (>=2 — the last
+                # ball stays reserved for a shiny/legendary moment). Fail-safe end to end:
+                # catch_pokemon is time-bounded, a miss fight-clears as normal, and any read
+                # fault just skips the divert (she fights like before). LAP NO-CATCH +
+                # RESERVE (2026-08-05, the Kindle Road Meowth): the pure gate suppresses the
+                # push for the whole badge-8 pre-credits victory lap, and the ball count it
+                # reads is reserve-aware — hunt Ultras can never arm a trash catch.
+                try:
+                    import field_moves as _fm
+                    _dexable, _lap_hold = dex_push_gate(
+                        sum(1 for i in range(8) if _fm.read_flag(self.b, 0x820 + i)),
+                        _fm.read_flag(self.b, 0x82C),           # FLAG_SYS_GAME_CLEAR
+                        _fm.read_flag(self.b, 0x256),           # Exp. Share claimed
+                        ram.pokedex_owned_count(self.b) or 0,
+                        self._dex_owns_species(esp) is not False,
+                        self._spendable_for_pref("cheap"))
+                except Exception:
+                    _dexable, _lap_hold = False, False
+                if _lap_hold:
+                    self.log(f"   [engine] dex_push SUPPRESSED — the victory lap owns the "
+                             f"run (badge 8, credits not rolled): {foe} is a fight/flee, "
+                             f"not a catch (POKEMON_LAP_NO_CATCH=0 reverts)")
+                if _dexable:
+                    _owned_n = ram.pokedex_owned_count(self.b) or 0
+                    self.emit(f"a {foe} — that's a NEW one for the dex. balls out "
+                              f"({_owned_n}/50 caught — the Route 15 aide hands over an "
+                              f"Exp. Share at fifty).", beat=True, tier=2)
+                    return self._divert_wild_catch("dex_push", foe, max_seconds)
 
         last_glob, stall = None, 0
         # victory_run7 (2026-07-07): gMoveToLearn is STALE across battles — snapshot at attach so
@@ -2575,6 +5340,20 @@ class BattleAgent:
                                   f"{st.SPECIES_NAME.get(enemy['species'], 'another Pokemon')}",
                                   beat=True)
                         break
+                    # [dbl] BELT: one foe down does NOT decide a double — the partner foe
+                    # fights on (the doubles-aware read only shows hp==0 when NO foe is live,
+                    # so this should be rare; any race that armed the flag early disarms here).
+                    if (self._enemy_fainted and not self._we_fainted and self._is_double()
+                            and self._dbl_weakest_foe() is not None):
+                        self._enemy_fainted = False
+                        self._status_played = False
+                        self._sleep_casts = 0
+                        if cur:
+                            self._prev = cur
+                            self._note_foe(cur)
+                        self.log("   [dbl] a foe went down but its partner still stands — "
+                                 "fighting on (drain disarmed)")
+                        break
                     # STALE-ATTACH DISARM (koga_run7, the obj7 silent drain): _we_fainted can be armed
                     # at re-entry from the SAVE's display struct still holding the LAST battle's corpse
                     # (run3's Koga loss left Mankey at 0 in the struct; the first battle of the next
@@ -2610,7 +5389,11 @@ class BattleAgent:
                     # next mon and the fresh-enemy detect above resumes the fight. Each loop
                     # iteration re-checks, so a B that only closed the sub-menu just B's again.
                     if self._party_screen():
-                        if cur and cur["ours"]["hp"] == 0 and self._healthy_reserve_slot() is not None:
+                        # [dbl] "ours" reads the LIVE partner in a double, so hp==0 can't see a
+                        # fainted slot — _dbl_our_down reads both player battlers directly.
+                        if (cur and (cur["ours"]["hp"] == 0
+                                     or (self._is_double() and self._dbl_our_down()))
+                                and self._healthy_reserve_slot() is not None):
                             self.log("   [engine] party screen in drain: our mon is DOWN -> forced switch")
                             if self._force_switch():
                                 self._we_fainted = False
@@ -2678,6 +5461,13 @@ class BattleAgent:
                         self.b.press("START", 2, 14, self.render, owner=self.owner)
                         self._wait(16)
                     elif self._drain_noprog >= 120:
+                        # DECIDED WIN (2026-08-02 Rock Tunnel): never abort mid-victory — travel
+                        # re-enters the same fight and the stream watches the last seconds rewind.
+                        if self._decided_win():
+                            self.log("   [engine] !! post-faint drain wedged BUT win is DECIDED — "
+                                     "extending decided-win drain (refuse fight-reset re-entry)")
+                            self._debug_snap("drain120_decided_win")
+                            return self._drain_decided_win()
                         self.log("   [engine] !! post-faint drain WEDGED (120 no-progress advances) "
                                  "-> LOUD stuck + frame; never the silent 420s spin again")
                         self._debug_snap("drain120")
@@ -2700,21 +5490,82 @@ class BattleAgent:
                 self.log("   [engine] BAG is open at the turn loop (abandoned item flow) -> B-closing it")
                 self._close_bag_screen()
                 continue
+            # [dbl] STRAY TARGET-SELECT at the turn top (re-entry/abandoned commit): answer it
+            # deliberately — the generic _advance_text B could back it out to the move list
+            # (the loop), and it is neither an action menu nor a move list to the gate below.
+            if self._is_double() and self._dbl_at_target_select():
+                self.log("   [dbl] target-select at turn top (stray/re-entry) — confirming")
+                self._dbl_confirm_target()
+                continue
+            # 2026-08-03 NUCLEAR: party open while OUR active is ALIVE = Pokemon↔Blastoise thrash.
+            # B out only — A re-selects the ace and is the sticky loop Jonny filmed.
+            if self._party_screen():
+                # [dbl] a fainted slot's replacement prompt is MANDATORY and "ours" reads the
+                # LIVE partner (hp>0) — the thrash guard would B-fight the game forever. Send.
+                if (self._is_double() and self._dbl_our_down()
+                        and self._healthy_reserve_slot() is not None):
+                    self.log("   [dbl] party screen + a player slot is DOWN — forced send-in "
+                             "(never B-closed)")
+                    if self._force_switch():
+                        self._prev = st.read_battle(self.b)
+                        self.emit("one of mine went down — sending in the next one", beat=True)
+                        continue
+                _cur = st.read_battle(self.b)
+                if _cur and (_cur.get("ours") or {}).get("hp", 0) > 0:
+                    self._party_thrash_n = getattr(self, "_party_thrash_n", 0) + 1
+                    self.log(f"   [engine] !! PARTY THRASH #{self._party_thrash_n}: open but "
+                             f"active ALIVE — B-closing (never A)")
+                    for _ in range(8):
+                        if not self._party_screen():
+                            break
+                        self.b.press("B", self.hold, self.hold, self.render, owner=self.owner)
+                        self._wait(12)
+                    if self._party_thrash_n >= 3:
+                        self._allow_pokemon_menu = False
+                        self._switch_fail_n = 99
+                        self.log("   [engine] PARTY THRASH latch — voluntary POKEMON banned this battle")
+                        # 2026-08-04 LIVE (thrash #1..#23, 19 minutes of Hyper-Potion theater): the
+                        # party screen kept RE-OPENING because a bag/target layer sat open UNDERNEATH
+                        # it, invisible to _bag_screen(), and every 'move commit' re-confirmed the
+                        # parked potion. B-closing only the party layer can never break that cycle —
+                        # blind-unwind the WHOLE menu stack, then re-home the cursor to FIGHT.
+                        self._blind_menu_unwind(8)
+                    continue
             glob = self._bstate()
             if glob != last_glob:                     # real progress -> reset the wedge guard
                 last_glob, stall = glob, 0
-            if self._white_box():                     # the action menu is up (white panel) ->
+            # MENU TRUTH (2026-08-02 LIVE): gate on ACTION (menu_up==1) OR MOVE LIST — not
+            # white_box alone (shared by both → every turn re-opened / probed forever).
+            if self._at_action_menu() or self._at_move_list():
                 state = st.read_battle(self.b)         # pick + commit a move, verify it lands
+                # [dbl] PUNT LIST (deliberate, minimal-risk): in a double, items ("use on which
+                # mon?" extra prompt), voluntary/famine/whiff/load-share switches and the
+                # futility bench switch are all party/bag actuations whose doubles prompts are
+                # UNVERIFIED — attack-only keeps her un-wedgeable; forced faint send-ins stay on.
+                _dbl_turn = self._is_double()
                 self._note_foe(state)                  # foes-seen ledger (live turn read)
                 self._classify_prev_whiff(state)       # race-free: judge last turn's move at this clean
                 #                                        menu-up read (before the whiff-breaker acts below)
+                # Already on the move list (stray open) — commit immediately, skip switch/item theater.
+                if self._at_move_list() and not self._at_action_menu():
+                    self.log("   [engine] move list already open at turn top — STREAM COMMIT, "
+                             "skipping switch/item menu theater")
+                    res = self._select_and_verify(state) if state else "done"
+                    if res == "done":
+                        self._acted_once = True
+                        stall = 0
+                        self._unresolved_turns = 0
+                    else:
+                        stall += 1
+                        self._unresolved_turns += 1
+                    continue
                 # NS23 LOAD-SHARE (pre-heal, flag-gated default OFF): BEFORE spending a heal, if the worn
                 # active is an SE attacker and a NEAR-FULL SE partner is on the bench, rotate to the fresh
                 # body instead — spreads the gauntlet's attrition across two SE attackers AND conserves the
                 # scarce heal items (the E4 Champion whiteout is a Full-Restore famine). Not during a
                 # participation grind (the ace-protect switch owns that). Fail-safe: an unconfirmed switch
                 # just falls through to the heal path; churn-safe by the near-full gate (see _load_share_slot).
-                if (BATTLE_LOAD_SHARE and state and not PROTECT_LEAD_GRIND
+                if (BATTLE_LOAD_SHARE and state and not PROTECT_LEAD_GRIND and not _dbl_turn
                         and not (self._enemy_fainted or self._we_fainted)):
                     _ls = self._load_share_slot(state)
                     if _ls is not None:
@@ -2726,13 +5577,74 @@ class BattleAgent:
                             self._unresolved_turns = 0
                             continue
                         self.log("   [engine] load-share switch did not confirm -> heal/fight (fail-safe)")
+                # JUST FIGHT (2026-08-03): crushing level lead + connecting damage → skip bag /
+                # switch theater entirely. Voltorb/Electrode logs: no status, Blastoise half-HP,
+                # Water Pulse ending them — potion/POKEMON menus were pure watchability poison.
+                # UNGATED FUTILITY CHECK — ABOVE every gate (2026-08-03 11:43, the third
+                # parked-on-Tackle photo set): the 09:18 session proved the breaker can be
+                # starved by its OWN gates — crushing-lead (_just_fight) skipped must-leave
+                # because stale PP bytes said Bite/WP were usable, so the only routes to the
+                # breaker were the 60s menu wedge's war presses, which kept landing on refusal
+                # boxes ("text") instead of the move list. A battle whose move list has eaten
+                # FUTILE_AMOVE_MAX confirms with zero change gets a bench switch attempt at the
+                # TOP of every turn, ungated by level leads, item offers, or ledger state.
+                if (getattr(self, "_amove_futile", 0) >= FUTILE_AMOVE_MAX
+                        and self._is_trainer_battle() and not _dbl_turn
+                        and not (self._enemy_fainted or self._we_fainted)
+                        and getattr(self, "_futility_switches", 0) < 2):
+                    if self._futility_bench_switch():
+                        self._acted_once = True
+                        stall = 0
+                        self._unresolved_turns = 0
+                        continue
+                _just_fight = bool(state and self._crushing_lead(state)
+                                   and _hp_frac(state.get("ours") or {}) > BATTLE_CRIT_FRAC
+                                   and _decode_status((state.get("ours") or {}).get("status1", 0) or 0)
+                                   not in ("sleep", "freeze"))
+                if _just_fight and getattr(self, "_just_fight_logged", None) != id(state):
+                    self._just_fight_logged = id(state)
+                    _o, _e = state.get("ours") or {}, state.get("enemy") or {}
+                    self.log(f"   [engine] JUST FIGHT: L{_o.get('level')} vs L{_e.get('level')} "
+                             f"+ connecting damage — skipping bag/switch hierarchy this turn")
                 # PART B: SURVIVAL INSTINCT FIRST — if a mon is crit-low/afflicted with a matching item,
                 # offer the bag to the oracle. If she uses one, the turn is spent (skip move selection).
                 # Any non-use falls through to the proven move path (fail-safe; never wedges).
-                if state and not (self._enemy_fainted or self._we_fainted) and self._maybe_use_item(state):
+                if (state and not _just_fight and not _dbl_turn
+                        and not (self._enemy_fainted or self._we_fainted)
+                        and self._maybe_use_item(state)):
                     self._acted_once = True
                     stall = 0
                     continue
+                # ALIVE-BUT-STUCK SWITCH (2026-08-03 Jonny: Blastoise vs Voltorb — half HP, can't
+                # move / sleep-freeze / move theater, 3 live on bench, kept "switching" into himself).
+                # Force a voluntary leave to a DIFFERENT living species; never row-0 / same species.
+                # NUCLEAR: dead while POKEMON_BATTLE_SWITCH=0 (default) — was the thrash opener.
+                if (BATTLE_SWITCH_ENABLED and state and not _just_fight and not _dbl_turn
+                        and not (self._enemy_fainted or self._we_fainted)
+                        and self._must_leave_active(state)):
+                    _asp = state.get("ours", {}).get("species")
+                    if self._must_leave_tried.get(_asp, 0) < FAMINE_SWITCH_TRIES:
+                        if self._bag_screen():
+                            self._close_bag_screen()
+                            continue
+                        self._must_leave_tried[_asp] = self._must_leave_tried.get(_asp, 0) + 1
+                        _bs = self._alive_bench_slot(state)
+                        if _bs is not None:
+                            self.log(f"   [engine] MUST-LEAVE: active alive but stuck "
+                                     f"(status/famine/exhausted) -> bench slot {_bs} "
+                                     f"(NOT re-picking species {_asp})")
+                            if self._switch_to_slot(_bs, _asp) == "switched":
+                                self.emit("this one's stuck — switching to someone who can still fight.",
+                                          beat=True, tier=2)
+                                self._skip_streak.clear()
+                                self._acted_once = True
+                                stall = 0
+                                self._unresolved_turns = 0
+                                self._note_battle_progress("must-leave switch")
+                                continue
+                            self.log("   [engine] must-leave switch did not confirm -> fight/Struggle")
+                        else:
+                            self.log("   [engine] MUST-LEAVE but no other live bench — Struggle/fight")
                 # PP-FAMINE SWITCH (2026-07-07, erika_run2 postmortem — the gym-gauntlet PP wall): the
                 # active mon can be ALIVE but WINLESS — every damaging move at 0 PP after a long gauntlet,
                 # leaving only status moves that can never KO (Fearow Growl/Leer'd a 60/60 Gloom until the
@@ -2743,9 +5655,11 @@ class BattleAgent:
                 # (a forced re-entry of the same dry mon gets one more try, never a churn loop). Fail-safe:
                 # an unconfirmed switch just fights on; no reserve -> log LOUD and let the anti-wedge
                 # floor + the campaign's needs_heal gate own it.
-                if (state and not (self._enemy_fainted or self._we_fainted)
+                if (BATTLE_SWITCH_ENABLED and state and not _dbl_turn
+                        and not (self._enemy_fainted or self._we_fainted)
                         and self._active_pp_famine(state)
-                        and state.get("ours", {}).get("species") not in self._famine_tried):
+                        and self._famine_tried.get(state.get("ours", {}).get("species"), 0)
+                        < FAMINE_SWITCH_TRIES):
                     # DIRTY-SCREEN GUARD (e4_run8 Agatha): the famine often trips the very turn an
                     # item flow ends, with the BAG still on screen — the switch nav then can't reach
                     # POKEMON ("cursor not on POKEMON") and the once-per-species try was BURNED, dooming
@@ -2757,7 +5671,8 @@ class BattleAgent:
                                  "(try not consumed)")
                         self._close_bag_screen()
                         continue
-                    self._famine_tried.add(state.get("ours", {}).get("species"))
+                    _fsp = state.get("ours", {}).get("species")
+                    self._famine_tried[_fsp] = self._famine_tried.get(_fsp, 0) + 1
                     _fs = self._pp_reserve_slot(state)
                     if _fs is not None:
                         self.log(f"   [engine] PP FAMINE: active has no damaging PP left -> switching to "
@@ -2779,6 +5694,7 @@ class BattleAgent:
                 # weak mon banks a share of XP and never takes a hit (benched before the enemy's turn); the
                 # tanky ace KOs. Fires at most once/battle; fail-safe (a non-confirm just fights).
                 if (GRIND_SWITCH_ENABLED and PROTECT_LEAD_GRIND and not self._grind_switched
+                        and not _dbl_turn
                         and state and not (self._enemy_fainted or self._we_fainted)):
                     self._grind_switched = True            # one attempt/battle, whatever the result
                     ace = self._ace_reserve_slot()
@@ -2811,6 +5727,25 @@ class BattleAgent:
                         self.log(f"   [engine] GRIND SWITCH: weak lead out -> switching to ace slot {ace} "
                                  f"(weak mon banks participation XP, ace does the fighting)")
                         if self._switch_to_slot(ace, state.get("ours", {}).get("species")) == "switched":
+                            # NARRATE THE MANEUVER (2026-07-30, Jonny live report: this deliberate switch
+                            # read as 'she benched the mon she said she was training' — and her own
+                            # commentary then credited the wrong mon). Name BOTH parties from ground
+                            # truth (the battle read + the verified ace slot) so voice matches screen.
+                            try:
+                                _wk_sp = (state.get("ours") or {}).get("species")
+                                _wk_nm = st.SPECIES_NAME.get(_wk_sp, "the little one")
+                                _ace_nm = st.SPECIES_NAME.get(st.read_party_species(self.b, ace), "my ace")
+                                # Name Intimidate as the LEAD's ability so chat doesn't pin it on the ace
+                                # (2026-08-02: "Blastoise got Ekans's ability" after the turn-1 switch).
+                                if _wk_sp in (23, 24, 58, 59):
+                                    self.emit(f"that Intimidate was {_wk_nm}'s — {_ace_nm} is in now "
+                                              f"for the actual fight. bench XP, then the real hitters.",
+                                              beat=True, tier=1)
+                                else:
+                                    self.emit(f"{_wk_nm} showed up for the XP share — now {_ace_nm} takes it "
+                                              f"from here. that's how you train a rookie.", beat=True, tier=1)
+                            except Exception:
+                                pass
                             self._acted_once = True
                             stall = 0
                             self._unresolved_turns = 0
@@ -2825,7 +5760,11 @@ class BattleAgent:
                 # wild) and re-field the fragile mon, which then faints and STRANDS her (the observed
                 # Route-4 (84,15) strand: GRIND SWITCH in, MATCHUP SWITCH straight back out). During a grind
                 # the ace STAYS and tanks — no matchup churn.
-                if (BATTLE_SWITCH_ENABLED and not PROTECT_LEAD_GRIND
+                # Skip matchup switch once a turn already failed to resolve — opening POKEMON
+                # mid-thrash is more menu theater (2026-08-02 LIVE).
+                if (BATTLE_SWITCH_ENABLED and not PROTECT_LEAD_GRIND and not _just_fight
+                        and not _dbl_turn
+                        and getattr(self, "_unresolved_turns", 0) < 1
                         and state and not (self._enemy_fainted or self._we_fainted)
                         and self._voluntary_switch(state) == "switched"):
                     self._acted_once = True
@@ -2838,7 +5777,7 @@ class BattleAgent:
                 # crushing level lead. Gen-3 resets stat stages on switch-out, so we switch the ace OUT
                 # (accuracy resets) then BACK the next turn to swing fresh. _classify_prev_whiff counts misses;
                 # here we execute the reset. Bounded per battle (WHIFF_MAX_RECOVERIES) so it never loops.
-                if (WHIFF_BREAKER_ENABLED and state
+                if (WHIFF_BREAKER_ENABLED and state and not _dbl_turn
                         and not (self._enemy_fainted or self._we_fainted)):
                     if self._whiff_recovering is not None:
                         # (a) mid-recovery — the ace is benched with reset accuracy; bring it back to swing.
@@ -2898,6 +5837,12 @@ class BattleAgent:
                     self._whiff_prev_fired = _dmg_pp_now < _dmg_pp_pre
                     self._whiff_prev_hp = _enemy_hp_pre
                     self._whiff_prev_sp = (state.get("enemy") or {}).get("species") if state else None
+                    # Only real PP/HP change counts as progress (STREAM COMMIT returns "done" on miss).
+                    _ehp = (_cur or {}).get("enemy", {}).get("hp")
+                    if self._whiff_prev_fired or (_ehp is not None and _enemy_hp_pre is not None
+                                                  and _ehp != _enemy_hp_pre):
+                        self._note_battle_progress(
+                            "move resolved" if self._whiff_prev_fired else "foe HP changed")
                 else:
                     stall += 1                        # menu up but flaky -> settle re-checks, retry
                     # ANTI-WEDGE FLOOR — the run-existential one. `stall` resets on ANY screen change,
@@ -2921,33 +5866,96 @@ class BattleAgent:
                         except Exception:
                             pass
                         self.log(f"   [engine] !! ANTI-WEDGE FLOOR: {self._unresolved_turns} unresolved "
-                                 f"turns (last={res}) in a TRAINER battle -> can't flee; LOUD abort "
-                                 f"[forensics: action_cursor={self.b.rd8(ram.GBATTLE_ACTION_CURSOR)} "
-                                 f"white_box={self._white_box()} move_list={self._in_move_list()} "
+                                 f"turns (last={res}) in a TRAINER battle -> mash FIGHT+A (war-must-advance) "
+                                 f"[forensics: menu_up={int(self._menu_up())} "
+                                 f"action={self._at_action_menu()} moves={self._at_move_list()} "
                                  f"bag={self._bag_screen()} party={self._party_screen()} ours_pp={_pp}]")
                         self._debug_snap("antiwedge_trainer")
-                        self.emit("I'm jammed up in here — can't get a move to land.", beat=False)
-                        return "stuck"
+                        # NEVER return stuck (travel re-enters the same fight). Screen-aware
+                        # presses ONLY — the old blind 'A A' here re-opened a BAG-parked cursor
+                        # forever (the Route-13 fisherman Super-Potion loop).
+                        p1 = self._war_advance_press()
+                        p2 = self._war_advance_press()
+                        self.log(f"   [engine] anti-wedge presses: {p1}, {p2}")
+                        self._unresolved_turns = 0
+                        stall = 0
+                        continue
             else:
                 self._advance_text()                  # BLUE dialogue/animation box -> advance it
                 stall += 1
+            # STALL-CLOCK MENU WEDGE (2026-08-03): fire only when NOTHING real has happened for
+            # BATTLE_MENU_WEDGE_S — NOT "battle older than 45s". The old t0 clock false-fired mid
+            # multi-mon trainer fight ("menus are glitched") and killed the stream.
+            _stall_for = time.time() - getattr(self, "_last_battle_progress_t", t0)
+            # RE-ARMABLE (2026-08-03): this was a ONE-SHOT latch — when the single bail's own
+            # blind A re-opened the bag (fisherman loop), NO escape could EVER fire again and
+            # the fight span minutes of Super-Potion theater. Bounded re-fires (each spaced by
+            # a full BATTLE_MENU_WEDGE_S of zero progress) keep it loud but never dead.
+            if (BATTLE_MENU_WEDGE_S > 0 and _stall_for >= BATTLE_MENU_WEDGE_S
+                    and not self._enemy_fainted and not self._we_fainted
+                    and getattr(self, "_menu_wedge_n", 0) < 8):
+                self._menu_wedge_n = getattr(self, "_menu_wedge_n", 0) + 1
+                self.log(f"   [engine] !! MENU WEDGE {_stall_for:.0f}s with NO progress — escaping the "
+                         f"scroll theater (fire {self._menu_wedge_n}/8, menu_up={int(self._menu_up())} "
+                         f"action={self._at_action_menu()} moves={self._at_move_list()} "
+                         f"bag={self._bag_screen()} party={self._party_screen()})")
+                if self._menu_wedge_n == 1:
+                    self.emit("menus are glitched — bailing this fight.", beat=True, tier=2)
+                if not self._is_trainer_battle():
+                    return self.flee(max_seconds=45)
+                if self._menu_wedge_n >= 2:
+                    # 2026-08-04 LIVE (the Hyper-Potion golbat loop): fires 1-3 ran the screen-AWARE
+                    # presses below, which consult the SAME lying classifiers that caused the wedge
+                    # (action=True while the real screen was the bag list) — so all three fires
+                    # burned and the loop ran 19 minutes until the window died. From the second
+                    # fire on, stop trusting screens: blind B-unwind the whole stack (B never
+                    # confirms), then re-home FIGHT. Cap raised 3->8 so the escape can't go dead.
+                    self.log("   [engine] MENU WEDGE escalation: blind B-unwind (classifiers untrusted)")
+                    self._blind_menu_unwind(10)
+                else:
+                    # Trainer, first fire: screen-aware presses only (B out of bag/party; A only on
+                    # a FIGHT-homed action menu / move list). The old 'B then always A' alternation
+                    # was itself the infinite selected/Use-on-which cycle.
+                    for _ in range(8):
+                        if not st.in_battle(self.b) or self._enemy_fainted:
+                            break
+                        self._war_advance_press()
+                self._unresolved_turns = 0
+                stall = 0
+                self._last_battle_progress_t = time.time()  # don't re-trigger every iteration
             if stall >= 30:                           # genuine wedge -> loud abort, never silent
-                self.log("   [engine] !! battle wedged - no progress over 30 attempts, aborting loudly")
-                self.emit("okay I'm properly stuck, the menu's glitched", beat=False)
-                return "stuck"
+                if self._decided_win():
+                    self.log("   [engine] !! stall≥30 but win DECIDED — finishing victory chain "
+                             "(refuse fight-reset re-entry)")
+                    return self._drain_decided_win()
+                if not self._is_trainer_battle():
+                    self.log("   [engine] !! battle wedged stall≥30 WILD -> FLEE")
+                    return self.flee(max_seconds=45)
+                self.log("   [engine] !! battle wedged stall≥30 TRAINER -> screen-aware press, "
+                         "not stuck-abort (never a blind A — the bag-parked-cursor lesson)")
+                self._war_advance_press()
+                stall = 0
+                continue
+        # Budget exhausted: if the fight is already won, NEVER hand travel a timeout that
+        # re-attaches mid-victory (Rock Tunnel trainer loop, 2026-08-02).
+        if self._decided_win():
+            self.log(f"   [engine] !! battle budget exhausted ({max_seconds}s) but win DECIDED — "
+                     f"extending decided-win drain (refuse timeout re-entry)")
+            return self._drain_decided_win()
         return "timeout"
 
     def _finish(self):
         prev = self._prev or {}
         ours = prev.get("ours", {})
+        _mine = st.SPECIES_NAME.get(ours.get("species"), "your Pokemon")
         if self._enemy_fainted or (prev.get("enemy", {}).get("hp", 1) == 0):
             # F-7(c): the certain-win beat already voiced this win AT THE FAINT (the drain +
             # LLM chain aligned her reaction with the victory screen) — never voice it twice.
             if not self._win_emitted:
-                self.emit("you won the battle", beat=True)
+                self.emit(f"you won the battle — your {_mine} finished it", beat=True)
             return "win"
         if ours.get("hp", 1) == 0:
-            self.emit("you lost - your Pokemon fainted", beat=True)
+            self.emit(f"you lost - your {_mine} fainted", beat=True)
             return "loss"
         self.emit("the battle ended", beat=False)
         return "ended"
@@ -2957,13 +5965,19 @@ class BattleAgent:
             return
         pe, ce = prev["enemy"], cur["enemy"]
         po, co = prev["ours"], cur["ours"]
+        # WHO'S ACTUALLY OUT (2026-07-30, Jonny live report: "spearow's eating well tonight" while
+        # WARTORTLE made the kill): every event below now names HER ACTIVE battler from gBattleMons[0]
+        # (`cur["ours"]` — live ground truth, correct across mid-battle switches). Without the name in
+        # the event string, the voice LLM only saw the foe + her full roster and INVENTED the attacker.
+        mine = st.SPECIES_NAME.get(co.get("species"), "your Pokemon")
         # narrate the move from the OBSERVED hit (ground truth), not per button-press,
         # so it fires exactly once per landed move - never spammy.
         if ce["hp"] < pe["hp"] and ce["hp"] > 0:
             desc = getattr(self, "_last_desc", "an attack")
-            self.emit(f"used {desc}", beat=(getattr(self, "_last_eff", 1.0) >= 2))
+            self.emit(f"your {mine} used {desc}", beat=(getattr(self, "_last_eff", 1.0) >= 2))
         if ce["hp"] == 0 and pe["hp"] > 0:
             self._enemy_fainted = True
+            self._note_battle_progress("enemy fainted")
             # F-7(c) SPECULATIVE PREFETCH (the certain-win early beat): when THIS faint leaves no
             # live mon anywhere in gEnemyParty, the battle is DECIDED at this frame — but the win
             # line used to fire only after the whole victory drain (faint anim → EXP → level-up,
@@ -2976,19 +5990,20 @@ class BattleAgent:
             if (not self._win_emitted and not self._catching and not self._we_fainted
                     and cur["ours"]["hp"] > 0 and self._enemy_live_remaining() == 0):
                 self._win_emitted = True
-                self.emit(f"the enemy's {st.SPECIES_NAME.get(ce['species'], 'Pokemon')} went down — "
-                          f"that's the battle, you won", beat=True)
+                self.emit(f"the enemy's {st.SPECIES_NAME.get(ce['species'], 'Pokemon')} went down to "
+                          f"your {mine} — that's the battle, you won", beat=True)
                 return
             # BATCH 5 PHASE 3 — mark the SIDE so she never narrates her own WIN as a loss. The bare
             # "{species} fainted" read as HER mon dying (she mourned a Nidoran she'd just KO'd). gBattleMons[1]
             # is the ENEMY, so this faint is always a victory. (Avoid the substrings 'knocked out'/'you lost'
             # — pokemon_voice.classify tiers those as a T3 LOSS; "took it down" stays the correct T1.)
-            self.emit(f"the enemy's {st.SPECIES_NAME.get(ce['species'], 'Pokemon')} fainted — you took it down",
-                      beat=True)
+            self.emit(f"the enemy's {st.SPECIES_NAME.get(ce['species'], 'Pokemon')} fainted — "
+                      f"your {mine} took it down", beat=True)
         if co["hp"] == 0 and po["hp"] > 0:
             self._we_fainted = True
-            self.emit("your Pokemon fainted", beat=True)
+            self._note_battle_progress("our mon fainted")
+            self.emit(f"your {mine} fainted", beat=True)
         elif co["maxhp"] and (po["hp"] - co["hp"]) > 0.4 * co["maxhp"]:
-            self.emit("you took a big hit", beat=True)
+            self.emit(f"your {mine} took a big hit", beat=True)
         elif co["maxhp"] and co["hp"] / co["maxhp"] < 0.25 and po["hp"] / max(po["maxhp"], 1) >= 0.25:
-            self.emit("low HP - this is getting tense", beat=True)
+            self.emit(f"your {mine} is at low HP - this is getting tense", beat=True)

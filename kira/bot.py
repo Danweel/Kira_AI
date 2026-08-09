@@ -477,10 +477,33 @@ class _ChatBudgetGovernor:
         self._window.clear()
 
 
+class _TrackedLock(asyncio.Lock):
+    """asyncio.Lock that remembers WHICH task holds it and since WHEN — the handle the
+    turn-lock watchdog needs to RECOVER a hung turn (2026-07-31, the Misty-badge deafness:
+    a wedged LLM await held _active_turn_lock indefinitely and she went deaf+mute to voice
+    and chat with the stream live). A bare Lock can only be observed, never attributed."""
+
+    def __init__(self):
+        super().__init__()
+        self.holder_task = None
+        self.acquired_at = 0.0
+
+    async def acquire(self):
+        result = await super().acquire()
+        self.holder_task = asyncio.current_task()
+        self.acquired_at = time.time()
+        return result
+
+    def release(self):
+        self.holder_task = None
+        self.acquired_at = 0.0
+        super().release()
+
+
 class VTubeBot:
     def __init__(self):
         self.interruption_event = asyncio.Event()
-        self.processing_lock = asyncio.Lock()
+        self.processing_lock = _TrackedLock()
         # [DroppedInput] instrumentation: frames of Jonny's speech dropped in the current
         # run while processing_lock is held (his voice arriving during one of her turns,
         # never transcribed). Throttled — onset + run-length logged, not per-frame.
@@ -501,7 +524,7 @@ class VTubeBot:
         # Held by voice turns, chat_batch turns, and interjection turns so they
         # never race against each other. Distinct from processing_lock (which remains
         # STT-only and drives VAD interruption_event — no change to that logic).
-        self._active_turn_lock = asyncio.Lock()
+        self._active_turn_lock = _TrackedLock()
         # Buffered P1 interjections (MW/chess reactions) that arrived while a turn
         # was active. Each entry: {prompt, memory_query, scene_override, queued_at}.
         # Drained (one at a time) immediately after each turn completes.
@@ -865,6 +888,8 @@ class VTubeBot:
         self._chaos_mode_task = None  # asyncio.Task handle for the chaos timer
         self._speech_constraint_task = None  # asyncio.Task handle for the speech-constraint timer
         self._accent_mode_task = None  # asyncio.Task handle for the accent-mode timer
+        self._persona_mode_task = None  # asyncio.Task handle for wheel timed-persona timer
+        self._persona_end_line: str = ""  # spoken when the active persona window ends
 
         # Wheel state
         self._wheel_vetoed: bool = False          # set by dashboard veto action
@@ -885,7 +910,7 @@ class VTubeBot:
     # is now one slice among equals. Banner names the tipper.
     COOKIE_MILESTONE_ANNOUNCE = [
         "Chat. You filled the whole jar. {tipper} put the last one in. The Wheel has been summoned.",
-        "Jar full. {tipper} tipped it over. The Wheel of Fortune appears — let's see what you've all earned.",
+        "Jar full. {tipper} tipped it over. The Wheel of Time appears — let's see what you've all earned.",
         "{cap} cookies — milestone {n}. {tipper} sealed it. Spinning the wheel now.",
         "The jar overflows. {tipper} gets credit. The Wheel turns. Whatever it lands on, we're doing it.",
     ]
@@ -992,7 +1017,7 @@ class VTubeBot:
             # Banner with tipper name
             try:
                 from kira.dashboard.control_server import push_banner_show
-                banner_text = f"🍪 JAR FULL — tipped by {tipper_disp} — THE WHEEL"
+                banner_text = f"🍪 JAR FULL — tipped by {tipper_disp} — THE WHEEL OF TIME"
                 asyncio.ensure_future(push_banner_show(banner_text, 10))
             except Exception:
                 pass
@@ -1107,6 +1132,31 @@ class VTubeBot:
         if slice_id == "accent_mode":
             if self.timed_modifiers.can_activate("accent"):
                 self._start_accent_vote()
+            return
+
+        # ── timed_persona: generic 5-minute persona takeover (Dragon Queen,
+        #    Villain Arc, ...). ONE branch for all of them: the slice carries its
+        #    own directive/duration/announce/end_line, and the registry enforces
+        #    one-at-a-time + cooldown under the shared name "persona". If the
+        #    registry is busy, degrade to a one-shot performance of the same
+        #    directive (the wheel never lands on a dead wedge). ──
+        if slice_type == "timed_persona":
+            label = slice_def.get("label", slice_id)
+            announce = slice_def.get("announce",
+                                     f"The Wheel of Time — {label}. For the next five minutes.")
+            try:
+                await self.ai_core.speak_text(announce, priority=1)
+                self.conversation_history.append({"role": "assistant", "content": announce})
+                self._log_session_turn(role="assistant", content=announce, speaker_name="Kira")
+            except Exception:
+                pass
+            if self.timed_modifiers.can_activate("persona"):
+                self._activate_persona_mode(slice_def)
+            else:
+                print(f"   [Wheel] persona registry busy — running '{label}' as a one-shot bit")
+            # Perform the opening beat NOW either way (the announced-then-silent bug):
+            # the registry keeps the persona alive for later turns; this is the entrance.
+            await self._perform_wheel_segment(directive, label=label, slice_id=slice_id)
             return
 
         # ── duchess_challenge: open chess gauntlet ───────────────────────
@@ -1433,6 +1483,66 @@ class VTubeBot:
             await _cs.send_chaos(active=active, remaining=int(remaining))
         except Exception as e:
             print(f"   [Chaos] Overlay broadcast failed: {e}")
+
+    # ── Timed Persona (Wheel of Time takeovers: Dragon Queen, Villain Arc…) ──
+    # Generic rider on the TimedModifierRegistry spine, mirroring chaos's
+    # activate/timer/deactivate shape. ONE registry name ("persona") covers every
+    # persona wedge — one-at-a-time and the shared cooldown come for free.
+    def _activate_persona_mode(self, slice_def: dict) -> None:
+        """Activate a wheel persona as a TimedModifier. The slice carries its own
+        directive/duration/cooldown/end_line — bot.py stays persona-agnostic."""
+        from kira.timed_modifier import TimedModifier
+        duration = int(slice_def.get("duration_s", 300))
+        cooldown = int(slice_def.get("cooldown_s", 900))
+        label    = slice_def.get("label", slice_def.get("id", "persona"))
+        self._persona_end_line = slice_def.get(
+            "end_line", f"...and the {label} window closes. Back to regular me.")
+        self.timed_modifiers.start(
+            TimedModifier("persona", slice_def.get("directive", ""), duration, cooldown)
+        )
+        print(f"   [Persona] 👑 {label} ACTIVE for {duration}s")
+        try:
+            self.stream_logger.log("persona_start", persona=slice_def.get("id"), duration=duration)
+        except Exception:
+            pass
+        try:
+            if self._persona_mode_task and not self._persona_mode_task.done():
+                self._persona_mode_task.cancel()
+        except Exception:
+            pass
+        self._persona_mode_task = asyncio.create_task(self._persona_mode_timer(duration))
+
+    async def _persona_mode_timer(self, duration: int) -> None:
+        """Sleep for the persona duration, then deactivate. Cancellable."""
+        try:
+            await asyncio.sleep(duration)
+            await self._deactivate_persona_mode()
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"   [Persona] Timer error: {e}")
+
+    async def _deactivate_persona_mode(self) -> None:
+        """End the persona window: clear state (arms cooldown), speak the end line."""
+        if not self.timed_modifiers.is_active("persona"):
+            return
+        self.timed_modifiers.end()
+        print("   [Persona] Persona window ended.")
+        try:
+            self.stream_logger.log("persona_end")
+        except Exception:
+            pass
+        try:
+            for _ in range(30):
+                if not self.ai_core.is_speaking:
+                    break
+                await asyncio.sleep(0.1)
+            line = self._persona_end_line or "The persona window closes. I'm me again — mostly."
+            await self.ai_core.speak_text(line, priority=1)
+            self.conversation_history.append({"role": "assistant", "content": line})
+            self._log_session_turn(role="assistant", content=line, speaker_name="Kira")
+        except Exception as e:
+            print(f"   [Persona] End TTS error: {e}")
 
     # ── Speech Constraint (timed mode #2) ────────────────────────────────
     # Second rider on the TimedModifierRegistry spine, mirroring chaos's
@@ -2038,6 +2148,131 @@ class VTubeBot:
         default_desc = "I'm just getting my bearings. One sec!"
         return bool(va.scene_summary or (va.last_description and va.last_description != default_desc))
 
+    # CREATOR-ORDER SEAM (2026-07-31, Jonny's pacing debrief: "take my word as law — if I say stop
+    # and go fight Misty, she should"). A direct gameplay order in JONNY'S VOICE (never chat — chat
+    # stays advice) latches creator_order.json in the game harness's state dirs; the campaign's roam
+    # loop reads it every tick, stands its prep/prune machinery down, and obeys. Deliberately a small
+    # mechanical regex, not an LLM read: an order must latch even when her conversational brain is
+    # busy, and false positives are cheap (TTL + badge-fulfillment release it).
+    _POKEMON_GYM_ORDER_RX = re.compile(
+        r"\b(?:go\s+)?(?:and\s+)?(?:fight|battle|challenge|take\s+on|beat|attack)\s+(?:the\s+)?"
+        r"(?:(?:misty|brock|(?:lt\.?\s*)?surge|erika|koga|sabrina|blaine|giovanni)(?:'?s)?"
+        r"|gym(?:\s+leader)?)\b",
+        re.IGNORECASE)
+    _POKEMON_STOP_GRIND_RX = re.compile(
+        r"\bstop\s+(?:grinding|training|farming|leveling|levelling)\b", re.IGNORECASE)
+    # CATCH NOW (2026-08-02 Diglett chalk): "catch that / catch one / ball it" must latch LAW the
+    # same way fight-gym does — conversational "okay" without a harness latch was the kill-loop.
+    _POKEMON_CATCH_ORDER_RX = re.compile(
+        r"\b(?:catch|capture|ball)\s+(?:that|this|it|one|him|her|them|a\s+\w+)\b"
+        r"|\bcatch\s+(?:one|it|that)\b"
+        r"|\btry\s+to\s+catch\b"
+        r"|\bthrow\s+(?:a\s+)?(?:poke\s*)?balls?\b",
+        re.IGNORECASE)
+    # Flash / forward: "go get flash", "move forward", "leave the cave" — stand down catch spam.
+    _POKEMON_FLASH_FORWARD_RX = re.compile(
+        r"\b(?:go\s+)?(?:get|grab|find|learn)\s+flash\b"
+        r"|\b(?:need|needs)\s+flash\b"
+        r"|\bmove\s+forward\b"
+        r"|\bleave\s+(?:the\s+)?(?:cave|diglett)\b"
+        r"|\bstop\s+catching\b"
+        r"|\bkeep\s+(?:going|moving)\b",
+        re.IGNORECASE)
+    # NO-CATCH NEGATION GUARD (2026-08-05, the Route-21 tentacool spiral): "Don't try to catch
+    # it. We don't want it" and third-person commentary ("she wanted to catch it... what the
+    # fuck is she doing?") both matched _POKEMON_CATCH_ORDER_RX and LATCHED catch_now LAW —
+    # each accidental catch regrew the box-bench plan and fed the Cinnabar PC shuttle. A
+    # negated/commentary catch phrase must never latch; it RELEASES a live catch_now instead.
+    _POKEMON_NO_CATCH_RX = re.compile(
+        r"\b(?:do\s*not|don'?t|never|won'?t|not\s+(?:going\s+to|gonna))\b[^.!?]{0,40}\bcatch"
+        r"|\bstop\s+(?:trying\s+to\s+)?catch"
+        r"|\bwe\s+don'?t\s+want\s+(?:it|that|this|him|her)\b"
+        r"|\b(?:just\s+)?kill\s+it\b"
+        r"|\bshe\s+(?:wanted|tried|keeps?\s+trying|'?s\s+trying|is\s+trying)\s+to\s+catch\b"
+        r"|\bwhat\s+(?:the\s+\w+\s+)?is\s+she\s+doing\b",
+        re.IGNORECASE)
+
+    def _pokemon_creator_order_live(self) -> bool:
+        """True when a Pokémon campaign is actually running — health.json heartbeat fresh, OR
+        the states dir exists (resume_marathon may not set pokemon_mode on the bot). Voice orders
+        must latch either way; chat never reaches this path."""
+        try:
+            from kira import pokemon_proc
+            if pokemon_proc.heartbeat_alive():
+                return True
+        except Exception:
+            pass
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "pokemon_agent", "states")
+        return os.path.isdir(os.path.join(root, "campaign")) or os.path.isdir(
+            os.path.join(root, "kira"))
+
+    def _pokemon_creator_order_check(self, content: str) -> None:
+        """Latch a creator order from Jonny's spoken words. Best-effort; not gated on pokemon_mode
+        (resume_marathon launches the harness outside the dashboard mode flip)."""
+        text = content or ""
+        # Flash/forward OUTRANKS a lingering catch_now — "go get flash" must clear Diglett ball spam.
+        if self._POKEMON_FLASH_FORWARD_RX.search(text):
+            order = "get_flash"
+        elif self._POKEMON_NO_CATCH_RX.search(text):
+            # Negated/commentary catch talk ("don't try to catch it", "she wanted to catch
+            # it... what is she doing") — NEVER a latch; release any live catch_now instead.
+            self._pokemon_release_catch_order(text)
+            return
+        elif self._POKEMON_CATCH_ORDER_RX.search(text):
+            order = "catch_now"
+        elif (self._POKEMON_GYM_ORDER_RX.search(text)
+              or self._POKEMON_STOP_GRIND_RX.search(text)):
+            order = "fight_gym"
+        else:
+            return
+        if not self._pokemon_creator_order_live():
+            return
+        import json as _j
+        payload = {"order": order, "raw": text.strip()[:200], "ts": time.time()}
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "pokemon_agent", "states")
+        wrote = False
+        for sub in ("campaign", "kira"):     # both timelines — whichever is live picks it up
+            d = os.path.join(root, sub)
+            if not os.path.isdir(d):
+                continue
+            try:
+                tmp = os.path.join(d, "creator_order.json.tmp")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    _j.dump(payload, f)
+                os.replace(tmp, os.path.join(d, "creator_order.json"))
+                wrote = True
+            except Exception as e:
+                print(f"   [CreatorOrder] write to {sub} failed: {e}")
+        if wrote:
+            print(f"   [CreatorOrder] !! LAW latched from Jonny's voice: {payload['raw']!r}")
+
+    def _pokemon_release_catch_order(self, text: str) -> None:
+        """RELEASE a live catch_now LAW when Jonny NEGATES it by voice (2026-08-05): the old
+        parser latched 'Don't try to catch it' AS a catch order — the harness then ball-spammed
+        Route-21 tentacools, each catch regrew the box-bench plan, and the lap shuttled her back
+        into the Cinnabar Center forever. Deletes creator_order.json (both timelines) iff it
+        holds a catch_now; other orders (fight_gym/get_flash) are untouched."""
+        import json as _j
+        root = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            "pokemon_agent", "states")
+        for sub in ("campaign", "kira"):
+            p = os.path.join(root, sub, "creator_order.json")
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    cur = _j.load(f)
+            except Exception:
+                continue
+            if (cur or {}).get("order") != "catch_now":
+                continue
+            try:
+                os.remove(p)
+                print(f"   [CreatorOrder] !! NO-CATCH heard — RELEASED the {sub} catch_now "
+                      f"LAW (was {cur.get('raw', '')!r:.80}); trigger: {text.strip()[:120]!r}")
+            except Exception as e:
+                print(f"   [CreatorOrder] catch_now release in {sub} failed: {e}")
+
     def _pokemon_perception_directive(self) -> str:
         """POKÉMON-MODE PERCEPTION (2026-07-08 immersion fix): when she's PLAYING Pokémon her
         sense is the game's live RAM state, NOT her eyes (vision is window-locked/parked to save
@@ -2046,8 +2281,10 @@ class VTubeBot:
         directive that GROUNDS her in the game and forbids ALL screen/vision talk."""
         return (
             "\n\n[PERCEPTION — you're PLAYING Pokémon FireRed. You read the game through its live "
-            "state: your team, the route, the battle, what just happened. Vision/eyes are OFF for "
-            "this and that is NORMAL — you don't need them to play.]\n"
+            "state: your team, badges, field moves (Cut/Flash/Surf/…), the route, the battle, what "
+            "just happened. Vision/eyes are OFF for this and that is NORMAL — you don't need them "
+            "to play. When [YOUR POKÉMON RUN] appears in context, that block is ground truth — trust "
+            "it over fuzzy memory; never deny a badge or HM it lists.]\n"
             "NEVER mention a screen, display, 'black screen', 'dark', 'frozen', 'I can't see', or "
             "your vision in ANY way — you are not watching a screen, you are PLAYING. Talk about the "
             "GAME and the moment. If the GAME itself seems unresponsive, frame it as the game being "
@@ -2058,7 +2295,7 @@ class VTubeBot:
         """Strong prohibition against fabricated visual observations when vision is off
         or no frame has been captured. Mirrors the UNCERTAIN-honesty rule already used
         by the vision agent — don't claim to see what you can't see."""
-        if getattr(self, "pokemon_mode", False):
+        if self._pokemon_live_voice_ok():
             return self._pokemon_perception_directive()
         return (
             "\n\n[VISUAL STATUS: BLIND — no live visual input]\n"
@@ -2072,7 +2309,7 @@ class VTubeBot:
 
     def _stale_visual_directive(self, age_seconds: int) -> str:
         """Used when vision is on but the last frame is too old to be treated as 'now'."""
-        if getattr(self, "pokemon_mode", False):
+        if self._pokemon_live_voice_ok():
             return self._pokemon_perception_directive()
         return (
             f"\n\n[VISUAL STATUS: STALE — last frame was {age_seconds}s ago]\n"
@@ -3274,6 +3511,28 @@ class VTubeBot:
         "out there ('I should grind here', 'my team needs a level').]"
     )
 
+    # THE CHAMPION DOCTRINE (2026-08-03, 'high level programmatic prompted strategy'): the standing
+    # HOW-SHE-PLAYS layer, present in EVERY Pokémon decision prompt. Before this, the decide prompt
+    # told her to pick by 'taste/mood, NOT the most optimal play' — prompted-in casualness that had
+    # her strolling past Centers hurt and walking into gyms with an empty bag. Doctrine: the PICK is
+    # always the pro move; her personality lives in the COMMENTARY. The per-tick numbers ride in
+    # separately as the strategist brief (campaign._strategy_brief -> ctx['strategy']); this block is
+    # the permanent constitution those numbers plug into.
+    _POKEMON_STRATEGY_DOCTRINE = (
+        "[HOW YOU PLAY — champion doctrine, always in force: you are an EXPERT, Bulbapedia-brained "
+        "FireRed player and you play to ROLL CREDITS. Non-negotiables, in priority order: "
+        "(1) SURVIVAL — heal and cure status BEFORE fights and marches; a Center visit costs a "
+        "minute, a blackout can cost the run. Never chain fights while hurt. "
+        "(2) SUPPLIES — stay stocked: potions, status cures, revives, balls. Money exists to be "
+        "spent; walking past a Mart with a thin bag is throwing. "
+        "(3) TYPE FIRST — matchups decide fights; know the next gym's type and bring the answer. "
+        "(4) TEAM — build and level the PLANNED team, not just the ace; one over-levelled carry "
+        "with a dead bench loses the Elite Four. "
+        "(5) FORWARD — the next badge is the compass; explore with purpose, never wander. "
+        "Your flair, trash-talk and taste live in HOW you narrate the pick — the pick itself is "
+        "always the strategically correct one.]"
+    )
+
     async def _pokemon_react(self, summary: str, *, bypass: bool = False, tier: int | None = None,
                              kind: str | None = None):
         """SEAM (M1): route a NEUTRAL Pokémon game-event summary through Kira's existing
@@ -3628,13 +3887,27 @@ class VTubeBot:
     _BADGE_LEADER = {"Boulder": "Brock", "Cascade": "Misty", "Thunder": "Lt. Surge", "Rainbow": "Erika",
                      "Soul": "Koga", "Marsh": "Sabrina", "Volcano": "Blaine", "Earth": "Giovanni"}
 
+    def _pokemon_live_voice_ok(self) -> bool:
+        """True when her live Pokémon brief should be injected — pokemon_mode OR a fresh harness
+        heartbeat (resume_marathon often leaves pokemon_mode False while she plays)."""
+        if getattr(self, "pokemon_mode", False):
+            return True
+        try:
+            from kira import pokemon_proc
+            return bool(pokemon_proc.heartbeat_alive())
+        except Exception:
+            return False
+
     def _pokemon_state_block_for_voice(self) -> str:
         """FIX 2 — her REAL live run-state (the SAME health.json the dashboard reads), formatted for her
         DECISION + VOICE so she stops flying blind: confabulating ('Dome fossil secured' with none),
         not knowing she beat Misty, asking Jonny her own goal. Single source of truth shared with the
         cockpit — 'wired to the display' is NOT enough; this is the wired-to-the-brain half. Returns ''
         when there's no fresh snapshot (no run / stale / crashed) so she never asserts stale facts.
-        Best-effort; never raises."""
+        Best-effort; never raises.
+
+        2026-08-02: also grounds FIELD HMs (Cut/Flash/…) — she was denying Cut while chopping trees,
+        and forgetting Lt. Surge after Thunder Badge because story milestones stopped at Misty."""
         try:
             from kira import pokemon_proc
             h = pokemon_proc.health() or {}
@@ -3653,12 +3926,27 @@ class VTubeBot:
             objective = g.get("active_objective") or goals.get("medium") or g.get("objective") or ""
             longg = goals.get("long") or ""
             place = g.get("place") or "?"
+            hms = g.get("field_hms") or []
             lines = ["[YOUR POKÉMON RUN — your REAL state right now. Answer from THIS; never ask anyone "
-                     "what you're doing or which badges/items you have, and never narrate a goal as if "
-                     "it's already done. Don't recite it robotically — just KNOW it.]"]
-            lines.append(f"Badges: {bc}/8" + (f" — you've beaten {', '.join(beaten)}" if beaten
+                     "what you're doing or which badges/items/HMs you have, never claim you haven't "
+                     "beaten a gym that's listed below, and never narrate a goal as if it's already done. "
+                     "Don't recite it robotically — just KNOW it.]"]
+            lines.append(f"Badges: {bc}/8" + (f" — you've ALREADY beaten {', '.join(beaten)}" if beaten
                                               else " — no gym beaten yet") + ".")
             lines.append(f"Your team: {team}.")
+            if hms:
+                lines.append(f"Field moves you can use RIGHT NOW: {', '.join(hms)} — if you're cutting "
+                             f"trees / lighting caves / surfing, that IS you using that HM. You have it.")
+            else:
+                lines.append("Field moves: none usable yet (no taught+badge-unlocked HM on the party).")
+            # WHO'S ON THE FIELD (2026-07-30 attribution fix): mid-battle, name the ACTIVE battler
+            # explicitly — without this she only saw the roster and invented which of her mons was
+            # fighting ("spearow's eating well" on a Wartortle kill). Ground truth from health.json
+            # (gBattleMons[0], published by the campaign heartbeat).
+            active = g.get("active_species")
+            if active:
+                lines.append(f"IN BATTLE RIGHT NOW: your {active} is the one on the field — credit "
+                             f"hits, KOs, and faints to {active}, not a benched teammate.")
             lines.append(f"Where you are: {place}.")
             if now:
                 lines.append(f"Right now you're: {now}")
@@ -3757,14 +4045,24 @@ class VTubeBot:
         # the consistent grounding incl. items/fossil). This is the reaches-the-BRAIN half.
         _sb = self._pokemon_state_block_for_voice()
         _sb = (_sb + "\n") if _sb else ""
+        # THE STRATEGIST BRIEF (2026-08-03): the campaign computes a prioritized directive block from
+        # live RAM (survival / supplies / gym matchup / team build / standing orders) and hands it in
+        # via ctx['strategy']. Rendered as its OWN labeled section so it reads as counsel with
+        # authority, not one more sentence lost in the narrative place-string.
+        _strat = str(ctx.get("strategy") or "").strip()
+        _strat_block = (
+            "YOUR STRATEGIST BRIEF — computed from the LIVE game state this second; priority order, "
+            "the top line outranks everything under it:\n" + _strat + "\n\n"
+        ) if _strat else ""
         try:
             if kind == "want":
                 # world-knowledge she carries (things she KNOWS are out there) as CONTEXT, not a pick-list.
                 known = ("\n".join(f"- {k}: {v}" for k, v in detail.items()) if detail
                          else ("\n".join(f"- {o}" for o in opts) if opts else "(nothing specific in mind)"))
                 prompt = (
-                    self._POKEMON_CHARACTER_RULES + "\n" + self._POKEMON_DECIDE_FRAMING + "\n\n"
-                    + _sb
+                    self._POKEMON_CHARACTER_RULES + "\n" + self._POKEMON_DECIDE_FRAMING + "\n"
+                    + self._POKEMON_STRATEGY_DOCTRINE + "\n\n"
+                    + _sb + _strat_block
                     + f"You're at {where}, playing your OWN Pokemon run. Things you know are out there:\n"
                     f"{known}\n\n"
                     "Is there something you actually WANT right now — a pokemon, a goal, a place to reach? "
@@ -3777,13 +4075,16 @@ class VTubeBot:
                     return {"choice": "", "reasoning": ""}
                 menu = "\n".join(f"- {o}" + (f": {detail[o]}" if o in detail else "") for o in opts)
                 prompt = (
-                    self._POKEMON_CHARACTER_RULES + "\n" + self._POKEMON_DECIDE_FRAMING + "\n\n"
-                    + _sb
+                    self._POKEMON_CHARACTER_RULES + "\n" + self._POKEMON_DECIDE_FRAMING + "\n"
+                    + self._POKEMON_STRATEGY_DOCTRINE + "\n\n"
+                    + _sb + _strat_block
                     + f"You're at {where}. It's YOUR call what to do next. Your options right now:\n"
                     f"{menu}\n\n"
-                    "Pick the ONE that fits what YOU actually want to do — your taste/mood, NOT the most "
-                    "optimal play. Say a sentence in YOUR voice about why, THEN on a final line write "
-                    "exactly:  PICK: <one of the options above, verbatim>"
+                    "Pick the option a CHAMPION would — follow your strategist brief's top priority "
+                    "(and the doctrine) unless no listed option can serve it. Your taste and flair go "
+                    "in HOW you talk about it, never in throwing the game. Say a sentence in YOUR "
+                    "voice about why, THEN on a final line write exactly:  "
+                    "PICK: <one of the options above, verbatim>"
                 )
             resp = await self.ai_core.kira_deep_response(
                 request=prompt, self_context=self._build_self_block(),
@@ -5063,6 +5364,83 @@ class VTubeBot:
             return False
         return (time.time() - self._vad_mic_last_ts) < MIC_GATE_ACTIVE_WINDOW_S
 
+    async def _turn_lock_watchdog_loop(self) -> None:
+        """DEAFNESS DETECTOR + RECOVERY (2026-07-30 observe-only; upgraded 2026-07-31 after the
+        Misty-badge deafness — a hung turn held _active_turn_lock indefinitely and she went silent
+        to voice AND chat with the stream live). While processing_lock or _active_turn_lock is
+        held, Jonny's mic frames are DROPPED (vad_loop) and chat batches are SKIPPED
+        (chat_batch_worker) — correct for the seconds a real turn takes, catastrophic for a hung
+        one (a stalled LLM/TTS await).
+
+        RECOVERY LADDER (conservative — only past WEDGE_S of CONTINUOUS hold, and never while
+        she's actually mid-TTS unless the hold reaches 2x WEDGE_S, i.e. is_speaking itself wedged):
+          1. CANCEL the holder task — but ONLY a per-event/per-request task (a Pokémon event
+             react, a control-server handler). The registered long-lived workers (brain_worker,
+             vad drainer, director loops — self._background_tasks) are NEVER cancelled: a
+             CancelledError there would kill the whole loop, worse than the wedge.
+          2. If the cancel didn't free the lock within one sample (or the holder is a core
+             worker / unknown), ORPHAN the lock: recreate the attribute with a fresh lock so
+             every NEW turn flows again. The hung holder still references the old object and
+             releases it harmlessly whenever (if ever) it resumes — no release-chain corruption,
+             which is why the old force-release idea was rejected but recreation is safe."""
+        held_since = {"processing_lock": None, "_active_turn_lock": None}
+        last_scream = {"processing_lock": 0.0, "_active_turn_lock": 0.0}
+        cancel_sent_at = {"processing_lock": 0.0, "_active_turn_lock": 0.0}
+        WEDGE_S = float(os.getenv("TURN_LOCK_WEDGE_S", "180"))
+        while True:
+            await asyncio.sleep(15)
+            try:
+                for name in ("processing_lock", "_active_turn_lock"):
+                    lk = getattr(self, name)
+                    if not lk.locked():
+                        held_since[name] = None
+                        cancel_sent_at[name] = 0.0
+                        continue
+                    if held_since[name] is None:
+                        held_since[name] = time.time()
+                        continue
+                    span = time.time() - held_since[name]
+                    if span <= WEDGE_S:
+                        continue
+                    speaking = bool(getattr(self.ai_core, "is_speaking", False))
+                    if time.time() - last_scream[name] > 60:
+                        last_scream[name] = time.time()
+                        print(f"   [TurnLockWatchdog] !!!! {name} held ~{span:.0f}s CONTINUOUSLY "
+                              f"(speaking={speaking}) — no real turn runs this long. She is DEAF "
+                              f"to voice+chat while this holds; recovering.")
+                    # A real (if absurd) TTS ramble may still be draining — hold fire while she
+                    # is audibly speaking, but not forever: is_speaking stuck True past 2x
+                    # WEDGE_S is itself the wedge (a hung TTS await), so recover anyway then.
+                    if speaking and span <= 2 * WEDGE_S:
+                        print(f"   [TurnLockWatchdog] {name}: holding recovery while she's "
+                              f"speaking (acts at {2 * WEDGE_S:.0f}s regardless).")
+                        continue
+                    holder = getattr(lk, "holder_task", None)
+                    core_tasks = set(getattr(self, "_background_tasks", None) or [])
+                    if getattr(self, "_vad_task", None) is not None:
+                        core_tasks.add(self._vad_task)
+                    if (holder is not None and not holder.done()
+                            and holder not in core_tasks and not cancel_sent_at[name]):
+                        cancel_sent_at[name] = time.time()
+                        print(f"   [TurnLockWatchdog] !! RECOVER step 1: cancelling the hung "
+                              f"holder task of {name} ({holder.get_name()!r}) — a per-event "
+                              f"turn, safe to kill. Lock releases as it unwinds.")
+                        holder.cancel()
+                        continue                      # give it one sample cycle to unwind
+                    # Cancel didn't land (or holder is a core worker / unknown) → orphan the
+                    # lock so new turns flow. LOUD: this is the she-comes-back-to-life moment.
+                    why = ("holder is a core worker — never cancelled" if holder in core_tasks
+                           else ("cancel did not free it" if cancel_sent_at[name]
+                                 else "holder unknown"))
+                    setattr(self, name, _TrackedLock())
+                    held_since[name] = None
+                    cancel_sent_at[name] = 0.0
+                    print(f"   [TurnLockWatchdog] !! RECOVER step 2: {name} ORPHANED after "
+                          f"~{span:.0f}s ({why}) — fresh lock installed, she can hear voice+chat "
+                          f"again. The hung turn still owns the old lock object and dies alone.")
+            except Exception as e:
+                print(f"   [TurnLockWatchdog] sample error (watchdog continues): {e}")
+
     async def _loopback_supervisor_loop(self) -> None:
         """Idempotent loopback keep-alive (the root fix for inconsistent hearing).
 
@@ -5581,6 +5959,15 @@ class VTubeBot:
 
             # Load identity anchors + temporal continuity (synchronous O(1) read)
             identity_manager.load()
+            # The channel owner IS Jonny — self-heal the alias map from config so a Twitch
+            # rename (2026-07-31: Militele3 -> TheKiraAgency) never silently demotes his
+            # chat messages to random-viewer status. Idempotent; no-op when already known.
+            try:
+                from kira.config import TWITCH_CHANNEL_TO_JOIN as _tcj
+                if _tcj:
+                    identity_manager.ensure_permanent_alias("Jonny", _tcj)
+            except Exception as _iae:
+                print(f"   [Identity] broadcaster alias self-heal skipped: {_iae}")
 
             # Generate the recent-activity brief now, before any conversation happens
             await self.generate_startup_brief()
@@ -5761,6 +6148,11 @@ class VTubeBot:
             # Loopback keep-alive supervisor — self-heals capture/transcriber that
             # never started or dropped (cold-boot silent-bind, unplug, clean exit).
             tasks.append(self._loopback_supervisor_loop())
+            # Turn-lock watchdog — screams AND RECOVERS when a hung turn holds
+            # processing_lock / _active_turn_lock past any plausible length (the 'she
+            # stopped listening to me and chat' deafness signature): cancels a hung
+            # per-event holder, else orphans+recreates the lock. 15s cadence.
+            tasks.append(self._turn_lock_watchdog_loop())
 
             # --- NEW: Start Dynamic Observer (Visual Spark) ---
             tasks.append(self.dynamic_observer_loop())
@@ -6579,6 +6971,15 @@ class VTubeBot:
                     _ep_ctx = self._episode_timeline_context()
                     if _ep_ctx:
                         visual_desc = (_ep_ctx + "\n\n" + visual_desc) if visual_desc else _ep_ctx
+
+                    # CREATOR-ORDER SEAM (2026-07-31): a direct gameplay order in Jonny's VOICE
+                    # becomes LAW for the game harness (chat never reaches this path — advice only).
+                    # NOT gated on pokemon_mode — resume_marathon may leave that flag False while
+                    # health.json is fresh / states/campaign exists; the check itself decides.
+                    try:
+                        self._pokemon_creator_order_check(content)
+                    except Exception as _coe:
+                        print(f"   [CreatorOrder] check skipped: {_coe}")
 
                     # 2. Construct dialogue line (history-clean — no screen state)
                     # Prefix with identity label so Claude always knows this is Jonny's real voice,
@@ -7877,6 +8278,14 @@ class VTubeBot:
             session_context_block += self._pokemon_journey_block()
         except Exception:
             pass
+        # LIVE badges/HMs for chat too (journey summary can lag; health.json is current).
+        try:
+            if self._pokemon_live_voice_ok():
+                _live_chat = self._pokemon_state_block_for_voice()
+                if _live_chat:
+                    session_context_block += _live_chat + "\n"
+        except Exception:
+            pass
         # Mid-session rolling takes — lets chat responses callback to opinions
         # she's already stated in this session, not just on-disk ones.
         if self.session_takes_summary:
@@ -9012,49 +9421,51 @@ class VTubeBot:
             llm_transcript = llm_transcript[:16000] + "\n\n[... middle of session truncated for length ...]\n\n" + llm_transcript[-40000:]
 
         # ── PRIORITY ARTIFACT: Discord daily diary (Phase 1 — REVIEW MODE). ──
-        # Generated FIRST among the LLM artifacts on purpose. It is the review-gate
-        # artifact Jonny reads before any Discord post, and unlike lore/clips it can
-        # NOT be backfilled from the raw dump (no backfill script exists for it). If
-        # shutdown axes the chain partway, the diary must already be on disk — so it
-        # leads and the backfill-able artifacts (lore/clips) trail. Own try/except.
-        try:
-            diary = await self.generate_daily_summary(
-                activity=activity,
-                date_str=date_str,
-                session_duration_min=session_duration_min,
-                highlights_block=highlights_block,
-                called_shots_block=called_shots_block,
-                transcript=transcript,
-            )
-            if diary:
-                os.makedirs("logs/diary", exist_ok=True)
-                diary_path = os.path.join("logs/diary", f"{date_str}_{activity_slug}.md")
-                with open(diary_path, "w", encoding="utf-8") as f:
-                    f.write(f"# Kira's Diary — {activity} ({date_str})\n\n")
-                    f.write(f"_~{session_duration_min} min · REVIEW MODE: not yet posted_\n\n")
-                    f.write(diary + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())
-                self.pending_discord_summary = diary
-                self.pending_discord_summary_path = diary_path
-                self.pending_discord_summary_posted = False
-                results["diary"] = diary_path
-                print(f"   [Diary] Saved for review → {diary_path} (NOT posted)")
+        # PARKED 2026-08-02 (Jonny): posts felt random / not landing — skip generate
+        # + autopost until we un-park DISCORD_DIARY_PARKED. Lore/clips still run below.
+        from kira.config import DISCORD_DIARY_PARKED, DISCORD_AUTOPOST
+        if DISCORD_DIARY_PARKED:
+            print("   [Diary] PARKED — skipping diary generate/post "
+                  "(set DISCORD_DIARY_PARKED=false to resume review mode)")
+            results["diary"] = "parked"
+        else:
+            try:
+                diary = await self.generate_daily_summary(
+                    activity=activity,
+                    date_str=date_str,
+                    session_duration_min=session_duration_min,
+                    highlights_block=highlights_block,
+                    called_shots_block=called_shots_block,
+                    transcript=transcript,
+                )
+                if diary:
+                    os.makedirs("logs/diary", exist_ok=True)
+                    diary_path = os.path.join("logs/diary", f"{date_str}_{activity_slug}.md")
+                    with open(diary_path, "w", encoding="utf-8") as f:
+                        f.write(f"# Kira's Diary — {activity} ({date_str})\n\n")
+                        f.write(f"_~{session_duration_min} min · REVIEW MODE: not yet posted_\n\n")
+                        f.write(diary + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                    self.pending_discord_summary = diary
+                    self.pending_discord_summary_path = diary_path
+                    self.pending_discord_summary_posted = False
+                    results["diary"] = diary_path
+                    print(f"   [Diary] Saved for review → {diary_path} (NOT posted)")
 
-                from kira.config import DISCORD_AUTOPOST
-                if DISCORD_AUTOPOST:
-                    try:
-                        from kira.streaming.discord_poster import post_discord_message
-                        ok, detail = await post_discord_message(diary)
-                        self.pending_discord_summary_posted = bool(ok)
-                        print(f"   [Diary] AUTOPOST → {detail}")
-                    except Exception as e:
-                        print(f"   [Diary] Autopost failed: {e}")
-            else:
-                print("   [Diary] generate_daily_summary returned empty — no diary written.")
-        except Exception as e:
-            print(f"   [Diary] Diary stage failed: {e}")
-            traceback.print_exc()
+                    if DISCORD_AUTOPOST:
+                        try:
+                            from kira.streaming.discord_poster import post_discord_message
+                            ok, detail = await post_discord_message(diary)
+                            self.pending_discord_summary_posted = bool(ok)
+                            print(f"   [Diary] AUTOPOST → {detail}")
+                        except Exception as e:
+                            print(f"   [Diary] Autopost failed: {e}")
+                else:
+                    print("   [Diary] generate_daily_summary returned empty — no diary written.")
+            except Exception as e:
+                print(f"   [Diary] Diary stage failed: {e}")
+                traceback.print_exc()
 
         # D4 (Phase K): the head + format spec is SHARED with backfill_clips via
         # prompt_spec — one copy, no drift; clip_cutter's parser depends on it.
@@ -10971,8 +11382,9 @@ class VTubeBot:
                 # FIX 2 — during Pokémon play, inject her LIVE run-state so mic questions ("did you beat
                 # Misty? what's your goal? which fossil?") are answered from her OWN state, never asked
                 # back at Jonny or confabulated. Same health.json the dashboard reads (reaches-brain, not
-                # just display). Gated on pokemon_mode so it's absent in every non-Pokémon context.
-                if getattr(self, "pokemon_mode", False):
+                # just display). Heartbeat OR pokemon_mode — resume_marathon often leaves the mode flag
+                # false while she's mid-run (2026-08-02 Surge/Cut amnesia chalk).
+                if self._pokemon_live_voice_ok():
                     _pkmn_state = self._pokemon_state_block_for_voice()
                     if _pkmn_state:
                         dynamic_context += f"\n\n{_pkmn_state}"
@@ -11115,6 +11527,25 @@ class VTubeBot:
                         if full_response_text:
                             streamed_already_spoken = True
                             _llm_model = "sonnet-stream(llm+tts)"
+                        else:
+                            # OPENROUTER RESILIENCE (2026-07-28): the streaming path can die
+                            # through the OpenRouter Anthropic Skin while plain calls work
+                            # fine (the Pokémon reaction path proved it). A dead stream used
+                            # to drop straight to local Llama — which answers WITHOUT her full
+                            # persona depth (the "helpful assistant" voice Jonny can feel
+                            # instantly). Retry ONE non-streaming Sonnet call first; Llama
+                            # stays the last resort. Safe to retry because nothing was spoken
+                            # (full_response_text is empty — a partially-spoken stream returns
+                            # its partial text and takes the branch above instead).
+                            print("   [Brain] Stream produced nothing — retrying non-streaming Sonnet before Llama.")
+                            full_response_text = await self.ai_core.claude_chat_inference(
+                                messages=self.conversation_history,
+                                system_prompt=self.ai_core.system_prompt,
+                                dynamic_context=dynamic_context,
+                                max_tokens=streaming_max,
+                            )
+                            if full_response_text:
+                                _llm_model = "sonnet(stream-rescue)"
                     else:
                         # Non-streaming Sonnet path
                         if brief_mode:

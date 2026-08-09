@@ -37,7 +37,8 @@ SB1_MAP_GROUP, SB1_MAP_NUM = 0x04, 0x05
 NUM_PRIMARY = 640                  # metatile ids < 640 use the primary tileset
 # B-3 POSITION-LOOP ESCAPE: if she's confined to <=POS_LOOP_DISTINCT tiles over the last
 # POS_LOOP_WINDOW steps without arriving, she's spinning (warp/spinner) -> bail. Env-tunable.
-POS_LOOP_WINDOW = int(os.getenv("POKEMON_POS_LOOP_WINDOW", "18"))
+POS_LOOP_WINDOW = int(os.getenv("POKEMON_POS_LOOP_WINDOW", "12"))   # 18 -> 12 (2026-07-29): bail a
+#   confinement loop ~1/3 sooner — on stream a visible circle-walk is dead air like any other wedge.
 POS_LOOP_DISTINCT = int(os.getenv("POKEMON_POS_LOOP_DISTINCT", "3"))
 # SPINNER NET-PROGRESS TRIPWIRE (night shift 11, the Viridian Gym row-17 oscillation): on a
 # forced-slide floor BOTH loop guards are blind — slides keep the coords CHANGING (the fp-stall
@@ -475,6 +476,38 @@ class Grid:
         return True
 
 
+# ── directional ARROW-WARP mats (2026-08-05, the One-Island PC exit) ─────────────────────────
+# FRLG metatile behaviors (pret include/constants/metatile_behaviors.h): a MB_*_ARROW_WARP mat
+# fires ONLY when the player WALKS ONTO IT IN THE ARROW'S DIRECTION — every Pokémon-Center exit
+# mat is MB_SOUTH_ARROW_WARP (walk DOWN). Walking ACROSS one sideways is plain floor: the Moltres
+# strike crossed the One-Island PC's (9,9) mat east<->west three times, never warped, burned all
+# 3 tries, and the watchdog escalation teleported her back across the sea. Behavior -> the KEY
+# that fires the mat (i.e. the direction you must be travelling).
+ARROW_WARP_STEP = {0x62: "RIGHT",     # MB_EAST_ARROW_WARP
+                   0x63: "LEFT",      # MB_WEST_ARROW_WARP
+                   0x64: "UP",        # MB_NORTH_ARROW_WARP
+                   0x65: "DOWN"}      # MB_SOUTH_ARROW_WARP
+
+
+def behavior_at(b, sx, sy):
+    """Metatile BEHAVIOR byte at save coords (the same header-attr read Grid does, for ONE
+    tile). None when unreadable — callers must treat None as 'unknown', never as 'plain'."""
+    try:
+        ml = b.rd32(GMAPHEADER)
+        attr = (b.rd32(b.rd32(ml + 0x10) + 0x14), b.rd32(b.rd32(ml + 0x14) + 0x14))
+        w, h = b.rd32(BACKUP_LAYOUT), b.rd32(BACKUP_LAYOUT + 4)
+        mp = b.rd32(BACKUP_LAYOUT + 8)
+        bx, by = sx + MAP_OFFSET, sy + MAP_OFFSET
+        if not (0 < w < 1000 and 0 < h < 1000 and 0 <= bx < w and 0 <= by < h):
+            return None
+        e = b.rd16(mp + (by * w + bx) * 2)
+        mid = e & 0x3FF
+        base, idx = (attr[0], mid) if mid < NUM_PRIMARY else (attr[1], mid - NUM_PRIMARY)
+        return b.rd32(base + idx * 4) & 0xFF
+    except Exception:
+        return None
+
+
 def bfs(grid, start, goal_test, bound=None, walkable=None):
     """Breadth-first over 4-neighbours of walkable tiles. Returns the tile path
     (list incl. start+goal) or None. `bound` limits explored save-coords to
@@ -502,7 +535,8 @@ def bfs(grid, start, goal_test, bound=None, walkable=None):
             # LEDGE HOP: if the adjacent tile is a ledge whose one-way jump direction matches the
             # move, we hop OVER it and land 2 tiles along (the ledge itself is never a standing
             # tile). Crossing the ledge the wrong way isn't offered -> the directed one-way edge.
-            if grid.ledge_dir(cx + dx, cy + dy) == (dx, dy):
+            hop = grid.ledge_dir(cx + dx, cy + dy) == (dx, dy)
+            if hop:
                 nx, ny = cx + 2 * dx, cy + 2 * dy
             else:
                 nx, ny = cx + dx, cy + dy
@@ -511,7 +545,22 @@ def bfs(grid, start, goal_test, bound=None, walkable=None):
                 if hasattr(grid, "edge_open") and not grid.edge_open(cx, cy, dx, dy):
                     continue
             if not (bx_lo <= nx <= bx_hi and by_lo <= ny <= by_hi):
-                continue
+                # LEDGE HOP OFF THE MAP EDGE IS A LEGAL SEAM CROSSING (2026-08-01, the Cerulean
+                # south-ledge seam): Cerulean's whole boundary row toward Route 5 is one-way
+                # south-jump ledges, and a hop over a boundary-row ledge lands at sy_hi+1 — ONE
+                # tile past the playable rect, in the border buffer where the neighbour's tiles
+                # overlap (the exact tiles the connection band already read as walkable). The
+                # unconditional bound check discarded that landing, and since a ledge tile can
+                # never be stood on, NO tile could satisfy the south edge goal -> the only exit
+                # read as a solid wall (head_to_gym -> no_path every tick, the Cerulean<->Route 4
+                # ping-pong). Accept the out-of-bound landing ONLY when all three hold: it is a
+                # ledge hop, the goal fires there, and the tile reads walkable (Grid.walkable
+                # bounds-checks buffer coords itself). It's a terminal node by construction (the
+                # goal test fires the moment it's popped), so BFS never expands INTO the border.
+                # Normal 1-tile steps keep the strict bound: border tiles read collision-0 on
+                # every side, so unbounded stepping would leak the plan off the map.
+                if not (hop and goal_test((nx, ny)) and walk(nx, ny)):
+                    continue
             nxt = (nx, ny)
             if nxt in came or not walk(nx, ny):
                 continue
@@ -537,9 +586,25 @@ def direction(frm, to):
 
 # ── the executor: walk a planned path, one VERIFIED tile at a time ───────────
 HOLD = 8
-STUCK_LIMIT = 16         # consecutive no-progress steps -> LOUD ABORT (patient: towns
-                         # have NPC clusters that need waiting/rerouting, not a fast give-up)
+STUCK_LIMIT = 10         # consecutive no-progress steps -> LOUD ABORT. Was 16 ("patient: towns have
+                         # NPC clusters that need waiting"); SUBATHON READINESS (2026-07-29): 16 cycles
+                         # reads as ~15s of visible wall-bumping on stream. 10 keeps two wanderer-wait
+                         # cycles (stuck%4) + the corner-jiggle at 6 before the loud abort re-routes.
 EXIT_TRIES = 5           # presses off the map edge before giving up loudly
+# ── EGRESS NPC-PATIENCE (2026-08-05, the Cinnabar-Center door-loop class) ─────
+# A WANDER_* NPC parked on a door approach blocks a tile for SECONDS, not forever (FRLG
+# wanderers re-roll a step every ~1-4s inside a 1-tile movement box — e.g. the Cinnabar
+# Center Gentleman boxed (8-10,6-8) beside the exit mats, the One Island Network Center
+# kid boxed (5-7,7-9) beside the single (9,9) door). Treating his tile as a wall made the
+# planner re-path an alternate approach every tick while he kept moving — the visible
+# "undershoots or overshoots her positioning every single time" door loop, ending in the
+# escape hatch. The correct HUMAN move is to STAND STILL and let him wander off: poll the
+# LIVE object list (readback law — never blind timing) every ~0.4s, bounded; only a
+# timed-out wait falls back to the old re-path machinery (escape hatch stays LAST resort).
+NPC_WAIT_POLL_FRAMES = 24    # frames between blocker re-reads (~0.4s at 1x speed)
+NPC_WAIT_TIMEOUT_S = 12.0    # bounded patience, then the old re-path machinery resumes
+NPC_WAIT_PROBE_S = 3.5       # motion gate: a body still this long is a squatter/trainer —
+#                              gauntlet trainers must NOT eat the full wait before a fight
 
 
 class Traveler:
@@ -705,6 +770,48 @@ class Traveler:
             out.add((x, y))
         return out
 
+    def _wait_for_npc_clear(self, tile, why="step", require_motion=False):
+        """EGRESS NPC-PATIENCE (2026-08-05, the Cinnabar-Center door loop): a LIVE body
+        (object event, read back from RAM every poll) blocks `tile`. HOLD POSITION and wait
+        for it to wander off instead of re-pathing — per-tick replans against a moving
+        blocker tie-flip between near-equal approaches and she oscillates at the door.
+        require_motion: bail early (~NPC_WAIT_PROBE_S) if the live object set never changes
+        — a stationary body is a squatter/trainer and the old interact machinery should run
+        promptly (gauntlet trainers must not eat the full wait per fight).
+        Returns True when `tile` reads clear (caller resumes the SAME plan/step); False on
+        timeout / watchdog / battle / stationary (caller falls through to the old re-path)."""
+        import pokemon_state as st
+        t0 = time.time()
+        last = self._npc_tiles()
+        self.log(f"   [egress] blocker on {tile} ({why}) — holding position, waiting up to "
+                 f"{NPC_WAIT_TIMEOUT_S:.0f}s for it to wander off (live bodies={sorted(last)})")
+        moved = False
+        polls = 0
+        while time.time() - t0 < NPC_WAIT_TIMEOUT_S:
+            if self.stuck_check():
+                self.log("   [egress] watchdog disengage during the wait — abandoning patience")
+                return False
+            for _ in range(NPC_WAIT_POLL_FRAMES):
+                self.b.run_frame(); self.render()
+            polls += 1
+            if st.in_battle(self.b):
+                self.log("   [egress] a battle started during the wait — yielding to the handler")
+                return False
+            now = self._npc_tiles()
+            moved = moved or (now != last)
+            last = now
+            if tile not in now:
+                self.log(f"   [egress] blocker cleared off {tile} after {polls} poll(s) "
+                         f"(~{time.time() - t0:.1f}s) — resuming the committed step")
+                return True
+            if require_motion and not moved and (time.time() - t0) > NPC_WAIT_PROBE_S:
+                self.log(f"   [egress] blocker on {tile} hasn't moved in {NPC_WAIT_PROBE_S:.1f}s "
+                         f"— stationary (trainer/squatter); falling back to interact/re-path")
+                return False
+        self.log(f"   [egress] wait on {tile} TIMED OUT ({NPC_WAIT_TIMEOUT_S:.0f}s) — "
+                 f"re-pathing around it")
+        return False
+
     def _warmup_battle(self):
         """Let the encounter solidly BEGIN, then hand to the engine - which does its own
         intro advance (run()->_reach_first_menu). DO NOT mash A here on GBATTLE_PHASE: that
@@ -828,7 +935,12 @@ class Traveler:
             if bnd:
                 self.log(f"   [travel] {edge} connection band {unit}: {sorted(bnd)}")
             return bnd
-        band = _compute_band(grid)
+        # COORD LEGS DON'T CROSS EDGES (2026-07-30 log-hygiene, the seam-thrash recon red herring):
+        # `edge` defaults to "north" even for arrive_coord legs, so every 1-tile grind hop was
+        # computing + logging a full "north connection band cols: [0..107]" it would never use —
+        # which made routine grass pacing at Route 4 (86,14) read as a failing Cerulean seam-cross
+        # in the logs. The band exists only for edge-crossing legs.
+        band = _compute_band(grid) if arrive_coord is None else None
         def _edge_goal(t):
             return exit_cmp(t[exit_axis]) and (band is None or t[perp_axis] in band)
         goal = ((lambda t: t == arrive_coord) if arrive_coord is not None else _edge_goal)
@@ -937,8 +1049,40 @@ class Traveler:
                 # the runner cannot resolve THIS battle — re-detecting it as a fresh encounter forever
                 # was the south_run1 ×27 spin (an abandoned no-balls catch battle). Three consecutive
                 # -> abort the leg LOUD; roam's recovery (no-move pruning / hard recovery) owns it.
-                if outcome == "stuck" and st.in_battle(self.b):
-                    _bstuck[0] += 1
+                # + 'timeout' COUNTS (2026-07-31, the 10-minute Teleport-Abra fight): a battle that
+                # burns the runner's whole 180s budget and is STILL open is the same unresolvable
+                # class — the old loop re-entered it fresh every 3 minutes for the rest of the leg
+                # (latches cleared each time, so the same moveless lead re-spun the same futile turns).
+                if outcome in ("stuck", "timeout") and st.in_battle(self.b):
+                    # DECIDED-WIN GUARD (2026-08-02): if every enemy mon is already dead, this is a
+                    # mid-victory abort — re-entering looks like a fight rewind on stream. Hand off
+                    # one more BattleAgent attach (re-entry corpse guard drains the win) WITHOUT
+                    # counting toward the breaker; only unresolved LIVE fights escalate.
+                    _foes_live = 0
+                    try:
+                        for _es in range(6):
+                            _esp = st.read_enemy_species(self.b, _es)
+                            if not (1 <= _esp <= 411):
+                                continue
+                            if self.b.rd16(ram.GENEMY_PARTY + _es * 100 + 0x56) > 0:
+                                _foes_live += 1
+                    except Exception:
+                        _foes_live = 99
+                    if _foes_live == 0:
+                        self.log("   [travel] battle returned "
+                                 f"{outcome} but enemy party is WIPED — finishing victory chain "
+                                 f"(refuse fight-reset re-entry loop)")
+                        outcome = self.battle_runner()
+                        if outcome == "loss":
+                            self.on_event("we got knocked out... I need to regroup")
+                            return "battle_loss"
+                        if not (outcome in ("stuck", "timeout") and st.in_battle(self.b)):
+                            _bstuck[0] = 0
+                            # fall through to post-battle resume below
+                        else:
+                            _bstuck[0] += 1
+                    else:
+                        _bstuck[0] += 1
                     if _bstuck[0] >= 3:
                         self.log("   [travel] !! BATTLE-LOOP BREAKER: 3 consecutive unresolved 'stuck' "
                                  "battles — aborting the leg LOUD (no infinite re-entry)")
@@ -977,7 +1121,7 @@ class Traveler:
                 # 2026-07-08 night train): the band is edge-crossing lines on the CURRENT map, and
                 # a single edge='south' leg can span Viridian->Route1->Pallet — the starting map's
                 # band gates the goal to the wrong lines on every map after the first.
-                band = _compute_band(grid)
+                band = _compute_band(grid) if arrive_coord is None else None
                 edge_row_retries = 0
                 plan_cache = None
                 stuck = exit_tries = 0
@@ -1042,9 +1186,22 @@ class Traveler:
             path = None
             if plan_cache and len(plan_cache) >= 2 and plan_cache[0] == cur:
                 nx_, ny_ = plan_cache[1]
-                if ((grid.walkable(nx_, ny_) or (can_surf and grid.is_water(nx_, ny_)))
-                        and free(nx_, ny_)):
+                _stepable = grid.walkable(nx_, ny_) or (can_surf and grid.is_water(nx_, ny_))
+                if _stepable and free(nx_, ny_):
                     path = plan_cache
+                elif (_stepable and (nx_, ny_) in npc
+                      and (nx_, ny_) not in static_blocked
+                      and (nx_, ny_) not in avoid
+                      and (nx_, ny_) not in blocked_here):
+                    # EGRESS NPC-PATIENCE (2026-08-05): a live wanderer stepped ONTO the
+                    # committed plan's next tile. Re-planning here tie-flips between
+                    # near-equal approaches while the blocker keeps moving (the door-mat
+                    # undershoot/overshoot loop). HOLD the plan and wait it out (bounded);
+                    # only a timed-out wait falls through to the normal re-plan below.
+                    if self._wait_for_npc_clear((nx_, ny_), why="committed step"):
+                        blocked.pop((nx_, ny_), None)
+                        path = plan_cache
+                    _pos_window.clear()      # deliberate stillness — the watchdog truce
             if path is None:
                 path = bfs(grid, cur, goal,
                            walkable=lambda sx, sy: grid.walkable_safe(sx, sy) and free(sx, sy))
@@ -1147,6 +1304,19 @@ class Traveler:
                         self.log(f"   [travel] no clean path from {cur}; NPC-allowing path EXISTS "
                                  f"(len {len(npc_path)}), blocker NPC tile={blk}, npcs nearby={nplist} "
                                  f"-> approaching to interact/trigger")
+                        # EGRESS NPC-PATIENCE (2026-08-05, the Cinnabar-Center door loop):
+                        # before walking up and TALKING to the blocker (which marks his tile
+                        # into block memory and re-paths — on a single-file door approach
+                        # that kills the leg with no_route_npc_blocked), give a MOVING body
+                        # the bounded wait: wanderers clear the gap on their own in seconds.
+                        # The motion gate keeps gauntlet trainers on the old fast path.
+                        if blk is not None and self._wait_for_npc_clear(
+                                blk, why="only-gap blocker", require_motion=True):
+                            no_path = fp_stall = 0
+                            last_fp = None
+                            plan_cache = None
+                            _pos_window.clear()
+                            continue
                         for _ in range(14):                       # walk up to the blocker
                             cur2 = coords(self.b)
                             ap = bfs(grid, cur2, goal, walkable=lambda sx, sy: grid.walkable(sx, sy)
@@ -1388,6 +1558,17 @@ class Traveler:
             if st.in_battle(self.b):
                 continue
             if after == cur:
+                # EGRESS NPC-PATIENCE (2026-08-05, the Cinnabar-Center door loop): the step
+                # failed and a LIVE body reads ON the planned tile (fresh read — the plan-time
+                # set is stale by now; a mid-step wanderer has finished its step onto it).
+                # Don't mark the tile blocked and detour (the undershoot/overshoot loop) —
+                # hold position, let the wanderer clear, then retry the SAME plan.
+                if (nxt in self._npc_tiles() and not st.in_battle(self.b)
+                        and self._wait_for_npc_clear(nxt, why=f"failed {d}-step")):
+                    blocked.pop(nxt, None)
+                    plan_cache = path            # path[0] == cur — the hysteresis re-arms
+                    _pos_window.clear()          # deliberate stillness — the watchdog truce
+                    continue
                 blocked[nxt] = step                 # dynamic block -> re-plan around it
                 fail_count[nxt] = fail_count.get(nxt, 0) + 1
                 # BLOCKER vs TERRAIN: a tile the grid says is walkable but we can't step onto is
@@ -1455,6 +1636,28 @@ class Traveler:
                         continue
                     for _ in range(24):             # else wait for a wanderer to step aside
                         self.b.run_frame(); self.render()
+                # CORNER JIGGLE (2026-07-29 subathon readiness — Jonny watching live): wedged in a
+                # corner she'd re-press the same planned direction while "all she needs to do is press
+                # up or left". BFS replans from her CURRENT tile, so physically relocating one tile
+                # sideways changes the plan's root — the exact human fix. One perpendicular attempt
+                # mid-streak (before the loud abort), cheap and safe: a blocked jiggle press is just a
+                # turn; a battle hands off at the loop top like any step.
+                if stuck == 6 and not st.in_battle(self.b):
+                    for jd in {"N": ("W", "E"), "S": ("W", "E"),
+                               "W": ("N", "S"), "E": ("N", "S")}.get(d, ()):
+                        self._press(jd)
+                        if st.in_battle(self.b):
+                            break
+                        if coords(self.b) != cur:
+                            self.log(f"   [travel] CORNER-JIGGLE: {jd} broke the {d}-bump at {cur} "
+                                     f"-> {coords(self.b)} — replanning from the new tile")
+                            plan_cache = None
+                            stuck = 0
+                            break
+                    if st.in_battle(self.b):
+                        continue
+                    if stuck == 0:
+                        continue
                 if stuck >= STUCK_LIMIT:
                     self.log(f"   [travel] !! STUCK at {cur} ({stuck} blocked dirs, last "
                              f"{d}->{nxt}) - ABORT LOUD (never silent-spin)")

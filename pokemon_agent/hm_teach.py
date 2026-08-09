@@ -31,6 +31,28 @@ HM_ITEM = {"cut": 339, "fly": 340, "surf": 341, "strength": 342, "flash": 343,
 TM_FIRST = 289                   # ITEM_TM01
 HM_FIRST = 339                   # ITEM_HM01
 KEY_ITEMS_OFF, TM_CASE_OFF = 0x3B8, 0x464
+ITEMS_OFF = 0x310                # SaveBlock1 Items pocket (potions/cures), 42 slots
+P_STATUS, P_HP, P_MAXHP, PARTY_MON_SIZE = 0x50, 0x56, 0x58, 100
+
+
+def items_pocket_rows(b):
+    """[(item_id, qty), ...] of the ITEMS pocket in DISPLAY order — hole-skipped (a zero-qty
+    slot mid-pocket is skipped by the game's list too), qty decrypted with the SB2 low-16 key.
+    Same doctrine as battle_agent._items_pocket (the run17 break-at-first-zero collapse)."""
+    sb1 = _sb1(b)
+    key = b.rd32(b.rd32(ram.GSAVEBLOCK2_PTR) + 0xF20) & 0xFFFF
+    out = []
+    for s in range(42):
+        slot = sb1 + ITEMS_OFF + s * 4
+        iid = b.rd16(slot)
+        qty = b.rd16(slot + 2) ^ key
+        if iid and qty:
+            out.append((iid, qty))
+    return out
+
+
+def items_pocket_qty(b, item_id):
+    return sum(q for i, q in items_pocket_rows(b) if i == item_id)
 
 
 def _sb1(b):
@@ -206,13 +228,68 @@ class TeachFlow:
                 # cheap 'menus gone' proxy: two Bs beyond the last visible change are harmless
                 pass
             self._press("B", settle=16)
+        # START-MENU TAIL (2026-08-05 #2, the Mt. Ember EXIT-cursor wedge): every hm_teach
+        # flow opens via START, and START runs UNDER CB2_Overworld — a blind cascade whose
+        # Bs got eaten can leave it up with every cb2 gate reading 'world fine'. gTasks is
+        # the readback: while Task_StartMenuHandleInput is alive, keep B'ing (bounded).
+        for _ in range(4):
+            if not ram.start_menu_open(self.b):
+                break
+            self._press("B", settle=24)
 
-    def use_field_move(self, mon_slot, verify, label="field-move", max_seconds=60):
+    def _confirm_world_back(self, label, max_presses=10, extra=6):
+        """WORLD-BACK POSTCONDITION (2026-08-05, the Mt. Ember bag wedge): _b_cascade is
+        BLIND — on a just-attached/long-running core its Bs can be EATEN wholesale, leaving
+        the bag menu open UNDER a 'VERIFIED' return. A leaked menu PAUSES the world (movement
+        eaten, NPC coords frozen), so every walker upstream reads phantom 'step blocked'
+        forever — the live (15,33)->(15,34) boulder-approach spin. Ground truth is
+        gMain.callback2 (ram.battle_cb2_dead — the exact read the roam watchdog's scene gate
+        trusts): press B, settle, RE-READ, bounded; still open -> log LOUD and hammer a few
+        more with long settles. NEVER returns with the menu knowingly open and unsaid.
+        Returns True iff the world callback is confirmed back. A cb2 READ error fails OPEN
+        (an unreadable byte must not convert a verified item use into a failure; the
+        campaign's pixel sweep + watchdog own that backstop)."""
+        def _world():
+            try:
+                # cb2 back in the world AND no START menu owning input — START runs UNDER
+                # CB2_Overworld (the Mt. Ember EXIT-cursor wedge), so cb2 alone can lie.
+                return ram.battle_cb2_dead(self.b) and not ram.start_menu_open(self.b)
+            except Exception:
+                return None
+        w = _world()
+        if w is None:
+            return True                                   # unreadable cb2 -> old blind semantics
+        for _ in range(max_presses):
+            if _world():
+                break
+            self._press("B", settle=24)
+        if not _world():
+            self.log(f"   [{label}] !! menu stack STILL open after {max_presses} B's "
+                     f"(callback2 non-overworld) — hammering {extra} more, long settles (LOUD)")
+            for _ in range(extra):
+                self._press("B", settle=60)
+                if _world():
+                    break
+        if _world() is False:
+            return False
+        # two safety Bs: the START menu runs UNDER the overworld callback, so cb2 alone can
+        # read 'world' with it still up — B on a clean overworld is a no-op, never a confirm
+        self._press("B", settle=16)
+        self._press("B", settle=16)
+        return True
+
+    def use_field_move(self, mon_slot, verify, label="field-move", max_seconds=60,
+                       drain_frames=90, fixed_row=None):
         """Use a FIELD MOVE from the overworld party menu: START -> POKEMON -> `mon_slot` ->
         the mon's submenu (field moves list FIRST, above SUMMARY/SWITCH/...) -> A; `verify()`
         (RAM truth — e.g. FLAG_SYS_FLASH_ACTIVE for Flash) decides success. Attempt k selects
         submenu row k (no cursor address known for this submenu, so rows are blind — but each
-        attempt reopens the menu fresh, making the count deterministic). Returns
+        attempt reopens the menu fresh, making the count deterministic). `fixed_row` pins the
+        SAME submenu row every attempt (a mon with exactly one field move lists it at row 0 —
+        the row scan only exists for multi-field-move mons). `drain_frames` sizes the animation
+        wait BEFORE any B is pressed: Flash verifies instantly (90 is plenty), but a WARP like
+        Teleport fades + relocates over several real seconds — 2026-07-31 live, the 90-frame
+        drain expired mid-fade and the flow read a fired Teleport as 'did not verify'. Returns
         'used' | 'failed'; fail-safe B-cascade back to the overworld either way."""
         t0 = time.time()
         self.b.set_input_owner("agent")
@@ -220,6 +297,11 @@ class TeachFlow:
             if time.time() - t0 > max_seconds:
                 break
             self._b_cascade(6)                                   # clean slate
+            if verify():
+                # the PREVIOUS attempt's move landed while we were backing out (a slow warp
+                # can complete during the cascade) — count it, don't re-fire
+                self.log(f"   [{label}] VERIFIED late (landed during backout of attempt {attempt - 1})")
+                return "used"
             self._press("START", settle=60)
             if not self._nav_byte(START_CURSOR, 1):              # row 1 = POKEMON (post-dex menu)
                 self.log(f"   [{label}] !! START-menu cursor no-response — retrying")
@@ -238,10 +320,11 @@ class TeachFlow:
                 self.log(f"   [{label}] !! party cursor couldn't reach slot {mon_slot}")
                 continue
             self._press("A", settle=40)                          # the mon's action submenu
-            for _ in range(attempt):                             # attempt k -> submenu row k
+            row = attempt if fixed_row is None else fixed_row
+            for _ in range(row):
                 self._press("DOWN", settle=14)
             self._press("A", settle=40)                          # fire the field move
-            for _ in range(90):                                  # drain the animation
+            for _ in range(drain_frames):                        # drain the animation (NO input)
                 if verify():
                     break
                 self.b.run_frame(); self.c.render()
@@ -251,11 +334,538 @@ class TeachFlow:
                 self._press("B", settle=20)
             if verify():
                 self._b_cascade()
-                self.log(f"   [{label}] VERIFIED used (attempt {attempt}, submenu row {attempt})")
+                self.log(f"   [{label}] VERIFIED used (attempt {attempt}, submenu row {row})")
                 return "used"
-            self.log(f"   [{label}] attempt {attempt} (row {attempt}) did not verify — backing out")
+            self.log(f"   [{label}] attempt {attempt} (row {row}) did not verify — backing out")
+        if verify():
+            self.log(f"   [{label}] VERIFIED late (landed after the final backout)")
+            return "used"
         self._b_cascade()
         self.log(f"   [{label}] !! FAILED — field move never verified (LOUD)")
+        return "failed"
+
+    def field_cure(self, item_id, mon_slot, max_seconds=75):
+        """OVERWORLD status cure (2026-08-03: 'she's not removing poisons between battles!!').
+        START -> BAG -> Items pocket -> `item_id` -> USE -> party `mon_slot` -> A, then verify
+        by GROUND TRUTH ONLY: the item count DROPPED and the slot's status u32 CLEARED. The bag
+        list row is walked BLIND (UP-clamp home, then counted DOWNs) — same zero-RAM-trust
+        doctrine as the in-battle blind walks; the overworld cursor byte is never load-bearing.
+        Returns 'cured' | 'no_item' | 'failed' (fail-safe: B-cascade restores the overworld;
+        a wasted pass can never mis-report success)."""
+        t0 = time.time()
+        rows = [i for i, _q in items_pocket_rows(self.b)]
+        if item_id not in rows:
+            return "no_item"
+        row = rows.index(item_id)
+        if row > 9:
+            self.log(f"   [cure] item {item_id} sits at bag row {row} — too deep for the blind "
+                     f"walk, skipping (LOUD)")
+            return "failed"
+        qty0 = items_pocket_qty(self.b, item_id)
+        stat_addr = ram.GPLAYER_PARTY + mon_slot * PARTY_MON_SIZE + P_STATUS
+        if not (self.b.rd32(stat_addr) & 0xFF):
+            return "cured"                                   # already clean — nothing to do
+        self.b.set_input_owner("agent")
+        self.log(f"   [cure] field cure: item {item_id} (bag row {row}) -> party slot {mon_slot}")
+        # 1. START menu open-verify -> BAG (row 2). Same stale-cursor doctrine as teach().
+        opened = False
+        self._press("START", settle=60)
+        for _ in range(4):
+            c0 = self.b.rd8(START_CURSOR)
+            self._press("DOWN", settle=24)
+            if self.b.rd8(START_CURSOR) != c0:
+                opened = True
+                break
+            self._press("START", settle=60)
+        if not opened or not self._nav_byte(START_CURSOR, 2):
+            self.log("   [cure] !! START menu never opened — aborting (B out)")
+            self._b_cascade(); return "failed"
+        self._press("A", settle=80)                          # open the bag
+        # 2. Items pocket (0). POCKET LIVENESS PROBE first (the mid-fight Teachy-TV/Helix-
+        #    Fossil hover, 13:01): a frozen pocket byte reads 0 while the REAL pocket is Key
+        #    Items. A healthy byte must RESPOND to a press; a mute one -> BLIND LEFT x4
+        #    (the pocket strip clamps at Items).
+        _p0 = self.b.rd8(BAG_POCKET)
+        self._press("RIGHT", settle=20)
+        _live = self.b.rd8(BAG_POCKET) != _p0
+        if not _live:
+            self._press("LEFT", settle=20)
+            _live = self.b.rd8(BAG_POCKET) != _p0
+        if _live:
+            for _ in range(4):
+                if self.b.rd8(BAG_POCKET) == 0:
+                    break
+                self._press("LEFT", settle=20)
+            if self.b.rd8(BAG_POCKET) != 0:
+                self.log("   [cure] !! couldn't reach the Items pocket — aborting")
+                self._b_cascade(); return "failed"
+        else:
+            self.log("   [cure] pocket byte is MUTE (frozen RAM) — BLIND clamp LEFT x4")
+            for _ in range(4):
+                self._press("LEFT", settle=20)
+        # 3. BLIND row walk: UP x (row+8) clamps home to row 0 from any parked position (the
+        #    bag list remembers its row across opens), then DOWN x row lands the true row.
+        for _ in range(row + 8):
+            self._press("UP", settle=12)
+        for _ in range(row):
+            self._press("DOWN", settle=16)
+        self._press("A", settle=50)                          # select the item -> USE/GIVE/TOSS box
+        self._press("A", settle=90)                          # USE (top row default) -> party chooser
+        # 4. STATE MACHINE (bounded): party teal -> nav + pick; anything else -> A-drain the
+        #    cure dialogue. The loop's top status-check is the real done signal.
+        party_navved = False
+        for _ in range(40):
+            if not (self.b.rd32(stat_addr) & 0xFF) and items_pocket_qty(self.b, item_id) < qty0:
+                break
+            if time.time() - t0 > max_seconds:
+                break
+            scr = self._classify()
+            if scr == "party":
+                if not party_navved:
+                    if not self._party_goto(mon_slot):
+                        self.log("   [cure] !! party cursor never reached the slot — B out")
+                        break
+                    party_navved = True
+                    self._press("A", settle=90)              # pick the mon -> cure applies
+                else:
+                    self._press("A", settle=60)              # 'X was cured of its poisoning!' text
+            elif scr == "bag" and not party_navved:
+                self._press("A", settle=70)                  # USE press hadn't landed yet
+            else:
+                self._press("A", settle=50)                  # dialogue / transition
+        self._b_cascade()
+        world_back = self._confirm_world_back("cure")
+        cured = not (self.b.rd32(stat_addr) & 0xFF)
+        consumed = items_pocket_qty(self.b, item_id) < qty0
+        if cured and consumed:
+            if not world_back:
+                self.log(f"   [cure] !! cure LANDED but the MENU STACK never closed — "
+                         f"'menu_stuck' (LOUD; same postcondition as field_heal)")
+                return "menu_stuck"
+            self.log(f"   [cure] VERIFIED: slot {mon_slot} status cleared, item {item_id} consumed")
+            return "cured"
+        self.log(f"   [cure] !! NOT cured (status_clear={cured} consumed={consumed} "
+                 f"world_back={world_back}) — failed LOUD")
+        return "failed"
+
+    def field_heal(self, item_id, mon_slot, max_seconds=75):
+        """OVERWORLD HP heal (2026-08-05, the Mt. Ember climb: 'she is not healing outside of
+        battle when she probably should' — grinding up Kindle Road/Summit Path with the bag
+        full of potions and no Center on the mountain). START -> BAG -> Items pocket ->
+        `item_id` -> USE -> party `mon_slot` -> A, then verify by GROUND TRUTH ONLY: the item
+        count DROPPED and the slot's HP ROSE. Identical skeleton to field_cure (the proven
+        blind-row-walk + pocket-liveness-probe rails); only the target read differs.
+        Returns 'healed' | 'no_item' | 'already_full' | 'fainted' | 'failed' (fail-safe:
+        B-cascade restores the overworld; a wasted pass can never mis-report success)."""
+        t0 = time.time()
+        rows = [i for i, _q in items_pocket_rows(self.b)]
+        if item_id not in rows:
+            return "no_item"
+        row = rows.index(item_id)
+        if row > 9:
+            self.log(f"   [fieldheal] item {item_id} sits at bag row {row} — too deep for the "
+                     f"blind walk, skipping (LOUD)")
+            return "failed"
+        qty0 = items_pocket_qty(self.b, item_id)
+        base = ram.GPLAYER_PARTY + mon_slot * PARTY_MON_SIZE
+        hp0, mx = self.b.rd16(base + P_HP), self.b.rd16(base + P_MAXHP)
+        if mx <= 0 or hp0 <= 0:
+            return "fainted"                             # the game REFUSES a potion on a corpse
+        if hp0 >= mx:
+            return "already_full"                        # nothing to heal — never waste the press
+        self.b.set_input_owner("agent")
+        self.log(f"   [fieldheal] field heal: item {item_id} (bag row {row}) -> party slot "
+                 f"{mon_slot} ({hp0}/{mx} HP)")
+        # 1. START menu open-verify -> BAG (row 2). Same stale-cursor doctrine as field_cure.
+        opened = False
+        self._press("START", settle=60)
+        for _ in range(4):
+            c0 = self.b.rd8(START_CURSOR)
+            self._press("DOWN", settle=24)
+            if self.b.rd8(START_CURSOR) != c0:
+                opened = True
+                break
+            self._press("START", settle=60)
+        if not opened or not self._nav_byte(START_CURSOR, 2):
+            self.log("   [fieldheal] !! START menu never opened — aborting (B out)")
+            self._b_cascade(); return "failed"
+        self._press("A", settle=80)                      # open the bag
+        # 2. Items pocket (0) with the liveness probe; mute byte -> blind LEFT clamp.
+        _p0 = self.b.rd8(BAG_POCKET)
+        self._press("RIGHT", settle=20)
+        _live = self.b.rd8(BAG_POCKET) != _p0
+        if not _live:
+            self._press("LEFT", settle=20)
+            _live = self.b.rd8(BAG_POCKET) != _p0
+        if _live:
+            for _ in range(4):
+                if self.b.rd8(BAG_POCKET) == 0:
+                    break
+                self._press("LEFT", settle=20)
+            if self.b.rd8(BAG_POCKET) != 0:
+                self.log("   [fieldheal] !! couldn't reach the Items pocket — aborting")
+                self._b_cascade(); return "failed"
+        else:
+            self.log("   [fieldheal] pocket byte is MUTE (frozen RAM) — BLIND clamp LEFT x4")
+            for _ in range(4):
+                self._press("LEFT", settle=20)
+        # 3. BLIND row walk (UP-clamp home, counted DOWNs) -> select -> USE -> party chooser.
+        for _ in range(row + 8):
+            self._press("UP", settle=12)
+        for _ in range(row):
+            self._press("DOWN", settle=16)
+        self._press("A", settle=50)                      # select the item -> USE/GIVE/TOSS box
+        self._press("A", settle=90)                      # USE (top row default) -> party chooser
+        # 4. STATE MACHINE (bounded): party teal -> nav + pick; anything else -> A-drain the
+        #    'restored HP' dialogue. The loop's top HP-rise check is the real done signal.
+        party_navved = False
+        for _ in range(40):
+            if self.b.rd16(base + P_HP) > hp0 and items_pocket_qty(self.b, item_id) < qty0:
+                break
+            if time.time() - t0 > max_seconds:
+                break
+            scr = self._classify()
+            if scr == "party":
+                if not party_navved:
+                    if not self._party_goto(mon_slot):
+                        self.log("   [fieldheal] !! party cursor never reached the slot — B out")
+                        break
+                    party_navved = True
+                    self._press("A", settle=90)          # pick the mon -> the heal applies
+                else:
+                    self._press("A", settle=60)          # 'X's HP was restored by N points!' text
+            elif scr == "bag" and not party_navved:
+                self._press("A", settle=70)              # USE press hadn't landed yet
+            else:
+                self._press("A", settle=50)              # dialogue / transition
+        self._b_cascade()
+        world_back = self._confirm_world_back("fieldheal")
+        hp1 = self.b.rd16(base + P_HP)
+        consumed = items_pocket_qty(self.b, item_id) < qty0
+        if hp1 > hp0 and consumed:
+            if not world_back:
+                # HARD POSTCONDITION (2026-08-05 live wedge): the heal LANDED but the bag
+                # never closed — returning 'healed' here is how the Mt. Ember session died
+                # (a paused world under a green log line). The caller backs off; the
+                # watchdog/strike sweeps own the leaked screen.
+                self.log(f"   [fieldheal] !! heal LANDED (HP {hp0}->{hp1}, item consumed) but "
+                         f"the MENU STACK never closed — 'menu_stuck' (LOUD, never a silent leak)")
+                return "menu_stuck"
+            self.log(f"   [fieldheal] VERIFIED: slot {mon_slot} HP {hp0} -> {hp1}/{mx}, "
+                     f"item {item_id} consumed (world callback restored)")
+            return "healed"
+        self.log(f"   [fieldheal] !! NOT healed (hp {hp0}->{hp1} consumed={consumed} "
+                 f"world_back={world_back}) — failed LOUD")
+        return "failed"
+
+    def field_pp_restore(self, item_id, mon_slot, max_seconds=75):
+        """OVERWORLD PP restore (2026-08-06 LIVE, Mt. Ember: Bite:0 / only Skull Bash OHKO —
+        soft-reload of a dry pre-bank cannot refill PP, and the catch path refused every FIGHT).
+        START -> BAG -> Items -> Ether/Elixir/Max* -> USE -> party `mon_slot` -> (move 0 for
+        Ether/Max Ether; Elixir applies all) -> verify by GROUND TRUTH: bag count DROPPED and
+        that slot's total PP ROSE. Same blind-walk / pocket-liveness rails as field_heal.
+        Returns 'restored' | 'no_item' | 'already_full' | 'fainted' | 'failed' | 'menu_stuck'."""
+        t0 = time.time()
+        rows = [i for i, _q in items_pocket_rows(self.b)]
+        if item_id not in rows:
+            return "no_item"
+        row = rows.index(item_id)
+        if row > 9:
+            self.log(f"   [fieldpp] item {item_id} sits at bag row {row} — too deep for the "
+                     f"blind walk, skipping (LOUD)")
+            return "failed"
+        qty0 = items_pocket_qty(self.b, item_id)
+        base = ram.GPLAYER_PARTY + mon_slot * PARTY_MON_SIZE
+        hp0 = self.b.rd16(base + P_HP)
+        if hp0 <= 0:
+            return "fainted"
+        try:
+            pps0 = list(st.read_party_pp(self.b, mon_slot) or [])
+        except Exception:
+            pps0 = []
+        sum0 = sum(int(p or 0) for p in pps0)
+        # Already topped (every move has PP) — never waste an Ether on a full tank.
+        if pps0 and all(int(p or 0) > 0 for p in pps0):
+            return "already_full"
+        self.b.set_input_owner("agent")
+        self.log(f"   [fieldpp] field PP restore: item {item_id} (bag row {row}) -> party "
+                 f"slot {mon_slot} (pp was {pps0})")
+        opened = False
+        self._press("START", settle=60)
+        for _ in range(4):
+            c0 = self.b.rd8(START_CURSOR)
+            self._press("DOWN", settle=24)
+            if self.b.rd8(START_CURSOR) != c0:
+                opened = True
+                break
+            self._press("START", settle=60)
+        if not opened or not self._nav_byte(START_CURSOR, 2):
+            self.log("   [fieldpp] !! START menu never opened — aborting (B out)")
+            self._b_cascade(); return "failed"
+        self._press("A", settle=80)
+        _p0 = self.b.rd8(BAG_POCKET)
+        self._press("RIGHT", settle=20)
+        _live = self.b.rd8(BAG_POCKET) != _p0
+        if not _live:
+            self._press("LEFT", settle=20)
+            _live = self.b.rd8(BAG_POCKET) != _p0
+        if _live:
+            for _ in range(4):
+                if self.b.rd8(BAG_POCKET) == 0:
+                    break
+                self._press("LEFT", settle=20)
+            if self.b.rd8(BAG_POCKET) != 0:
+                self.log("   [fieldpp] !! couldn't reach the Items pocket — aborting")
+                self._b_cascade(); return "failed"
+        else:
+            self.log("   [fieldpp] pocket byte is MUTE (frozen RAM) — BLIND clamp LEFT x4")
+            for _ in range(4):
+                self._press("LEFT", settle=20)
+        for _ in range(row + 8):
+            self._press("UP", settle=12)
+        for _ in range(row):
+            self._press("DOWN", settle=16)
+        self._press("A", settle=50)                      # select -> USE/GIVE/TOSS
+        self._press("A", settle=90)                      # USE -> party chooser
+        party_navved = False
+        for _ in range(50):
+            try:
+                pps_now = list(st.read_party_pp(self.b, mon_slot) or [])
+            except Exception:
+                pps_now = []
+            if (sum(int(p or 0) for p in pps_now) > sum0
+                    and items_pocket_qty(self.b, item_id) < qty0):
+                break
+            if time.time() - t0 > max_seconds:
+                break
+            scr = self._classify()
+            if scr == "party":
+                if not party_navved:
+                    if not self._party_goto(mon_slot):
+                        self.log("   [fieldpp] !! party cursor never reached the slot — B out")
+                        break
+                    party_navved = True
+                    self._press("A", settle=90)          # pick mon -> Ether move box / Elixir apply
+                else:
+                    # Ether/Max Ether: "Restore which move?" defaults to move 0 (Bite).
+                    # Elixir/Max Elixir: PP-restored dialogue. Extra A is harmless either way.
+                    self._press("A", settle=60)
+            elif scr == "bag" and not party_navved:
+                self._press("A", settle=70)
+            else:
+                self._press("A", settle=50)
+        self._b_cascade()
+        world_back = self._confirm_world_back("fieldpp")
+        try:
+            pps1 = list(st.read_party_pp(self.b, mon_slot) or [])
+        except Exception:
+            pps1 = []
+        sum1 = sum(int(p or 0) for p in pps1)
+        consumed = items_pocket_qty(self.b, item_id) < qty0
+        if sum1 > sum0 and consumed:
+            if not world_back:
+                self.log(f"   [fieldpp] !! PP restore LANDED (pp {pps0}->{pps1}, item "
+                         f"consumed) but MENU STACK never closed — 'menu_stuck' (LOUD)")
+                return "menu_stuck"
+            self.log(f"   [fieldpp] VERIFIED: slot {mon_slot} pp {pps0} -> {pps1}, "
+                     f"item {item_id} consumed (world callback restored)")
+            return "restored"
+        self.log(f"   [fieldpp] !! NOT restored (pp {pps0}->{pps1} consumed={consumed} "
+                 f"world_back={world_back}) — failed LOUD")
+        return "failed"
+
+    def give_item(self, item_id, mon_slot, max_seconds=75):
+        """OVERWORLD hold-item give (2026-08-03, the Exp. Share equip: 'she needs exp share').
+        START -> BAG -> Items pocket -> `item_id` -> GIVE (one DOWN below USE in the sub-box)
+        -> party `mon_slot` -> A, then verify by GROUND TRUTH ONLY: the bag count DROPPED
+        (the item now rides on the mon). Identical skeleton to field_cure — same blind row
+        walk, same pocket liveness probe, same B-cascade fail-safe. If the target already
+        holds something the game asks to switch; the A-drain answers YES (the old item
+        returns to the bag, so the count-drop verify still reads true for `item_id`).
+        Returns 'given' | 'no_item' | 'failed'."""
+        t0 = time.time()
+        rows = [i for i, _q in items_pocket_rows(self.b)]
+        if item_id not in rows:
+            return "no_item"
+        row = rows.index(item_id)
+        if row > 9:
+            self.log(f"   [give] item {item_id} sits at bag row {row} — too deep for the blind "
+                     f"walk, skipping (LOUD)")
+            return "failed"
+        qty0 = items_pocket_qty(self.b, item_id)
+        self.b.set_input_owner("agent")
+        self.log(f"   [give] hold-item give: item {item_id} (bag row {row}) -> party slot {mon_slot}")
+        # 1. START menu open-verify -> BAG (row 2). Same stale-cursor doctrine as field_cure.
+        opened = False
+        self._press("START", settle=60)
+        for _ in range(4):
+            c0 = self.b.rd8(START_CURSOR)
+            self._press("DOWN", settle=24)
+            if self.b.rd8(START_CURSOR) != c0:
+                opened = True
+                break
+            self._press("START", settle=60)
+        if not opened or not self._nav_byte(START_CURSOR, 2):
+            self.log("   [give] !! START menu never opened — aborting (B out)")
+            self._b_cascade(); return "failed"
+        self._press("A", settle=80)                          # open the bag
+        # 2. Items pocket (0) with the liveness probe; mute byte -> blind LEFT clamp.
+        _p0 = self.b.rd8(BAG_POCKET)
+        self._press("RIGHT", settle=20)
+        _live = self.b.rd8(BAG_POCKET) != _p0
+        if not _live:
+            self._press("LEFT", settle=20)
+            _live = self.b.rd8(BAG_POCKET) != _p0
+        if _live:
+            for _ in range(4):
+                if self.b.rd8(BAG_POCKET) == 0:
+                    break
+                self._press("LEFT", settle=20)
+            if self.b.rd8(BAG_POCKET) != 0:
+                self.log("   [give] !! couldn't reach the Items pocket — aborting")
+                self._b_cascade(); return "failed"
+        else:
+            self.log("   [give] pocket byte is MUTE (frozen RAM) — BLIND clamp LEFT x4")
+            for _ in range(4):
+                self._press("LEFT", settle=20)
+        # 3. BLIND row walk (UP-clamp home, counted DOWNs), then the sub-box: USE is the top
+        #    row, GIVE sits ONE DOWN — the only structural difference from field_cure.
+        for _ in range(row + 8):
+            self._press("UP", settle=12)
+        for _ in range(row):
+            self._press("DOWN", settle=16)
+        self._press("A", settle=50)                          # select the item -> USE/GIVE/TOSS box
+        self._press("DOWN", settle=30)                       # USE -> GIVE
+        self._press("A", settle=90)                          # GIVE -> party chooser
+        # 4. STATE MACHINE (bounded): party teal -> nav + pick; then A-drain the 'gave it to
+        #    hold' (or switch-items) dialogue. Done signal = the bag count dropped.
+        party_navved = False
+        for _ in range(40):
+            if items_pocket_qty(self.b, item_id) < qty0:
+                break
+            if time.time() - t0 > max_seconds:
+                break
+            scr = self._classify()
+            if scr == "party":
+                if not party_navved:
+                    if not self._party_goto(mon_slot):
+                        self.log("   [give] !! party cursor never reached the slot — B out")
+                        break
+                    party_navved = True
+                    self._press("A", settle=90)              # pick the mon -> give applies
+                else:
+                    self._press("A", settle=60)              # 'X is now holding …!' / switch prompt
+            elif scr == "bag" and not party_navved:
+                self._press("A", settle=70)                  # GIVE press hadn't landed yet
+            else:
+                self._press("A", settle=50)                  # dialogue / transition
+        self._b_cascade()
+        given = items_pocket_qty(self.b, item_id) < qty0
+        if given:
+            self.log(f"   [give] VERIFIED: item {item_id} left the bag — party slot {mon_slot} holds it")
+            return "given"
+        self.log("   [give] !! NOT given (bag count unchanged) — failed LOUD")
+        return "failed"
+
+    def stone_evolve(self, item_id, mon_slot, want_species, max_seconds=150):
+        """OVERWORLD stone evolution (2026-08-03 OP-team pass: the Eevee -> Jolteon rite).
+        START -> BAG -> Items pocket -> the stone -> USE -> party `mon_slot` -> A, then WAIT OUT
+        the evolution cutscene and verify by GROUND TRUTH ONLY: the slot's SPECIES flipped to
+        `want_species` and the stone count dropped. Two doctrine points beyond field_cure:
+          1. NEVER press B once the mon is picked — in Gen 3, B during the evolution animation
+             CANCELS it (the stone would be consumed for nothing... actually FRLG refunds a
+             cancelled stone-use by not consuming, but either way the rite fails). The scene is
+             waited out passively (frame-running) polling the species byte; only A drains the
+             'Congratulations!' text after the flip.
+          2. A refusal ('It won't have any effect.') leaves qty AND species unchanged -> 'failed'
+             LOUD, the caller backs off (never a retry loop on a wrong-stone/wrong-mon pairing).
+        Returns 'evolved' | 'no_item' | 'failed' (fail-safe: B-cascade AFTER the verdict)."""
+        t0 = time.time()
+        rows = [i for i, _q in items_pocket_rows(self.b)]
+        if item_id not in rows:
+            return "no_item"
+        row = rows.index(item_id)
+        if row > 9:
+            self.log(f"   [stone] item {item_id} sits at bag row {row} — too deep for the blind "
+                     f"walk, skipping (LOUD)")
+            return "failed"
+        qty0 = items_pocket_qty(self.b, item_id)
+        if st.read_party_species(self.b, mon_slot) == want_species:
+            return "evolved"                                 # already done — nothing to do
+        self.b.set_input_owner("agent")
+        self.log(f"   [stone] stone evolve: item {item_id} (bag row {row}) -> party slot "
+                 f"{mon_slot} (want species {want_species})")
+        # 1-3. Identical rails to field_cure: START open-verify -> BAG (row 2) -> Items pocket
+        #      (liveness-probed) -> blind row walk -> select -> USE -> party chooser.
+        opened = False
+        self._press("START", settle=60)
+        for _ in range(4):
+            c0 = self.b.rd8(START_CURSOR)
+            self._press("DOWN", settle=24)
+            if self.b.rd8(START_CURSOR) != c0:
+                opened = True
+                break
+            self._press("START", settle=60)
+        if not opened or not self._nav_byte(START_CURSOR, 2):
+            self.log("   [stone] !! START menu never opened — aborting (B out)")
+            self._b_cascade(); return "failed"
+        self._press("A", settle=80)
+        _p0 = self.b.rd8(BAG_POCKET)
+        self._press("RIGHT", settle=20)
+        _live = self.b.rd8(BAG_POCKET) != _p0
+        if not _live:
+            self._press("LEFT", settle=20)
+            _live = self.b.rd8(BAG_POCKET) != _p0
+        if _live:
+            for _ in range(4):
+                if self.b.rd8(BAG_POCKET) == 0:
+                    break
+                self._press("LEFT", settle=20)
+            if self.b.rd8(BAG_POCKET) != 0:
+                self.log("   [stone] !! couldn't reach the Items pocket — aborting")
+                self._b_cascade(); return "failed"
+        else:
+            self.log("   [stone] pocket byte is MUTE (frozen RAM) — BLIND clamp LEFT x4")
+            for _ in range(4):
+                self._press("LEFT", settle=20)
+        for _ in range(row + 8):
+            self._press("UP", settle=12)
+        for _ in range(row):
+            self._press("DOWN", settle=16)
+        self._press("A", settle=50)                          # select the stone -> USE/GIVE/TOSS
+        self._press("A", settle=90)                          # USE -> party chooser
+        # 4. Pick the mon, then HANDS OFF: the cutscene owns the screen. Poll the species byte
+        #    (the one signal that cannot lie) while frame-running; A-drain only after the flip.
+        picked = False
+        while time.time() - t0 < max_seconds:
+            if st.read_party_species(self.b, mon_slot) == want_species:
+                break
+            scr = self._classify()
+            if scr == "party" and not picked:
+                if not self._party_goto(mon_slot):
+                    self.log("   [stone] !! party cursor never reached the slot — B out")
+                    self._b_cascade(); return "failed"
+                picked = True
+                self._press("A", settle=90)                  # pick the mon -> the rite begins
+            elif not picked:
+                self._press("A", settle=60)                  # USE press hadn't landed yet
+            else:
+                # cutscene / 'Congratulations!' text: A is safe, B is the cancel button — never B.
+                # A refusal bounce ('It won't have any effect.') also lands here and drains out.
+                self._press("A", settle=60)
+                if items_pocket_qty(self.b, item_id) == qty0 and self._classify() == "bag":
+                    self.log("   [stone] !! bounced back to the bag with the stone unspent — "
+                             "the game refused this pairing (failed LOUD)")
+                    self._b_cascade(); return "failed"
+        self._b_cascade()
+        evolved = st.read_party_species(self.b, mon_slot) == want_species
+        consumed = items_pocket_qty(self.b, item_id) < qty0
+        if evolved:
+            self.log(f"   [stone] VERIFIED: slot {mon_slot} is now species {want_species} "
+                     f"(stone consumed={consumed})")
+            return "evolved"
+        self.log(f"   [stone] !! NOT evolved (species={st.read_party_species(self.b, mon_slot)} "
+                 f"consumed={consumed}) — failed LOUD")
         return "failed"
 
     def teach(self, hm_key, mon_slot, forget_idx=None, max_seconds=120,
@@ -360,6 +970,13 @@ class TeachFlow:
                 else:
                     self._press("A", settle=50)                  # select the row -> sub-box
             elif scr == "party":
+                if not sub_seen:
+                    # WRONG FLOW (2026-08-03): a party chooser BEFORE the case sub-box means the
+                    # USE landed on a NON-TM bag item (heal/potion — stale cursor/pocket byte).
+                    # A-ing forward from here is the 'Super Potion on a full team' loop — abort.
+                    self.log("   [teach] !! party chooser opened WITHOUT the TM-case sub-box — "
+                             "a non-TM item got selected (stale bag cursor). ABORT, B out (LOUD)")
+                    break
                 if not party_navved:
                     if not self._party_goto(mon_slot):           # closed-loop (the menu REMEMBERS its
                         self.log("   [teach] !! party cursor never reached the slot — B out")
@@ -431,7 +1048,60 @@ def tm_compatible(b, tm_no, species):
 
 # expendable move classes for the forget choice: pure-status/no-power utility first, never the
 # mon's strongest damaging move.
-_PRECIOUS = {73}                              # leech seed etc. — never auto-forget
+# SLEEP MOVES ARE PRECIOUS (2026-08-05, the Moltres catch doctrine): asleep = x2 catch rate in
+# Gen 3 — the single biggest legendary-catch lever the party carries. They are 0-power, so the
+# 'pure status first' tier was EXACTLY the auto-forget's favorite snack (Lapras' Strength teach
+# likely ate Sing this way). Never again: Sing/Sleep Powder/Hypnosis/Lovely Kiss/Spore protected.
+_PRECIOUS = {73, 47, 79, 95, 142, 147}        # leech seed + the sleep family — never auto-forget
+# Field / battle-useless fillers — prefer these when a 4-move mon must forget for a bag TM.
+_FORGET_FIRST = {100}                         # Teleport (Abra's only move until Kadabra)
+
+
+def score_tm_recipient(dmg_moves, mon_types, tm_type, tm_power, *, plan_boost=False, is_ace=False):
+    """How badly `mon` needs this damaging TM. dmg_moves = [(type, power), ...] already known.
+    Returns score (>=0 worth teaching) or -1 (skip — already has comparable coverage).
+    Pure logic for recon; campaign uses this to pick Abra-over-Blastoise etc."""
+    tm_type = (tm_type or "").lower()
+    tm_power = int(tm_power or 0)
+    if tm_power <= 0 or not tm_type:
+        return -1
+    for mt, mp in dmg_moves:
+        if (mt or "").lower() == tm_type and int(mp or 0) >= int(tm_power * 0.8):
+            return -1
+    score = 0
+    if not dmg_moves:
+        score += 1000                               # Teleport-only Abra — the dream case
+    elif max(int(p or 0) for _, p in dmg_moves) < 40:
+        score += 200                                # thin offense
+    types = {(t or "").lower() for t in (mon_types or []) if t and t != "???"}
+    if tm_type in types:
+        score += 80                                 # STAB platform
+    if plan_boost:
+        score += 400                                # TeamPlanner teach_plan due
+    if is_ace and dmg_moves:
+        score -= 40                                 # prefer projects when the ace already fights
+    score += tm_power
+    return score
+
+
+def forget_idx_for_tm(b, mon_slot):
+    """Forget index for a bag-TM teach: None if room; else Teleport/0-power first, never precious."""
+    moves = st.read_party_moves(b, mon_slot)
+    real = [m for m in moves if m]
+    if len(real) < 4 or 0 in moves:
+        return None
+    scored = []
+    for i, m in enumerate(moves):
+        if not m or m in _PRECIOUS:
+            continue
+        _t, power = st.move_info(b, m)
+        # Teleport first, then pure status, then weakest damage
+        tier = 0 if m in _FORGET_FIRST else (1 if (power or 0) <= 0 else 2)
+        scored.append((tier, power or 0, i))
+    if not scored:
+        return 0
+    scored.sort()
+    return scored[0][2]
 
 
 def default_plan(b, hm_key, party_count):
