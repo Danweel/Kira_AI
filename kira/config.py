@@ -214,6 +214,7 @@ ELEVENLABS_VOICE_ID = os.getenv("ELEVENLABS_VOICE_ID", "")
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY", "")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION", "")
 AZURE_SPEECH_VOICE = os.getenv("AZURE_SPEECH_VOICE", "")
+EDGE_TTS_VOICE = os.getenv("EDGE_TTS_VOICE", "")
 AZURE_PROSODY_PITCH = os.getenv("AZURE_PROSODY_PITCH", "")
 AZURE_PROSODY_RATE = os.getenv("AZURE_PROSODY_RATE", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
@@ -389,15 +390,10 @@ CHAT_POST_KIRA_MAX_LEN = int(os.getenv("CHAT_POST_KIRA_MAX_LEN", "200"))        
 # Discord daily-diary webhook (Phase 1). Kira writes an in-character end-of-
 # session diary entry that is SAVED for review, NOT auto-posted. Posting to the
 # webhook is a deliberate manual action from the dashboard ("Post to Discord").
-# PARKED 2026-08-02 (Jonny): posts weren't landing / felt random — stop generate
-# + autopost until we revisit. Flip DISCORD_DIARY_PARKED False to resume review
-# mode; DISCORD_AUTOPOST still defaults off even then.
-DISCORD_DIARY_PARKED = os.getenv("DISCORD_DIARY_PARKED", "true").lower() == "true"
+# DISCORD_AUTOPOST stays false until the tone is trusted over several sessions;
+# flipping it true would let the diary fire to the webhook automatically.
 DISCORD_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL", "")
-DISCORD_AUTOPOST = (
-    False if DISCORD_DIARY_PARKED
-    else os.getenv("DISCORD_AUTOPOST", "false").lower() == "true"
-)
+DISCORD_AUTOPOST = os.getenv("DISCORD_AUTOPOST", "false").lower() == "true"
 
 # On-screen captions (Neuro-sama style word-by-word overlay).
 # When ENABLE_CAPTIONS=true, a local WebSocket server starts on
